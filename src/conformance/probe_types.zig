@@ -20,6 +20,46 @@ pub const DofProbe = extern struct {
     variant_penalty_multiplier: i32,
 };
 
+pub const RingProbe = extern struct {
+    atom_start: u32,
+    atom_count: u32,
+};
+
+pub const TemplateMappingProbe = extern struct {
+    input_atom: u32,
+    template_atom: u32,
+};
+
+pub const FragmentProbe = extern struct {
+    parent: u32,
+    component: u32,
+    atom_start: u32,
+    atom_count: u32,
+    ring_start: u32,
+    ring_count: u32,
+    dof_start: u32,
+    dof_count: u32,
+    flags: u32,
+    template_match: u32,
+    template_mapping_start: u32,
+    template_mapping_count: u32,
+};
+
+/// A transform is deliberately marked unavailable when the C++ oracle applies
+/// placement in place and preserves no source transform to report.
+pub const ComponentTransformStatus = enum(u32) {
+    unobserved = 0,
+    observed = 1,
+};
+
+pub const ComponentProbe = extern struct {
+    atom_start: u32,
+    atom_count: u32,
+    transform_status: ComponentTransformStatus,
+    reserved: u32,
+    transform: [6]f32,
+};
+
 pub fn dofProbe(dof: core.dof.Dof, current_penalty: f32) DofProbe {
     var probe = DofProbe{
         .id = dof.id.index(),
@@ -71,4 +111,12 @@ test "DOF probe is flat and preserves state, penalty, IDs, and membership" {
     try std.testing.expectEqual(@as(u32, 5), probe.atom_a);
     try std.testing.expectEqual(@as(u32, 6), probe.atom_b);
     try std.testing.expectEqual(@as(f32, 100), probe.current_penalty);
+}
+
+test "additional probe records are flat and use explicit unavailable transforms" {
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(RingProbe));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(TemplateMappingProbe));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(FragmentProbe));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(ComponentProbe));
+    try std.testing.expectEqual(ComponentTransformStatus.unobserved, ComponentTransformStatus.unobserved);
 }

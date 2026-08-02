@@ -1,0 +1,22 @@
+--- sketcherMinimizer.cpp
++++ sketcherMinimizer.cpp
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "sketcherMinimizer.h"
++#include "coordgen_oracle_hook.hpp"
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -298,9 +299,11 @@
+         findFragments();
+         buildFromFragments(true);
+         cleanPose = m_minimizer.avoidClashes();
++        coordgen_oracle_hook::captureComponentTransforms(m_molecules, false);
+         bestRotation();
+         maybeFlip();
+         arrangeMultipleMolecules();
++        coordgen_oracle_hook::captureComponentTransforms(m_molecules, true);
+         writeStereoChemistry();
+ #ifdef DEBUG_MINIMIZATION_COORDINATES
+         // write minimization data and atom mapping to file

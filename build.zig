@@ -213,6 +213,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .link_libc = true,
     });
+    probe_layout_module.addIncludePath(b.path("include"));
     probe_layout_module.addIncludePath(b.path("conformance/include"));
     probe_layout_module.addCSourceFile(.{
         .file = b.path("tests/probe_layout.c"),
@@ -260,20 +261,34 @@ pub fn build(b: *std.Build) !void {
         // translation units explicitly makes an upstream file appearing or
         // disappearing a build failure rather than a silent change in what
         // the oracle contains.
+        const instrument_fragment_builder = b.addSystemCommand(&.{
+            "sh",
+            "conformance/patches/apply-instrumentation.sh",
+        });
+        instrument_fragment_builder.addFileArg(oracle.path("CoordgenFragmentBuilder.cpp"));
+        instrument_fragment_builder.addFileArg(b.path("conformance/patches/CoordgenFragmentBuilder.instrumentation.patch"));
+        const instrumented_fragment_builder = instrument_fragment_builder.addOutputFileArg("CoordgenFragmentBuilder.cpp");
+        const instrument_minimizer = b.addSystemCommand(&.{
+            "sh",
+            "conformance/patches/apply-instrumentation.sh",
+        });
+        instrument_minimizer.addFileArg(oracle.path("sketcherMinimizer.cpp"));
+        instrument_minimizer.addFileArg(b.path("conformance/patches/sketcherMinimizer.instrumentation.patch"));
+        const instrumented_minimizer = instrument_minimizer.addOutputFileArg("sketcherMinimizer.cpp");
+
         const oracle_module = b.createModule(.{
             .target = target,
             .optimize = optimize,
             .link_libcpp = true,
         });
+        oracle_module.addIncludePath(b.path("conformance/include"));
         oracle_module.addCSourceFiles(.{
             .root = oracle.path("."),
             .files = &.{
-                "CoordgenFragmentBuilder.cpp",
                 "CoordgenFragmenter.cpp",
                 "CoordgenMacrocycleBuilder.cpp",
                 "CoordgenMinimizer.cpp",
                 "CoordgenTemplates.cpp",
-                "sketcherMinimizer.cpp",
                 "sketcherMinimizerAtom.cpp",
                 "sketcherMinimizerBond.cpp",
                 "sketcherMinimizerFragment.cpp",
@@ -285,6 +300,18 @@ pub fn build(b: *std.Build) !void {
             },
             .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
         });
+        oracle_module.addCSourceFile(.{
+            .file = instrumented_fragment_builder,
+            .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
+        });
+        oracle_module.addCSourceFile(.{
+            .file = instrumented_minimizer,
+            .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
+        });
+        oracle_module.addCSourceFile(.{
+            .file = b.path("conformance/oracle_hook.cpp"),
+            .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
+        });
         const oracle_library = b.addLibrary(.{
             .name = "coordgen-oracle",
             .linkage = .static,
@@ -293,6 +320,69 @@ pub fn build(b: *std.Build) !void {
         // Deliberately never installed: the oracle exists for conformance
         // comparison only.
         oracle_step.dependOn(&oracle_library.step);
+
+        // The adapter has the production-shaped C ABI plus the deliberately
+        // broader probe API.  It is conformance-only: neither artifact nor
+        // header is installed with the native Zig library.
+        const oracle_abi_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        oracle_abi_module.addIncludePath(b.path("include"));
+        oracle_abi_module.addIncludePath(b.path("conformance/include"));
+        oracle_abi_module.addIncludePath(oracle.path("."));
+        oracle_abi_module.addCSourceFile(.{
+            .file = b.path("conformance/oracle_adapter.cpp"),
+            .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        });
+        oracle_abi_module.linkLibrary(oracle_library);
+        const oracle_abi = b.addLibrary(.{
+            .name = "coordgen-oracle-abi",
+            .linkage = .static,
+            .root_module = oracle_abi_module,
+        });
+        oracle_step.dependOn(&oracle_abi.step);
+
+        const oracle_abi_smoke_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        oracle_abi_smoke_module.addIncludePath(b.path("include"));
+        oracle_abi_smoke_module.addIncludePath(b.path("conformance/include"));
+        oracle_abi_smoke_module.addCSourceFile(.{
+            .file = b.path("tests/oracle_abi_smoke.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic" },
+        });
+        oracle_abi_smoke_module.linkLibrary(oracle_abi);
+        const oracle_abi_smoke = b.addExecutable(.{
+            .name = "oracle-abi-smoke",
+            .root_module = oracle_abi_smoke_module,
+        });
+        const run_oracle_abi_smoke = b.addRunArtifact(oracle_abi_smoke);
+        run_oracle_abi_smoke.expectExitCode(0);
+        oracle_step.dependOn(&run_oracle_abi_smoke.step);
+
+        const oracle_abi_cpp_smoke_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        oracle_abi_cpp_smoke_module.addIncludePath(b.path("include"));
+        oracle_abi_cpp_smoke_module.addCSourceFile(.{
+            .file = b.path("tests/oracle_abi_cpp_smoke.cpp"),
+            .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        });
+        oracle_abi_cpp_smoke_module.linkLibrary(oracle_abi);
+        const oracle_abi_cpp_smoke = b.addExecutable(.{
+            .name = "oracle-abi-cpp-smoke",
+            .root_module = oracle_abi_cpp_smoke_module,
+        });
+        const run_oracle_abi_cpp_smoke = b.addRunArtifact(oracle_abi_cpp_smoke);
+        run_oracle_abi_cpp_smoke.expectExitCode(0);
+        oracle_step.dependOn(&run_oracle_abi_cpp_smoke.step);
 
         // Upstream's own example program is the cheapest proof that the
         // static library links and runs. Its two atoms must come out one

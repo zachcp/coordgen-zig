@@ -1,0 +1,27 @@
+--- CoordgenFragmentBuilder.cpp
++++ CoordgenFragmentBuilder.cpp
+@@ -7,6 +7,7 @@
+ #include <numeric>
+ 
+ #include "CoordgenFragmentBuilder.h"
++#include "coordgen_oracle_hook.hpp"
+ #include "CoordgenMinimizer.h"
+ #include "sketcherMinimizer.h"
+ #include "sketcherMinimizerFragment.h"
+@@ -141,10 +141,15 @@
+     }
+     vector<unsigned int> mapping;
+-    for (auto& temp : sketcherMinimizer::m_templates.getTemplates()) {
++    const auto& templates = sketcherMinimizer::m_templates.getTemplates();
++    for (size_t templateIndex = 0; templateIndex < templates.size();
++         ++templateIndex) {
++        auto* temp = templates[templateIndex];
+         foundTemplate = sketcherMinimizer::compare(atoms, bonds, temp, mapping);
+         if (foundTemplate) {
+             if (!atoms.empty()) {
+                 atoms[0]->fragment->isTemplated = true;
++                coordgen_oracle_hook::recordTemplateMatch(
++                    atoms[0]->fragment, atoms, templateIndex, mapping);
+             }
+             for (unsigned int i = 0; i < atoms.size(); i++) {
+                 atoms[i]->setCoordinates(temp->_atoms[mapping[i]]->coordinates *
