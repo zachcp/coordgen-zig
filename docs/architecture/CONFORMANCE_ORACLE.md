@@ -128,7 +128,10 @@ cross-compile unchanged to `x86_64-macos`; the resulting library reproduces
 upstream's documented example output; all seven `.mae` files parse to totals
 that an independent implementation agrees with.
 
+Since then `cgz-r04` added the conformance probe ABI over the same oracle, and
+`cgz-r05` added the corpus stability classification — see
+[PARITY_MANIFEST.md](PARITY_MANIFEST.md). `zig build conformance` now runs the
+oracle step plus `corpus-check`.
+
 Not yet proven, and owned elsewhere: any comparison of oracle output against
-the native port (`cgz-7v2.4.2`), the conformance probe ABI (`cgz-r04`), and
-corpus-level stability classification (`cgz-r05`). `zig build conformance`
-currently runs exactly the oracle step.
+the native port (`cgz-7v2.4.2`).

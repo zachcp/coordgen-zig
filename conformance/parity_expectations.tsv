@@ -1,0 +1,51 @@
+# Portable ceilings for the corpus stability classification (cgz-r05).
+#
+# Columns are tab separated:
+#   partition  observable  max_arch_unstable  max_order_unstable
+#
+# Values are fractions of the members for which that observable was produced.
+# `*` applies to every observable of the partition that has no explicit row;
+# an explicit row always wins. A new observable therefore inherits the strict
+# wildcard and fails until it has been classified.
+#
+# These are claims that must hold on any host, which is why coordinate values
+# and deviations live in conformance/parity_manifest.tsv instead: those are
+# per-(architecture, toolchain, optimize-mode) artifacts and would be false
+# failures anywhere else.
+#
+# The rows that matter most are the zeros. They assert that no perturbation of
+# architecture or heap address order moved any structural observable - ring
+# sets, fragment trees, canonical and input mappings, morgan ranks, template
+# mappings, effective bond orders, component membership, or the ok flag - on
+# any member of either partition. Everything above zero is a float-derived
+# observable, or an observable measured to follow one.
+#
+# Measured on aarch64-macos vs x86_64-macos, Zig 0.17.0-dev.1516+8a4b5424d,
+# oracle ReleaseFast. Ceilings carry deliberate headroom over the measurement
+# because the exact count is host dependent; the headroom is stated per row.
+
+# Realistic structures were bit-identical across architectures, optimization
+# levels, and allocator order in the review measurements, and remain so here.
+drug_like	*	0.0	0.0
+# Measured 7/7 arch. The component transform is derived from before/after
+# placement floats, so it differs by one to two units in the last place even
+# where the resulting coordinates are bit-identical. No architecture claim.
+drug_like	component_transforms	1.0	0.0
+drug_like	component_transforms_set	1.0	0.0
+
+adversarial	*	0.0	0.0
+# Measured 1414/2000 arch (70.7%), 1/2000 order (0.05%). This is the parity
+# ceiling: floating-point jitter moves the discrete search into a different
+# local minimum, so no geometric tolerance is meaningful for these inputs.
+adversarial	coordinates	0.75	0.002
+# Measured 36/2000 and 33/2000 arch, 0 order. Divergent coordinates carry the
+# discrete DOF search with them on a small fraction of members.
+adversarial	dofs	0.03	0.0
+adversarial	dofs_set	0.03	0.0
+# Measured 19/2000 arch, 0 order.
+adversarial	dof_penalties	0.02	0.0
+adversarial	dof_penalties_set	0.02	0.0
+# Measured 1972/2000 arch (98.6%), 4/2000 order (0.2%). Same derived-float
+# reason as the drug-like rows; component membership itself stayed exact.
+adversarial	component_transforms	1.0	0.005
+adversarial	component_transforms_set	1.0	0.005

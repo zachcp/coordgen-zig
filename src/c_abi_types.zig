@@ -1,5 +1,5 @@
 const std = @import("std");
-const core = @import("core.zig");
+const core = @import("core");
 
 pub const abi_version: u32 = 1;
 pub const bond_length: f32 = core.math.bond_length;

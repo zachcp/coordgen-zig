@@ -3,6 +3,10 @@
 
 #include "coordgen_abi.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Conformance-only. Never install this header or promise version stability. */
 #define COORDGEN_PROBE_VERSION UINT32_C(1)
 
@@ -123,5 +127,9 @@ typedef struct coordgen_probe_result {
 coordgen_error_t coordgen_probe_generate(const coordgen_input_t *input,
                                          coordgen_probe_result_t *result);
 void coordgen_probe_result_free(coordgen_probe_result_t *result);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* COORDGEN_PROBE_H */

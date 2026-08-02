@@ -1,4 +1,4 @@
-pub const api = @import("api.zig");
+pub const api = @import("api");
 pub const Input = api.Input;
 pub const AtomInput = api.AtomInput;
 pub const BondInput = api.BondInput;
@@ -13,9 +13,9 @@ test {
     // consumers see the safe public API above, not mutable model internals or
     // conformance types.
     _ = api;
-    _ = @import("core.zig");
-    _ = @import("model.zig");
-    _ = @import("geometry.zig");
-    _ = @import("c_abi_types.zig");
-    _ = @import("module_layers.zig");
+    _ = @import("core");
+    _ = @import("model");
+    _ = @import("geometry");
+    _ = @import("c_abi");
+    _ = @import("module_layers");
 }

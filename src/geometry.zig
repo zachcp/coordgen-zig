@@ -1,5 +1,5 @@
 const std = @import("std");
-const core = @import("core.zig");
+const core = @import("core");
 
 pub const Scalar = core.math.Scalar;
 pub const Vec2 = core.math.Vec2;

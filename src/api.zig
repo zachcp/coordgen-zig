@@ -1,5 +1,5 @@
 const std = @import("std");
-const core = @import("core.zig");
+const core = @import("core");
 
 pub const InputIndex = core.ids.InputIndex;
 pub const invalid_input_index = core.ids.invalid_input_index;

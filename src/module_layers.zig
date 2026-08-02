@@ -51,6 +51,11 @@ pub const approved_edges = [_]Edge{
     .{ .from = .conformance, .to = .optimize },
     .{ .from = .conformance, .to = .generator },
     .{ .from = .conformance, .to = .api },
+    // The oracle is reached through the same C ABI production exports, so
+    // conformance needs those types to call it and to mirror the probe
+    // result. Recorded here rather than duplicated: the layer table already
+    // grants conformance every production layer.
+    .{ .from = .conformance, .to = .c_abi },
 };
 
 pub fn allows(from: Layer, to: Layer) bool {
@@ -93,4 +98,6 @@ test "approved module graph is one-way and production cannot import conformance"
     try std.testing.expect(allows(.optimize, .core));
     try std.testing.expect(!allows(.optimize, .layout));
     try std.testing.expect(!allows(.generator, .conformance));
+    try std.testing.expect(allows(.conformance, .c_abi));
+    try std.testing.expect(!allows(.c_abi, .conformance));
 }

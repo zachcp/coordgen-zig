@@ -274,7 +274,7 @@ void setObservedTransform(const ComponentCoordinates* before,
     result.transform[5] = after_y - (m10 * before_x + m11 * before_y);
 }
 
-void fillStable(const Generation& value, coordgen_result_t* result) {
+void fillStable(Generation& value, coordgen_result_t* result) {
     result->coordinates = { value.coordinates.data(), static_cast<uint32_t>(value.coordinates.size()), 0 };
     result->input_to_internal = { value.input_to_internal.data(), static_cast<uint32_t>(value.input_to_internal.size()), 0 };
     result->internal_to_input = { value.internal_to_input.data(), static_cast<uint32_t>(value.internal_to_input.size()), 0 };
@@ -405,6 +405,17 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
         for (const sketcherMinimizerAtom* atom : component->_atoms) output.component_atoms.push_back(atomIndex(atom));
         output.components.push_back(record);
         std::vector<int> scores;
+        /* morganScores indexes its working arrays by each atom's
+         * _generalUseN and only documents the requirement in a comment
+         * ("assuming that _generalUseN is set as the index of each atom").
+         * Fragment building leaves stale values behind, so reading morgan
+         * ranks after generation without re-establishing the precondition
+         * writes outside the arrays and corrupts the heap. Upstream's own
+         * caller, canonicalOrdering(), sets it the same way immediately
+         * before the call. */
+        for (std::size_t position = 0; position < component->_atoms.size(); ++position) {
+            component->_atoms[position]->_generalUseN = static_cast<int>(position);
+        }
         const int iterations = sketcherMinimizer::morganScores(component->_atoms, component->_bonds, scores);
         (void)iterations;
         for (int score : scores) output.morgan_ranks.push_back(score < 0 ? 0U : static_cast<uint32_t>(score));
@@ -415,14 +426,14 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
             output.rings.push_back(record_ring);
         }
     }
-    for (const sketcherMinimizerFragment* fragment : minimizer._fragments) {
+    for (sketcherMinimizerFragment* fragment : minimizer._fragments) {
         fragment_indices.emplace(fragment, static_cast<uint32_t>(output.fragments.size()));
     }
     std::unordered_map<const sketcherMinimizerFragment*, const TemplateCapture*> template_captures;
     for (const TemplateCapture& template_capture : capture.templates) {
         template_captures[template_capture.fragment] = &template_capture;
     }
-    for (const sketcherMinimizerFragment* fragment : minimizer._fragments) {
+    for (sketcherMinimizerFragment* fragment : minimizer._fragments) {
         coordgen_probe_fragment_t record{};
         const auto parent = fragment_indices.find(fragment->getParent());
         record.parent = parent == fragment_indices.end() ? COORDGEN_INVALID_INDEX : parent->second;
@@ -436,7 +447,7 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
         record.ring_count = static_cast<uint32_t>(fragment_rings.size());
         for (const sketcherMinimizerRing* ring : fragment_rings) output.fragment_rings.push_back(ring_indices.at(ring));
         record.dof_start = static_cast<uint32_t>(output.dofs.size());
-        for (const CoordgenFragmentDOF* dof : fragment->getDofs()) {
+        for (CoordgenFragmentDOF* dof : fragment->getDofs()) {
             coordgen_probe_dof_t probe{};
             probe.id = static_cast<uint32_t>(output.dofs.size());
             probe.kind = dofKind(dof);
@@ -473,7 +484,7 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
     return COORDGEN_OK;
 }
 
-void fillProbe(const Generation& value, coordgen_probe_result_t* result) {
+void fillProbe(Generation& value, coordgen_probe_result_t* result) {
     result->input_to_internal = { value.input_to_internal.data(), static_cast<uint32_t>(value.input_to_internal.size()), 0 };
     result->internal_to_input = { value.internal_to_input.data(), static_cast<uint32_t>(value.internal_to_input.size()), 0 };
     result->morgan_ranks = { value.morgan_ranks.data(), static_cast<uint32_t>(value.morgan_ranks.size()), 0 };
