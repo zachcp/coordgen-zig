@@ -38,6 +38,6 @@ done
 
 require_text 'const examples_pending = b.addFail("examples is not implemented yet; see cgz-7v2")'
 require_text 'const regeneration_pending = b.addFail("template-regeneration-check is not implemented yet; see cgz-r09")'
-require_text 'const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-r15")'
+require_text 'const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4")'
 
 echo "verified strict ABI flags, no warning suppressions, and no dependency-free build gates"

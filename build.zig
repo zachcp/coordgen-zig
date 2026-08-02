@@ -435,11 +435,18 @@ pub fn build(b: *std.Build) !void {
         .file = b.path("tests/abi_layout.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic" },
     });
+    // The static asserts above check the header against itself; linking the
+    // real library is what catches drift between the header's declared
+    // coordgen_generate/coordgen_result_free signatures and what the Zig
+    // implementation actually exports. A signature or name mismatch here is
+    // a link error, not a silent pass.
+    abi_layout_module.linkLibrary(library);
     const abi_layout = b.addExecutable(.{
         .name = "abi-layout-test",
         .root_module = abi_layout_module,
     });
     const run_abi_layout = b.addRunArtifact(abi_layout);
+    run_abi_layout.expectExitCode(0);
 
     const abi_cpp_module = b.createModule(.{
         .target = target,
@@ -876,6 +883,6 @@ pub fn build(b: *std.Build) !void {
     regeneration_step.dependOn(&regeneration_pending.step);
 
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
-    const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-r15");
+    const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
     fuzz_step.dependOn(&fuzz_pending.step);
 }
