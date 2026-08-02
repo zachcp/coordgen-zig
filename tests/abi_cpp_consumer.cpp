@@ -11,7 +11,11 @@ static_assert(std::is_standard_layout<coordgen_result_t>::value,
  * Compile-time shape of the dominant RDKit flow: atom flags/template data,
  * bonds and stereo are present before the one-shot call; output is addressed
  * by the original atom array position and scaled by the public bond length.
- * Linking/running this against the pinned C++ oracle belongs to cgz-r04/r03.
+ *
+ * This stays compile-only so abi-check never depends on the oracle. The same
+ * flow linked against the pinned C++ facade and executed, which is what makes
+ * the input-order contract falsifiable, is tests/rdkit_consumer.cpp under
+ * `zig build upstream-oracle -Denable-oracle=true`.
  */
 void rdkit_shaped_consumer(void) {
     coordgen_atom_input_t atoms[4] = {};

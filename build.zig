@@ -576,6 +576,30 @@ pub fn build(b: *std.Build) !void {
         run_oracle_abi_cpp_smoke.expectExitCode(0);
         oracle_step.dependOn(&run_oracle_abi_cpp_smoke.step);
 
+        // cgz-r07's sufficiency test: the RDKit-shaped flow, linked against the
+        // pinned facade and run, rather than compiled for shape alone as
+        // tests/abi_cpp_consumer.cpp is. The input-order contract is only
+        // falsifiable when the facade is live, which is why this cannot live in
+        // abi-check.
+        const rdkit_consumer_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        rdkit_consumer_module.addIncludePath(b.path("include"));
+        rdkit_consumer_module.addCSourceFile(.{
+            .file = b.path("tests/rdkit_consumer.cpp"),
+            .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        });
+        rdkit_consumer_module.linkLibrary(oracle_abi);
+        const rdkit_consumer = b.addExecutable(.{
+            .name = "rdkit-consumer",
+            .root_module = rdkit_consumer_module,
+        });
+        const run_rdkit_consumer = b.addRunArtifact(rdkit_consumer);
+        run_rdkit_consumer.expectExitCode(0);
+        oracle_step.dependOn(&run_rdkit_consumer.step);
+
         // Upstream's own example program is the cheapest proof that the
         // static library links and runs. Its two atoms must come out one
         // bond-length (50) apart on the x axis, which is the baseline
