@@ -29,6 +29,27 @@ consumer output. The adversarial permutation contract is exercised in
 The public bond-length unit is `bond_length = 50.0f` in Zig and
 `COORDGEN_BOND_LENGTH = 50.0f` in C.
 
+### Sufficiency evidence
+
+These are claims about what a real consumer needs, so they are settled by a
+consumer rather than by argument. `tests/rdkit_consumer.cpp` reproduces the
+flow of RDKit's `External/CoordGen/CoordGen.h` — per-atom flags and template
+coordinates, bond stereo, one generate call, coordinates read back by the
+caller's own atom index and divided by 50 — links it against the pinned C++
+facade, and runs it under `zig build upstream-oracle -Denable-oracle=true`.
+
+The molecule is handed over in an order that is deliberately not its
+connectivity order, so the input-order contract is falsifiable rather than
+assumed: a result returned in canonical or component order would fail the
+bonded-distance checks instead of silently transposing coordinates. Measured
+against the pinned facade, bonded pairs come back 49.996–50.001 apart, and
+renumbering every atom through an unrelated permutation reproduces the distance
+matrix with a deviation of exactly 0.
+
+`tests/abi_cpp_consumer.cpp` keeps the same surface as a compile-only check for
+builds that must not depend on the oracle; it is the header's portability gate,
+not its behavioral one.
+
 ## Conserved type table
 
 | Meaning | Zig representation | Units/default | Invalid state | C ABI | Upstream mapping / ownership |
