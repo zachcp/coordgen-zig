@@ -16,7 +16,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        # v7.0.1; v4 runs on Node 20, which GitHub-hosted runners no longer support.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Bootstrap checksummed Zig
         id: zig
@@ -63,12 +64,40 @@ jobs:
 
       # The architecture axis of the stability classification runs the other
       # CPU architecture's binaries. macOS arm64 runners do that through
-      # Rosetta; Linux needs qemu-user, and -fqemu tells the build to use it.
+      # Rosetta. Linux needs qemu-user *and* a runtime for the foreign
+      # architecture's libc: the oracle binaries are dynamically linked against
+      # glibc, so without an aarch64 loader on disk they die in the loader
+      # before main. qemu-user finds it through -L, which zig passes when it is
+      # given --libc-runtimes; libc6-arm64-cross installs the tree it expects
+      # at /usr/aarch64-linux-gnu. Keeping both halves on glibc is deliberate —
+      # a musl-linked cross oracle would put a second variable (libm) inside an
+      # axis that is supposed to isolate the architecture.
+      #
+      # qemu-user-static must NOT be installed here, and no binfmt_misc handler
+      # for aarch64 may survive this step. zig reaches its qemu path only after
+      # spawning the foreign binary *fails*: see lib/compiler/Maker/Step/Run.zig,
+      # where the external executor is consulted in the error.InvalidExe branch.
+      # A registered handler makes the spawn succeed, the kernel runs qemu
+      # without the -L that zig would have supplied, and the guest dies in its
+      # loader — which is exactly how this failed the first two times.
       - name: Install foreign-architecture executor
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+          sudo apt-get install -y qemu-user libc6-arm64-cross
+          test -e /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
+          command -v qemu-aarch64
+          for handler in /proc/sys/fs/binfmt_misc/*; do
+            case "${handler##*/}" in status|register|'*') continue ;; esac
+            if grep -qa 'aarch64\|arm64' "$handler" 2>/dev/null; then
+              echo "disabling binfmt_misc handler ${handler##*/}"
+              echo -1 | sudo tee "$handler" > /dev/null
+            fi
+          done
+          ! grep -qas 'aarch64\|arm64' /proc/sys/fs/binfmt_misc/* || {
+            echo "an aarch64 binfmt_misc handler is still registered; it would bypass zig's -L" >&2
+            exit 1
+          }
 
       - name: Classify corpus stability against recorded expectations
         env:
@@ -77,8 +106,11 @@ jobs:
           ALL_PROXY: http://127.0.0.1:9
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
-          QEMU_FLAG: ${{ runner.os == 'Linux' && '-fqemu' || '' }}
-        run: ${{ steps.zig.outputs.zig }} build corpus-check -Denable-oracle=true $QEMU_FLAG
+          # -fqemu and --libc-runtimes are build-runner flags the build script
+          # cannot observe; -Dforeign-executor declares the same arrangement to
+          # the script so the architecture axis is not reported as unrunnable.
+          QEMU_FLAGS: ${{ runner.os == 'Linux' && '-Dforeign-executor=qemu -fqemu --libc-runtimes /usr' || '' }}
+        run: ${{ steps.zig.outputs.zig }} build corpus-check -Denable-oracle=true $QEMU_FLAGS
 
       - name: Prove installed artifacts exclude the oracle
         env:
