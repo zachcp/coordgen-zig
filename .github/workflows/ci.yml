@@ -61,6 +61,25 @@ jobs:
           ${{ steps.zig.outputs.zig }} build abi-check -Doptimize=safe
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true upstream-oracle
 
+      # The architecture axis of the stability classification runs the other
+      # CPU architecture's binaries. macOS arm64 runners do that through
+      # Rosetta; Linux needs qemu-user, and -fqemu tells the build to use it.
+      - name: Install foreign-architecture executor
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+
+      - name: Classify corpus stability against recorded expectations
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
+          QEMU_FLAG: ${{ runner.os == 'Linux' && '-fqemu' || '' }}
+        run: ${{ steps.zig.outputs.zig }} build corpus-check -Denable-oracle=true $QEMU_FLAG
+
       - name: Prove installed artifacts exclude the oracle
         env:
           HTTP_PROXY: http://127.0.0.1:9
