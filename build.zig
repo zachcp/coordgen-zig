@@ -52,6 +52,17 @@ const corpus_partitions = [_]struct { name: []const u8, count: u32 }{
     .{ .name = "adversarial", .count = 2000 },
 };
 
+/// Declares what the caller has arranged for running the other CPU
+/// architecture's binaries. Hosts that need no help (same architecture, or
+/// arm64 macOS running x86_64 under Rosetta) are detected instead of declared.
+const ForeignExecutor = enum {
+    /// Nothing arranged; the architecture axis fails unless the host can
+    /// execute the foreign binaries on its own.
+    none,
+    /// qemu-user plus a cross libc, reached through `-fqemu --libc-runtimes`.
+    qemu,
+};
+
 const OracleOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -462,6 +473,18 @@ pub fn build(b: *std.Build) !void {
         "Fetch the pinned C++ oracle for conformance-only build steps",
     ) orelse false;
 
+    // `-fqemu` and `--libc-runtimes` are consumed by the build runner itself
+    // and are not visible to this script: std.Build.enable_qemu is a vestigial
+    // field that the 0.17-dev Maker never populates, so a build script that
+    // reads it concludes "no executor" even when qemu is in use. The caller
+    // therefore declares the executor separately. A false declaration is not a
+    // way past the gate: the architecture-axis Run step still has to execute.
+    const foreign_executor = b.option(
+        ForeignExecutor,
+        "foreign-executor",
+        "How corpus-check runs other-architecture binaries the host cannot execute natively",
+    ) orelse .none;
+
     const oracle_step = b.step("upstream-oracle", "Validate the pinned conformance-only oracle package");
     const conformance_step = b.step("conformance", "Run oracle/native conformance checks");
 
@@ -752,12 +775,16 @@ pub fn build(b: *std.Build) !void {
         const host = b.graph.host.result;
         const cross = cross_target.result;
         const architecture_runnable = host.os.tag == cross.os.tag and
-            (host.cpu.arch == cross.cpu.arch or b.enable_qemu or b.enable_rosetta or
-                (host.os.tag == .macos and host.cpu.arch == .aarch64 and cross.cpu.arch == .x86_64));
+            (host.cpu.arch == cross.cpu.arch or
+                // Rosetta 2 runs the x86_64 half on an arm64 macOS host.
+                (host.os.tag == .macos and host.cpu.arch == .aarch64 and cross.cpu.arch == .x86_64) or
+                (host.os.tag == .linux and foreign_executor == .qemu));
         if (!architecture_runnable) {
             const missing_executor = b.addFail(b.fmt(
                 "corpus-check needs to run {s}-{s} binaries for the architecture axis; " ++
-                    "pass -fqemu (Linux) or run on a host that can execute them",
+                    "on Linux install qemu-user and a matching cross libc, then pass " ++
+                    "-Dforeign-executor=qemu -fqemu --libc-runtimes <prefix>; " ++
+                    "otherwise run on a host that can execute them",
                 .{ @tagName(cross.cpu.arch), @tagName(cross.os.tag) },
             ));
             corpus_step.dependOn(&missing_executor.step);
