@@ -21,6 +21,12 @@ For the invariant tier, native must be no worse than the same-build oracle plus
 a named per-metric margin. Margins are test data, never an implicit global
 tolerance.
 
+This document fixes *how* to compare. The numbers — the tolerant-tier tolerance,
+the invariant-tier margins, and the pass counts per tier — are set by `cgz-r14`
+in [`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md). Note that the tier assignment
+inputs (`conformance/parity_expectations.tsv`) bound oracle against *perturbed
+oracle*; they are not native-vs-oracle tolerances.
+
 ## Geometry and chirality
 
 Coordinate normalization may translate and rotate. It must not reflect by
