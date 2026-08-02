@@ -89,6 +89,13 @@ lengths** across architectures, **0.58 bond lengths** across allocator order.
 Size buckets present: 187 tiny (<10 atoms), 764 small, 674 medium, 332 large,
 50 huge (≥70 atoms).
 
+The 0.58 figure supersedes the *739 units, roughly 15 bond lengths* recorded in
+`cgz-r13` and in the epic's summary of it, which came from the standalone C++
+review probe. This pipeline measures the same single member 25× smaller. The
+correction matters because that number is the whole empirical case for the
+parity ceiling: the one input a typed-index port structurally cannot match is
+off by half a bond length, not by a relayout.
+
 The adversarial coordinate counts — 1414/2000 across architectures and 1/2000
 across allocator order — reproduce the review-probe measurements recorded in
 `cgz-r05` through an entirely different pipeline: a Zig corpus generator, the
@@ -149,9 +156,16 @@ disappears from a classification is worse than a red build.
 - `cgz-r06` (comparison semantics): the per-observable columns are the input
   to tier assignment. Structural observables stable on both axes qualify for
   the exact tier on the whole corpus, not only on the stable partition.
-- `cgz-r13` (parity ceiling): the ceiling is per observable. Coordinates on
-  order-unstable members are the only observable this corpus shows to be
-  unreproducible in the oracle itself.
+- `cgz-r13` (parity ceiling): settled in
+  [COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md). The ceiling is per
+  observable, is scoped to the **allocator-order axis only**, and is the
+  enumerated `order_unstable` column of `parity_manifest.tsv` rather than any
+  fraction in `parity_expectations.tsv`. At the pin it is four member ×
+  observable groups: `adversarial/917`, `1538`, `1588` (component transforms
+  only, coordinates bit-identical) and `adversarial/1695` (coordinates, 0.580
+  bond lengths). The 1414/2000 architecture figure is **not** a ceiling — the
+  same-build rule means both sides of a differential comparison share an
+  architecture.
 - `cgz-7v2.4.2` (differential runner): reuse `tests/oracle_corpus_run.zig`'s
   dump format. Oracle and native must run in the same process, same build,
   same target.
