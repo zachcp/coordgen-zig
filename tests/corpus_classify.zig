@@ -52,6 +52,11 @@ const Member = struct {
 const Dump = struct {
     members: std.StringArrayHashMapUnmanaged(Member) = .empty,
 
+    fn deinit(self: *Dump, allocator: std.mem.Allocator) void {
+        for (self.members.values()) |*member| member.observables.deinit(allocator);
+        self.members.deinit(allocator);
+    }
+
     fn parse(arena: std.mem.Allocator, source: []const u8) !Dump {
         var dump: Dump = .{};
         var lines = std.mem.splitScalar(u8, source, '\n');
@@ -116,6 +121,37 @@ const Classification = struct {
 const Counter = struct {
     measured: u64 = 0,
     unstable: [std.enums.values(Axis).len]u64 = @splat(0),
+};
+
+/// The dump protocol is itself a conformance contract. Expectations place
+/// ceilings on values; this list prevents an emitter regression from deleting
+/// an observable before it reaches those ceilings.
+const required_observables = [_][]const u8{
+    "status",
+    "clean_pose",
+    "coordinates",
+    "input_to_internal",
+    "internal_to_input",
+    "effective_bond_orders",
+    "bond_displays",
+    "atom_stereo",
+    "probe_status",
+    "probe_clean_pose",
+    "morgan_ranks",
+    "rings",
+    "rings_set",
+    "fragments",
+    "fragments_set",
+    "dofs",
+    "dofs_set",
+    "dof_penalties",
+    "dof_penalties_set",
+    "template_mappings",
+    "template_mappings_set",
+    "components",
+    "components_set",
+    "component_transforms",
+    "component_transforms_set",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -223,6 +259,16 @@ fn classifyPartition(
     if (baseline.members.count() == 0) {
         return fatal("partition '{s}' baseline dump has no members", .{partition.name});
     }
+    for (std.enums.values(Axis)) |axis| {
+        try validateDumpSchema(
+            partition.name,
+            baseline,
+            variants[@backingInt(axis)],
+            axis.label(),
+            &required_observables,
+            true,
+        );
+    }
 
     for (baseline.members.keys(), baseline.members.values()) |key, member| {
         var classification: Classification = .{
@@ -271,6 +317,76 @@ fn classifyPartition(
 
         try classifications.append(arena, classification);
     }
+}
+
+fn validateDumpSchema(
+    partition: []const u8,
+    baseline: Dump,
+    other: Dump,
+    axis: []const u8,
+    required: []const []const u8,
+    log_failure: bool,
+) !void {
+    if (baseline.members.count() != other.members.count()) {
+        return schemaFailure(
+            log_failure,
+            "partition '{s}' has {d} baseline members but {d} {s} members",
+            .{ partition, baseline.members.count(), other.members.count(), axis },
+        );
+    }
+    for (baseline.members.keys(), baseline.members.values()) |key, member| {
+        const other_member = other.members.get(key) orelse return schemaFailure(
+            log_failure,
+            "member '{s}' is missing from the {s} dump of partition '{s}'",
+            .{ key, axis, partition },
+        );
+        if (member.atom_count != other_member.atom_count or
+            member.bond_count != other_member.bond_count or
+            !std.mem.eql(u8, member.bucket, other_member.bucket))
+        {
+            return schemaFailure(
+                log_failure,
+                "member '{s}' input metadata differs in the {s} dump of partition '{s}'",
+                .{ key, axis, partition },
+            );
+        }
+        for (required) |observable| {
+            if (!member.observables.contains(observable) or
+                !other_member.observables.contains(observable))
+            {
+                return schemaFailure(
+                    log_failure,
+                    "member '{s}' is missing required observable '{s}' in the {s} dump of partition '{s}'",
+                    .{ key, observable, axis, partition },
+                );
+            }
+        }
+        if (member.observables.count() != other_member.observables.count()) {
+            return schemaFailure(
+                log_failure,
+                "member '{s}' has a different observable schema in the {s} dump of partition '{s}'",
+                .{ key, axis, partition },
+            );
+        }
+        for (member.observables.keys()) |observable| {
+            if (!other_member.observables.contains(observable)) {
+                return schemaFailure(
+                    log_failure,
+                    "member '{s}' is missing observable '{s}' in the {s} dump of partition '{s}'",
+                    .{ key, observable, axis, partition },
+                );
+            }
+        }
+    }
+}
+
+fn schemaFailure(
+    log_failure: bool,
+    comptime format: []const u8,
+    arguments: anytype,
+) error{CorpusClassifyFailed} {
+    if (log_failure) return fatal(format, arguments);
+    return error.CorpusClassifyFailed;
 }
 
 /// Largest single-coordinate difference, in bond lengths. Both payloads are
@@ -407,6 +523,26 @@ fn checkExpectations(
     expectations: []const Expectation,
 ) !usize {
     var failures: usize = 0;
+
+    // An explicit expectation is a statement that an observable must be
+    // measured. Without this check, a misspelled or accidentally removed
+    // observable could leave a stale expectation row that no counter visits.
+    for (expectations) |expectation| {
+        if (std.mem.eql(u8, expectation.observable, "*")) continue;
+        var key_buffer: [1024]u8 = undefined;
+        const key = try std.fmt.bufPrint(
+            &key_buffer,
+            "{s}\t{s}",
+            .{ expectation.partition, expectation.observable },
+        );
+        if (counters.contains(key)) continue;
+        try out.print(
+            "corpus-classify: recorded expectation {s}/{s} was not measured\n",
+            .{ expectation.partition, expectation.observable },
+        );
+        failures += 1;
+    }
+
     for (counters.keys(), counters.values()) |key, counter| {
         const split = std.mem.indexOfScalar(u8, key, '\t').?;
         const partition = key[0..split];
@@ -456,6 +592,81 @@ fn findExpectation(
         if (std.mem.eql(u8, expectation.observable, "*")) wildcard = expectation;
     }
     return wildcard;
+}
+
+test "schema rejects observable, member, and input metadata drift" {
+    const baseline_source =
+        "input\tadversarial/0\tatoms=2 bonds=1 bucket=tiny\n" ++
+        "status\tadversarial/0\tok\n";
+    var baseline = try Dump.parse(std.testing.allocator, baseline_source);
+    defer baseline.deinit(std.testing.allocator);
+
+    var missing_observable = try Dump.parse(
+        std.testing.allocator,
+        "input\tadversarial/0\tatoms=2 bonds=1 bucket=tiny\n",
+    );
+    defer missing_observable.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CorpusClassifyFailed,
+        validateDumpSchema("adversarial", baseline, missing_observable, "architecture", &.{"status"}, false),
+    );
+
+    var extra_member = try Dump.parse(
+        std.testing.allocator,
+        baseline_source ++
+            "input\tadversarial/1\tatoms=2 bonds=1 bucket=tiny\n" ++
+            "status\tadversarial/1\tok\n",
+    );
+    defer extra_member.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CorpusClassifyFailed,
+        validateDumpSchema("adversarial", baseline, extra_member, "architecture", &.{"status"}, false),
+    );
+
+    const baseline_two_members = baseline_source ++
+        "input\tadversarial/1\tatoms=2 bonds=1 bucket=tiny\n" ++
+        "status\tadversarial/1\tok\n";
+    var missing_member = try Dump.parse(std.testing.allocator, baseline_source);
+    defer missing_member.deinit(std.testing.allocator);
+    var two_members = try Dump.parse(std.testing.allocator, baseline_two_members);
+    defer two_members.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CorpusClassifyFailed,
+        validateDumpSchema("adversarial", two_members, missing_member, "architecture", &.{"status"}, false),
+    );
+
+    var changed_atoms = try Dump.parse(
+        std.testing.allocator,
+        "input\tadversarial/0\tatoms=3 bonds=1 bucket=tiny\n" ++
+            "status\tadversarial/0\tok\n",
+    );
+    defer changed_atoms.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CorpusClassifyFailed,
+        validateDumpSchema("adversarial", baseline, changed_atoms, "architecture", &.{"status"}, false),
+    );
+
+    var changed_bonds = try Dump.parse(
+        std.testing.allocator,
+        "input\tadversarial/0\tatoms=2 bonds=2 bucket=tiny\n" ++
+            "status\tadversarial/0\tok\n",
+    );
+    defer changed_bonds.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CorpusClassifyFailed,
+        validateDumpSchema("adversarial", baseline, changed_bonds, "architecture", &.{"status"}, false),
+    );
+
+    var changed_bucket = try Dump.parse(
+        std.testing.allocator,
+        "input\tadversarial/0\tatoms=2 bonds=1 bucket=small\n" ++
+            "status\tadversarial/0\tok\n",
+    );
+    defer changed_bucket.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.CorpusClassifyFailed,
+        validateDumpSchema("adversarial", baseline, changed_bucket, "architecture", &.{"status"}, false),
+    );
 }
 
 fn fatal(comptime format: []const u8, arguments: anytype) error{CorpusClassifyFailed} {

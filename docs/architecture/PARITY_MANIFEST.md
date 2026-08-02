@@ -10,6 +10,10 @@ mapping upstream tests, APIs, fixtures, and templates to native tests — is
 `cgz-7v2.4.1`. The catalog says *how* to compare; the matrix says *what* must
 be covered.
 
+The catalog is consumed under the frozen three-tier policy in
+[`COMPARISON_SEMANTICS.md`](COMPARISON_SEMANTICS.md), including its
+reflection-safe coordinate normalization and same-build baseline rule.
+
 ## What is measured
 
 The same corpus runs through three oracle builds that differ in exactly one

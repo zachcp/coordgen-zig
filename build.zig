@@ -346,6 +346,19 @@ pub fn build(b: *std.Build) !void {
         .root_module = conformance,
     });
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
+    const corpus_classify_module = b.createModule(.{
+        .root_source_file = b.path("tests/corpus_classify.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "conformance", .module = conformance }},
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    const corpus_classify_tests = b.addTest(.{
+        .name = "corpus-classify-test",
+        .root_module = corpus_classify_module,
+    });
+    const run_corpus_classify_tests = b.addRunArtifact(corpus_classify_tests);
     const layer_tests = b.addTest(.{
         .name = "module-layer-test",
         .root_module = module_layers,
@@ -370,6 +383,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_module_tests.step);
     for (layer_test_runs) |run| test_step.dependOn(&run.step);
     test_step.dependOn(&run_conformance_tests.step);
+    test_step.dependOn(&run_corpus_classify_tests.step);
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
@@ -598,6 +612,24 @@ pub fn build(b: *std.Build) !void {
             .oracle_abi = corpus_oracle,
             .descending_allocator = true,
         });
+        const allocator_smoke_module = b.createModule(.{
+            .target = target,
+            .optimize = corpus_optimize,
+            .link_libcpp = true,
+        });
+        allocator_smoke_module.addCSourceFiles(.{
+            .files = &.{
+                "conformance/allocator_order.cpp",
+                "conformance/allocator_order_smoke.cpp",
+            },
+            .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+        });
+        const allocator_smoke = b.addExecutable(.{
+            .name = "allocator-order-smoke",
+            .root_module = allocator_smoke_module,
+        });
+        const run_allocator_smoke = b.addRunArtifact(allocator_smoke);
+        run_allocator_smoke.expectExitCode(0);
 
         // The architecture axis is a second oracle built for the other CPU
         // architecture of the same OS. Floating-point evaluation differences
@@ -674,17 +706,9 @@ pub fn build(b: *std.Build) !void {
         drug_like_diff.addFileArg(corpus_dump_output);
         drug_like_diff.expectExitCode(0);
 
-        const classify_module = b.createModule(.{
-            .root_source_file = b.path("tests/corpus_classify.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "conformance", .module = conformance }},
-            .link_libc = false,
-            .link_libcpp = false,
-        });
         const classify = b.addExecutable(.{
             .name = "corpus-classify",
-            .root_module = classify_module,
+            .root_module = corpus_classify_module,
         });
         const run_classify = b.addRunArtifact(classify);
         run_classify.expectExitCode(0);
@@ -719,6 +743,7 @@ pub fn build(b: *std.Build) !void {
         );
         corpus_step.dependOn(&drug_like_diff.step);
         corpus_step.dependOn(&run_classify.step);
+        corpus_step.dependOn(&run_allocator_smoke.step);
 
         // A Run step whose binary the host cannot execute is skipped, and a
         // skipped step still leaves the build green. The architecture axis
