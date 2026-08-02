@@ -1,0 +1,112 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+lock_file="$repo_root/upstream/coordgenlibs.lock"
+
+fail() {
+    echo "verify-upstream: $*" >&2
+    exit 1
+}
+
+lock_value() {
+    key=$1
+    awk -F '\t' -v key="$key" '$1 == key { print $2; exit }' "$lock_file"
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    else
+        fail "need sha256sum or shasum"
+    fi
+}
+
+[ "$(lock_value schema_version)" = 1 ] || fail "unsupported provenance lock schema"
+commit=$(lock_value commit)
+git_tree=$(lock_value git_tree_sha1)
+archive_root=$(lock_value archive_root)
+expected_bytes=$(lock_value archive_bytes)
+archive_sha=$(lock_value archive_sha256)
+package_hash=$(lock_value package_tree_hash)
+archive_url=$(lock_value archive_url)
+mirror_url=$(lock_value mirror_url)
+license_path=$(lock_value license_path)
+license_sha=$(lock_value license_sha256)
+
+case "$archive_url" in
+    *'/master/'*|*'/main/'*|*'refs/heads/'*) fail "archive URL resolves a branch" ;;
+esac
+case "$archive_url" in
+    *"$commit"*) ;;
+    *) fail "archive URL does not name the immutable commit" ;;
+esac
+
+if [ "$mirror_url" = UNCONFIGURED ]; then
+    if [ "${CGZ_REQUIRE_UPSTREAM_MIRROR:-0}" = 1 ]; then
+        fail "owner-controlled upstream mirror is not configured"
+    fi
+    echo "verify-upstream: warning: owner-controlled mirror is not configured; using exact upstream URL" >&2
+    download_url=$archive_url
+else
+    download_url=$mirror_url
+fi
+
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/coordgen-provenance.XXXXXX")
+trap 'rm -rf "$temp_dir"' EXIT HUP INT TERM
+
+if [ "${1:-}" = --archive ]; then
+    [ "$#" -eq 2 ] || fail "usage: verify-upstream [--archive PATH]"
+    archive_path=$2
+elif [ "$#" -eq 0 ]; then
+    archive_path="$temp_dir/coordgenlibs.tar.gz"
+    curl --fail --location --retry 3 --output "$archive_path" "$download_url"
+else
+    fail "usage: verify-upstream [--archive PATH]"
+fi
+
+[ -f "$archive_path" ] || fail "archive not found: $archive_path"
+[ "$(sha256_file "$archive_path")" = "$archive_sha" ] || fail "archive SHA-256 mismatch"
+actual_bytes=$(wc -c < "$archive_path" | tr -d ' ')
+[ "$actual_bytes" = "$expected_bytes" ] || fail "archive size mismatch"
+
+first_entry=$(tar -tzf "$archive_path" | awk 'NR == 1 { print; exit }')
+[ "$first_entry" = "$archive_root/" ] || fail "archive root does not name the pinned commit"
+actual_tree=$(python3 "$repo_root/tools/git-tree-sha1.py" "$archive_path")
+[ "$actual_tree" = "$git_tree" ] || fail "Git tree hash mismatch"
+
+tar -xOf "$archive_path" "$archive_root/$license_path" > "$temp_dir/LICENSE"
+[ "$(sha256_file "$temp_dir/LICENSE")" = "$license_sha" ] || fail "upstream LICENSE mismatch"
+
+zig_path=${CGZ_ZIG:-}
+if [ -z "$zig_path" ]; then
+    zig_path=$($repo_root/tools/bootstrap-zig)
+fi
+[ "$($zig_path version)" = "$(awk -F '\t' '$1 == "version" { print $2; exit }' "$repo_root/toolchain.lock")" ] \
+    || fail "package hash must be checked by the pinned Zig"
+
+export ZIG_GLOBAL_CACHE_DIR=${ZIG_GLOBAL_CACHE_DIR:-"$repo_root/.tools/zig-global-cache"}
+export ZIG_LOCAL_CACHE_DIR=${ZIG_LOCAL_CACHE_DIR:-"$repo_root/.zig-cache"}
+mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+mkdir -p "$temp_dir/package"
+tar -xzf "$archive_path" -C "$temp_dir/package"
+# URL archive fetching strips this single GitHub top-level directory. Hash the
+# extracted root to reproduce URL dependency semantics without trusting the URL.
+actual_package_hash=$($zig_path fetch "$temp_dir/package/$archive_root" | tail -n 1)
+[ "$actual_package_hash" = "$package_hash" ] || fail "Zig package tree hash mismatch"
+
+grep -F ".url = \"$archive_url\"" "$repo_root/build.zig.zon" >/dev/null \
+    || fail "build.zig.zon URL differs from provenance lock"
+grep -F ".hash = \"$package_hash\"" "$repo_root/build.zig.zon" >/dev/null \
+    || fail "build.zig.zon package hash differs from provenance lock"
+grep -F '.lazy = true' "$repo_root/build.zig.zon" >/dev/null \
+    || fail "oracle dependency is not lazy"
+
+range_count=$(awk -F '\t' '$1 == "range_commit" { count += 1 } END { print count + 0 }' "$lock_file")
+merge_count=$(awk -F '\t' '$1 == "range_commit" && $3 == "merge" { count += 1 } END { print count + 0 }' "$lock_file")
+[ "$range_count" = 10 ] || fail "expected ten commits after v3.0.2"
+[ "$merge_count" = 1 ] || fail "expected exactly one merge commit in the range"
+
+echo "verified coordgenlibs commit $commit (tree $git_tree, package $package_hash)"

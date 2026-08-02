@@ -75,3 +75,13 @@ _Add a brief overview of your project architecture_
 ## Conventions & Patterns
 
 _Add your project-specific conventions here_
+
+## Concurrent Agent Working Agreement
+
+- Claim the owning Bead before editing and respect the file ownership recorded there.
+- Establish a committed baseline before starting concurrent implementation agents.
+- Commit before and after a work session when the user or active profile authorizes commits; otherwise stop with a clean handoff and leave the working tree untouched by other agents.
+- Never restore or overwrite a shared file with `cp -f`, `git checkout --`, or an equivalent destructive operation unless that exact file is owned by the current Bead and the current changes have been inspected.
+- Perform experiments and independent reviews in a temporary copy or Git worktree, not by rewriting the shared working tree.
+- Validation evidence must use a fresh local cache, identify the exact toolchain/configuration, and must not weaken flags, tolerances, corpora, or assertions merely to make a gate pass.
+- A reserved gate must fail with the owning Bead ID until its real implementation is wired.

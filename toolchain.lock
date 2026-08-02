@@ -1,0 +1,9 @@
+# coordgen-zig host toolchain lock, schema 1.
+# This file is intentionally not ZON: it is parsed before Zig is trusted.
+# Fields are tab-separated. target columns are:
+# host, archive, sha256, bytes, upstream_url, owner_controlled_mirror_url.
+schema_version	1
+version	0.17.0-dev.1516+8a4b5424d
+target	aarch64-macos	zig-aarch64-macos-0.17.0-dev.1516+8a4b5424d.tar.xz	7284f4c3dd6efc8881225fcebe45e85f77c999748d73f895e72d3c6fcfb9fe8d	53774672	https://ziglang.org/builds/zig-aarch64-macos-0.17.0-dev.1516+8a4b5424d.tar.xz	UNCONFIGURED
+target	x86_64-macos	zig-x86_64-macos-0.17.0-dev.1516+8a4b5424d.tar.xz	0d637250297833234c44e66dca71455cae774659a9537aad6ccabbdab75b6571	59063328	https://ziglang.org/builds/zig-x86_64-macos-0.17.0-dev.1516+8a4b5424d.tar.xz	UNCONFIGURED
+target	x86_64-linux	zig-x86_64-linux-0.17.0-dev.1516+8a4b5424d.tar.xz	d3cb1d1dbe825ec5cb924b0c399ce0dfbdd27a61ae1097e272bee9f1ca07b311	57080284	https://ziglang.org/builds/zig-x86_64-linux-0.17.0-dev.1516+8a4b5424d.tar.xz	UNCONFIGURED

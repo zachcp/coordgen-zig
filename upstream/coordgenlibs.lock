@@ -1,0 +1,26 @@
+# coordgenlibs immutable semantic provenance lock, schema 1.
+# Fields are tab-separated and deliberately host-readable.
+schema_version	1
+repository	https://github.com/schrodinger/coordgenlibs
+base_tag	v3.0.2
+commit	d20e735d96480385b2e257522288004038a08cc9
+git_tree_sha1	ec93c5f64e37236cc2e1498732dfdade2eab54dc
+archive_root	coordgenlibs-d20e735d96480385b2e257522288004038a08cc9
+archive_bytes	167157
+archive_sha256	e8b4f5b2b3dd9d2cf7c6bd6e57edabcb536ff05d7f8b894560e48177b01828c9
+package_tree_hash	N-V-__8AABQpDwDF-WSgsvjsY-rYyWJy_5YJ_PrMUhx_2Yxh
+archive_url	https://github.com/schrodinger/coordgenlibs/archive/d20e735d96480385b2e257522288004038a08cc9.tar.gz
+mirror_url	UNCONFIGURED
+license	BSD-3-Clause
+license_path	LICENSE
+license_sha256	b123b11566a0194a1a6bd8eeaaa9acd47cd6846e3df17ecba572a43a0665ba28
+range_commit	6a1485643feb71c6d609d263f28751004c733cf7	non-merge	Fix some set but unused variables (#125)
+range_commit	c2fa2021b9518111b9240662dbdd03740f4e1ef7	non-merge	Export the include directory to the .cmake file (#129)
+range_commit	71e0ebc0981494702b68b8d0092455db62d41534	non-merge	build: use PROJECT_VERSION and install coordgen-config-version.cmake (#127)
+range_commit	55d99851afabd0bdd12904c2cb73e56398ad3daa	non-merge	Fixed bug in vertexCoords::operator<
+range_commit	b9d431bd7a102800e700d1c99beab0bb8ce1bf0d	non-merge	Use ${CMAKE_INSTALL_INCLUDEDIR} for headers installation path (#136)
+range_commit	a5abd7220addb1c718dd62a2592db3631f1ade97	non-merge	Fix installation of cmake targets and config (#135)
+range_commit	343ce5b4d935aee6fc247b10de7682872a7a3773	non-merge	fix: fix -Wdeprecated-literal-operator (#132)
+range_commit	448c2612995d549365ad35c3872e586404a2f7f7	non-merge	build: bump cmake_minimum_required to 3.5 (#130)
+range_commit	6212c8616bd25224b49d077afbd0e1b1ba5a891c	non-merge	fixes the issue, no idea why
+range_commit	d20e735d96480385b2e257522288004038a08cc9	merge	Merge pull request #138 from ricrogz/issue_137

@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Bootstrap checksummed Zig
+        id: zig
+        env:
+          CGZ_TOOLCHAIN_CACHE: ${{ runner.temp }}/coordgen-zig-toolchain
+        run: echo "zig=$(tools/bootstrap-zig)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify build and provenance policy
+        env:
+          CGZ_ZIG: ${{ steps.zig.outputs.zig }}
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-provenance-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-provenance-local-cache
+        run: |
+          tools/check-build-policy
+          tools/verify-upstream
+
+      - name: Prove ordinary builds do not fetch the oracle
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-ordinary-empty-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-ordinary-local-cache
+        run: ${{ steps.zig.outputs.zig }} build test
+
+      - name: Fetch complete package graph
+        env:
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
+        run: ${{ steps.zig.outputs.zig }} build --fetch=all
+
+      - name: Build and validate fetched packages offline
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
+        run: |
+          ${{ steps.zig.outputs.zig }} build package-check
+          ${{ steps.zig.outputs.zig }} build abi-check
+          ${{ steps.zig.outputs.zig }} build abi-check -Doptimize=safe
+          ${{ steps.zig.outputs.zig }} build -Denable-oracle=true upstream-oracle
+
+      - name: Prove installed artifacts exclude the oracle
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
+        run: |
+          ${{ steps.zig.outputs.zig }} build --prefix "${{ runner.temp }}/coordgen-install"
+          tools/check-install-isolation "${{ runner.temp }}/coordgen-install"

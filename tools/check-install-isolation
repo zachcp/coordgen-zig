@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+fail() {
+    echo "check-install-isolation: $*" >&2
+    exit 1
+}
+
+[ "$#" -eq 1 ] || fail "usage: check-install-isolation PREFIX"
+prefix=$1
+library="$prefix/lib/libcoordgen.a"
+public_header="$prefix/include/coordgen_abi.h"
+
+[ -f "$library" ] || fail "installed coordgen library is missing"
+[ -f "$public_header" ] || fail "installed public C header is missing"
+if find "$prefix" -type f -name 'coordgen_probe.h' | grep . >/dev/null; then
+    fail "conformance-only probe header was installed"
+fi
+if find "$prefix" -type f \( -iname '*oracle*' -o -iname '*coordgenlibs*' \) | grep . >/dev/null; then
+    fail "installed artifacts contain an oracle-named file"
+fi
+if grep -aE 'sketcherMinimizer|CoordgenMinimizer' "$library" >/dev/null; then
+    fail "installed production archive contains upstream C++ symbols"
+fi
+
+echo "verified installed public ABI and exclusion of the C++ oracle/probe header"

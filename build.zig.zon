@@ -1,0 +1,31 @@
+.{
+    .name = .coordgen,
+    .version = "0.0.0",
+    .fingerprint = 0x77542451d402daf8, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0-dev.1516+8a4b5424d",
+    .dependencies = .{
+        .coordgenlibs_oracle = .{
+            .url = "https://github.com/schrodinger/coordgenlibs/archive/d20e735d96480385b2e257522288004038a08cc9.tar.gz",
+            .hash = "N-V-__8AABQpDwDF-WSgsvjsY-rYyWJy_5YJ_PrMUhx_2Yxh",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "build_support",
+        "src",
+        "include",
+        "conformance",
+        "tests",
+        "examples",
+        "LICENSES",
+        "README.md",
+        "docs",
+        "upstream",
+        "tools/check-build-policy",
+        "tools/git-tree-sha1.py",
+        "tools/check-install-isolation",
+        "tools/verify-upstream",
+    },
+}

@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+zon="$repo_root/build.zig.zon"
+upstream_lock="$repo_root/upstream/coordgenlibs.lock"
+toolchain_lock="$repo_root/toolchain.lock"
+
+fail() {
+    echo "check-build-policy: $*" >&2
+    exit 1
+}
+
+lock_value() {
+    file=$1
+    key=$2
+    awk -F '\t' -v key="$key" '$1 == key { print $2; exit }' "$file"
+}
+
+version=$(lock_value "$toolchain_lock" version)
+archive_url=$(lock_value "$upstream_lock" archive_url)
+package_hash=$(lock_value "$upstream_lock" package_tree_hash)
+
+grep -F ".minimum_zig_version = \"$version\"" "$zon" >/dev/null \
+    || fail "minimum_zig_version and toolchain.lock differ"
+grep -F ".url = \"$archive_url\"" "$zon" >/dev/null \
+    || fail "oracle URL and provenance lock differ"
+grep -F ".hash = \"$package_hash\"" "$zon" >/dev/null \
+    || fail "oracle package hash and provenance lock differ"
+grep -F '.lazy = true' "$zon" >/dev/null || fail "oracle must remain lazy"
+grep -F 'dependencyLazy("coordgenlibs_oracle"' "$repo_root/build.zig" >/dev/null \
+    || fail "build graph does not use the lazy dependency API"
+grep -F '"enable-oracle"' "$repo_root/build.zig" >/dev/null \
+    || fail "oracle has no explicit opt-in boundary"
+grep -F 'library.installHeader(b.path("include/coordgen_abi.h"), "coordgen_abi.h")' \
+    "$repo_root/build.zig" >/dev/null || fail "public C header is not installed"
+if grep -E 'install(Header|File).*coordgen_probe|install(Header|File).*conformance' \
+    "$repo_root/build.zig" >/dev/null; then
+    fail "conformance probe header must never be installed"
+fi
+
+if grep -E '/(master|main)(/|\.|$)|refs/heads/' "$zon" "$upstream_lock" >/dev/null; then
+    fail "a dependency URL resolves a branch"
+fi
+
+dependency_count=$(grep -c '^        \.[A-Za-z0-9_]* = \.{' "$zon" || true)
+[ "$dependency_count" = 1 ] || fail "production package gained an unreviewed dependency"
+
+sh "$repo_root/tools/check-gate-strength"
+
+echo "verified std-only production package, public-header install, non-installed probe, and lazy oracle policy"

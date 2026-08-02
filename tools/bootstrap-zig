@@ -1,0 +1,99 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+lock_file="$repo_root/toolchain.lock"
+
+fail() {
+    echo "bootstrap-zig: $*" >&2
+    exit 1
+}
+
+lock_value() {
+    key=$1
+    awk -F '\t' -v key="$key" '$1 == key { print $2; exit }' "$lock_file"
+}
+
+target_value() {
+    host=$1
+    column=$2
+    awk -F '\t' -v host="$host" -v column="$column" \
+        '$1 == "target" && $2 == host { print $column; exit }' "$lock_file"
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    else
+        fail "need sha256sum or shasum"
+    fi
+}
+
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) host=aarch64-macos ;;
+    Darwin:x86_64) host=x86_64-macos ;;
+    Linux:x86_64) host=x86_64-linux ;;
+    *) fail "unsupported bootstrap host: $(uname -s) $(uname -m)" ;;
+esac
+
+[ "$(lock_value schema_version)" = 1 ] || fail "unsupported toolchain.lock schema"
+version=$(lock_value version)
+archive=$(target_value "$host" 3)
+expected_sha=$(target_value "$host" 4)
+expected_bytes=$(target_value "$host" 5)
+upstream_url=$(target_value "$host" 6)
+mirror_url=$(target_value "$host" 7)
+
+[ -n "$version" ] || fail "missing version"
+[ -n "$archive" ] || fail "host $host is not pinned"
+[ -n "$expected_sha" ] || fail "missing SHA-256 for $host"
+
+if [ "$mirror_url" = UNCONFIGURED ]; then
+    if [ "${CGZ_REQUIRE_TOOLCHAIN_MIRROR:-0}" = 1 ]; then
+        fail "owner-controlled mirror is not configured for $host"
+    fi
+    echo "bootstrap-zig: warning: owner-controlled mirror is not configured; using exact upstream URL" >&2
+    download_url=$upstream_url
+else
+    download_url=$mirror_url
+fi
+
+cache_root=${CGZ_TOOLCHAIN_CACHE:-"$repo_root/.tools/toolchains"}
+download_dir="$cache_root/downloads"
+install_parent="$cache_root/$host"
+archive_path="$download_dir/$archive"
+install_dir="$install_parent/$version"
+zig_path="$install_dir/zig"
+
+mkdir -p "$download_dir" "$install_parent"
+
+if [ ! -f "$archive_path" ]; then
+    archive_tmp="$archive_path.partial"
+    curl --fail --location --retry 3 --output "$archive_tmp" "$download_url"
+    actual_sha=$(sha256_file "$archive_tmp")
+    [ "$actual_sha" = "$expected_sha" ] || fail "archive SHA-256 mismatch for $host"
+    mv -f "$archive_tmp" "$archive_path"
+fi
+
+actual_sha=$(sha256_file "$archive_path")
+[ "$actual_sha" = "$expected_sha" ] || fail "cached archive SHA-256 mismatch for $host"
+actual_bytes=$(wc -c < "$archive_path" | tr -d ' ')
+[ "$actual_bytes" = "$expected_bytes" ] || fail "archive size mismatch for $host"
+
+if [ ! -x "$zig_path" ]; then
+    [ ! -e "$install_dir" ] || fail "incomplete install exists at $install_dir"
+    extract_dir=$(mktemp -d "$cache_root/.extract.XXXXXX")
+    trap 'rm -rf "$extract_dir"' EXIT HUP INT TERM
+    tar -xJf "$archive_path" -C "$extract_dir"
+    archive_root=${archive%.tar.xz}
+    [ -x "$extract_dir/$archive_root/zig" ] || fail "archive does not contain expected Zig executable"
+    mv -f "$extract_dir/$archive_root" "$install_dir"
+    rm -rf "$extract_dir"
+    trap - EXIT HUP INT TERM
+fi
+
+actual_version=$($zig_path version)
+[ "$actual_version" = "$version" ] || fail "expected Zig $version, found $actual_version"
+printf '%s\n' "$zig_path"

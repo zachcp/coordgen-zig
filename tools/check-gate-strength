@@ -1,0 +1,43 @@
+#!/bin/sh
+set -eu
+
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+build_file="$repo_root/build.zig"
+
+fail() {
+    echo "check-gate-strength: $*" >&2
+    exit 1
+}
+
+require_text() {
+    text=$1
+    grep -F "$text" "$build_file" >/dev/null || fail "missing required build policy: $text"
+}
+
+require_text '.flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic" }'
+require_text '.flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" }'
+
+if grep -F -- '-Wno-' "$build_file" >/dev/null; then
+    fail "ABI/build gates may not suppress warnings without a recorded decision"
+fi
+
+for step in \
+    test_step \
+    module_graph_step \
+    package_step \
+    abi_step \
+    oracle_step \
+    conformance_step \
+    examples_step \
+    regeneration_step \
+    fuzz_step
+do
+    grep -F "$step.dependOn(" "$build_file" >/dev/null \
+        || fail "$step has no dependency and would be a false-green gate"
+done
+
+require_text 'const examples_pending = b.addFail("examples is not implemented yet; see cgz-7v2")'
+require_text 'const regeneration_pending = b.addFail("template-regeneration-check is not implemented yet; see cgz-r09")'
+require_text 'const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-r15")'
+
+echo "verified strict ABI flags, no warning suppressions, and no dependency-free build gates"
