@@ -19,6 +19,19 @@ owns its arrays through the caller-supplied allocator and requires exactly one
 exactly one `coordgen_result_free`. On failure the C result is zeroed. A result
 must not be copied and freed twice.
 
+Borrowed means read-only. `generate` and `coordgen_generate` never write
+through a caller pointer and never take ownership of one, so the same input may
+be submitted any number of times and every caller-owned array is unchanged
+afterwards. This is the contract upstream violates: `sketcherMinimizer::
+initialize()` opens with `clear()`, which `delete`s the previous call's atoms
+and bonds, then rewrites bond orders, erases zero-order and hidden elements,
+and reorders both vectors in place on the caller's molecule. A second
+`initialize()` on the same molecule is a use-after-free rather than a
+non-idempotent result. `cgz-r11` records this as corrected, not emulated, and
+no compatibility facade reproduces it; the layout effect of the metal/ZOB
+normalization is published instead through the effective-bond-order output.
+See [COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md).
+
 All output atom arrays are in caller input order. All output bond arrays are in
 caller input bond order. `input_to_internal` and `internal_to_input` are the
 only arrays whose names denote a permutation. Canonical ordering, component
@@ -161,6 +174,13 @@ installed.
 - Phase arenas are explicit in the generator: topology scratch resets after
   topology, layout/DOF storage after discrete search, and interaction scratch
   after continuous minimization. A phase must copy retained values upward.
-- Immutable compiled templates contain no mutable global initialization.
+- Immutable compiled templates contain no mutable global initialization, no
+  lazy load guard, and no static destruction order dependency. Upstream's
+  `loadTemplates()` guards a mutable static with a non-atomic `static bool`
+  and then mutates the templates in place through a `normalizeTemplate` that
+  is not idempotent, so a first-use race either frees templates under another
+  thread or scales their coordinates twice. Normalization happens once, at
+  template generation time, and per-generation scratch that upstream stores on
+  template atoms belongs to the context. `cgz-r12` records this as corrected.
 - Public validation paths return errors, including OOM. Assertions are only
   for invariants established by prior validation or phase types.
