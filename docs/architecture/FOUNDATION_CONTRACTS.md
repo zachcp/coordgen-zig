@@ -89,7 +89,7 @@ size, alignment, and offset. All reserved fields must be zero on input.
 | `constrainAtoms(vector<bool>)` | per-atom `constrained` | `COORDGEN_ATOM_CONSTRAINED` | false | lossless atom DTO test |
 | `fixAtoms(vector<bool>)` | per-atom `fixed` | `COORDGEN_ATOM_FIXED` | false | lossless atom DTO test |
 | `addExtraBond` | `Input.extra_bonds` | `extra_bonds` span | empty | normal validation and caller-index rules |
-| `buildFromFragments` | `build_from_fragments` | same | false | options default/layout; conformance/orchestration control |
+| `buildFromFragments` | `build_from_fragments` | same | false; only 0 accepted, nonzero is `Unsupported` | options default/layout; oracle rejects nonzero (cgz-7v2.8) |
 | `DEBUG_MINIMIZATION_COORDINATES` / review `DEBUG_COORDS` | `debug_coordinates` | same | false | accepted only by builds that provide the debug sink; otherwise `Unsupported` |
 
 The static utilities audited as public (`canonicalOrdering`, `morganScores`,
