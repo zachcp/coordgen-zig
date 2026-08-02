@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Reject @import escape hatches that bypass the named-module allow-list.
+
+src/module_layers.zig is the reviewed edge table, and build.zig's
+wireApprovedModuleEdges() wires exactly those edges as named std.Build.Module
+imports (e.g. `@import("core")`). That construction alone does not stop a
+layer file from reaching another layer's *private* files with a source-
+relative import (e.g. `@import("../model.zig")` from inside src/core/), which
+never goes through the named-module table at all. This script is the CI-
+enforced half of the contract described in docs/architecture/
+FOUNDATION_CONTRACTS.md's "Module ownership and imports" section:
+
+  1. A relative @import() may only reach another file in the *same* layer.
+     Crossing into a different layer (or a non-layer file) must go through
+     the named module the build graph provides instead.
+  2. A bare-name @import() naming another declared layer is only allowed if
+     src/module_layers.zig's approved_edges actually lists that edge. This is
+     a second, independent check on top of the fact that an unapproved bare
+     import would also fail to resolve at compile time (no such module name
+     wired) - see the comment on wireApprovedModuleEdges in build.zig.
+
+Run with no arguments to scan this repository (exit non-zero on the first
+class of violation found). Run with --self-test to prove the checker itself
+catches a planted violation of each kind, using a throwaway copy of the real
+approved_edges table; this is the negative fixture cgz-7v2.5 requires as
+completion evidence, and it runs in every build via `zig build
+module-graph-check` so the check cannot regress silently.
+
+## Declaring a new layer edge
+
+Adding an edge is a two-step, reviewed change:
+
+  1. Add the `.{ .from = ..., .to = ... }` pair to `approved_edges` in
+     src/module_layers.zig. `zig build module-graph-check` validates the
+     graph stays acyclic and one-way.
+  2. Nothing else. build.zig's wireApprovedModuleEdges() derives every
+     std.Build addImport call directly from that table, and this script
+     derives its own allow-list from the same table, so there is exactly one
+     place that grants a layer permission to import another layer.
+"""
+
+import os
+import re
+import sys
+import shutil
+import tempfile
+
+LAYER_NAMES = [
+    "core",
+    "model",
+    "geometry",
+    "topology",
+    "layout",
+    "optimize",
+    "generator",
+    "api",
+    "c_abi",
+    "conformance",
+]
+
+# The root source file for each layer, relative to src/. Every layer but
+# c_abi names its own root "<layer>.zig"; c_abi's historical root predates
+# the layer name (see src/c_abi_types.zig).
+_LAYER_ROOT_FILES = {name: f"{name}.zig" for name in LAYER_NAMES}
+_LAYER_ROOT_FILES["c_abi"] = "c_abi_types.zig"
+
+_IMPORT_RE = re.compile(r'@import\("([^"]+)"\)')
+_EDGE_RE = re.compile(r"\.from\s*=\s*\.(\w+)\s*,\s*\.to\s*=\s*\.(\w+)\s*\}")
+
+_SCAN_DIRS = ("src", "tests", "build_support")
+
+
+def layer_of(relpath):
+    """Which declared layer owns `relpath` (posix, relative to repo root), or
+    None if the file is not part of any layer (package root, contract file,
+    tests, build_support)."""
+    relpath = relpath.replace(os.sep, "/")
+    if not relpath.startswith("src/"):
+        return None
+    rest = relpath[len("src/") :]
+    for name in LAYER_NAMES:
+        if rest == _LAYER_ROOT_FILES[name] or rest.startswith(name + "/"):
+            return name
+    return None
+
+
+def _is_relative_import(target):
+    return "/" in target or target.endswith(".zig")
+
+
+def _find_zig_files(root):
+    for base in _SCAN_DIRS:
+        base_path = os.path.join(root, base)
+        if not os.path.isdir(base_path):
+            continue
+        for dirpath, _dirnames, filenames in os.walk(base_path):
+            for name in filenames:
+                if name.endswith(".zig"):
+                    yield os.path.relpath(os.path.join(dirpath, name), root)
+
+
+def _parse_approved_edges(root):
+    path = os.path.join(root, "src", "module_layers.zig")
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    return {(m.group(1), m.group(2)) for m in _EDGE_RE.finditer(text)}
+
+
+def scan(root):
+    """Return a list of human-readable violation strings for the tree rooted
+    at `root`. An empty list means the tree is clean."""
+    edges = _parse_approved_edges(root)
+    violations = []
+    for relpath in sorted(_find_zig_files(root)):
+        with open(os.path.join(root, relpath), "r", encoding="utf-8") as fh:
+            text = fh.read()
+        source_layer = layer_of(relpath)
+        for match in _IMPORT_RE.finditer(text):
+            target = match.group(1)
+            if target == "std":
+                continue
+            if _is_relative_import(target):
+                target_path = os.path.normpath(
+                    os.path.join(os.path.dirname(relpath), target)
+                ).replace(os.sep, "/")
+                target_layer = layer_of(target_path)
+                if source_layer != target_layer:
+                    violations.append(
+                        f'{relpath}: forbidden relative cross-layer import "{target}" '
+                        f"(source layer {source_layer!r}, target layer {target_layer!r}); "
+                        f"use a named module import instead"
+                    )
+            else:
+                if (
+                    source_layer is not None
+                    and target in LAYER_NAMES
+                    and target != source_layer
+                    and (source_layer, target) not in edges
+                ):
+                    violations.append(
+                        f"{relpath}: unapproved named edge {source_layer} -> {target}; "
+                        f"add it to approved_edges in src/module_layers.zig first"
+                    )
+    return violations
+
+
+def _write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+def run_self_test(repo_root):
+    tmp = tempfile.mkdtemp(prefix="cgz-module-import-check-")
+    try:
+        src = os.path.join(tmp, "src")
+        os.makedirs(src)
+        # Use the real, current edge table so the named-edge fixture below
+        # exercises the actual reviewed policy, not a fabricated one.
+        shutil.copy(
+            os.path.join(repo_root, "src", "module_layers.zig"),
+            os.path.join(src, "module_layers.zig"),
+        )
+
+        # Fixture 1: model reaches into core's private file with a relative
+        # path instead of the named "core" module import every other file
+        # in the tree uses.
+        _write(os.path.join(src, "core.zig"), "pub const marker = 1;\n")
+        _write(os.path.join(src, "core", "ids.zig"), "pub const marker = 1;\n")
+        _write(os.path.join(src, "model.zig"), 'const bad = @import("core/ids.zig");\n')
+
+        # Fixture 2: geometry claims a named edge to layout. Only
+        # `.{ .from = .layout, .to = .geometry }` is approved, not the
+        # reverse, so this must be rejected even though the import name
+        # itself resolves fine as a build-provided module.
+        _write(os.path.join(src, "geometry.zig"), 'const bad = @import("layout");\n')
+
+        violations = scan(tmp)
+        relative_hit = any(
+            "forbidden relative cross-layer import" in v and v.startswith("src/model.zig")
+            for v in violations
+        )
+        named_hit = any(
+            "unapproved named edge" in v and v.startswith("src/geometry.zig")
+            for v in violations
+        )
+        if not (relative_hit and named_hit):
+            print(
+                "check-module-imports: self-test FAILED to catch a planted violation",
+                file=sys.stderr,
+            )
+            for v in violations:
+                print(f"  observed: {v}", file=sys.stderr)
+            return False
+
+        # Control: a compliant file exercising an approved named edge and an
+        # intra-layer relative import must not be flagged, so the checker is
+        # provably not just failing everything.
+        _write(
+            os.path.join(src, "topology.zig"),
+            'const core = @import("core");\n'
+            'const helper = @import("topology/helper.zig");\n',
+        )
+        _write(os.path.join(src, "topology", "helper.zig"), "pub const marker = 1;\n")
+        control_violations = [v for v in scan(tmp) if v.startswith("src/topology")]
+        if control_violations:
+            print(
+                "check-module-imports: self-test flagged a compliant import",
+                file=sys.stderr,
+            )
+            for v in control_violations:
+                print(f"  observed: {v}", file=sys.stderr)
+            return False
+
+        print(
+            "check-module-imports: self-test verified both a forbidden relative "
+            "cross-layer import and an unapproved named edge are caught, and a "
+            "compliant file is left alone"
+        )
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main(argv):
+    repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+    if argv[1:2] == ["--self-test"]:
+        return 0 if run_self_test(repo_root) else 1
+
+    violations = scan(repo_root)
+    if violations:
+        print("check-module-imports: found forbidden cross-layer imports:", file=sys.stderr)
+        for v in violations:
+            print(f"  {v}", file=sys.stderr)
+        return 1
+    print(
+        "check-module-imports: verified no relative or named import escapes "
+        "the approved edge table in src/module_layers.zig"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

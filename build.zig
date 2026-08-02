@@ -400,6 +400,16 @@ pub fn build(b: *std.Build) !void {
 
     const module_graph_step = b.step("module-graph-check", "Validate the approved named-module edge set");
     module_graph_step.dependOn(&run_layer_tests.step);
+    // Zig's own compile errors catch an unapproved *named* import (the
+    // module simply doesn't exist), but nothing stops a source-relative
+    // import from reaching another layer's private files on disk, bypassing
+    // the named-module table entirely. tools/check-module-imports is the
+    // independent, CI-enforced check for that escape hatch; its --self-test
+    // mode is the negative fixture proving it actually rejects one.
+    const module_import_check = b.addSystemCommand(&.{ "python3", "tools/check-module-imports" });
+    const module_import_self_test = b.addSystemCommand(&.{ "python3", "tools/check-module-imports", "--self-test" });
+    module_graph_step.dependOn(&module_import_check.step);
+    module_graph_step.dependOn(&module_import_self_test.step);
 
     const policy_command = b.addSystemCommand(&.{ "sh", "tools/check-build-policy" });
     const external_consumer = b.addRunFile(std.Build.LazyPath.zig_exe);
@@ -410,6 +420,10 @@ pub fn build(b: *std.Build) !void {
     package_step.dependOn(&policy_command.step);
     package_step.dependOn(&run_consumer_tests.step);
     package_step.dependOn(&external_consumer.step);
+    // package-check is the gate every commit already runs; folding the
+    // module-import escape-hatch check in here means it cannot be silently
+    // skipped by only remembering `zig build test`.
+    package_step.dependOn(module_graph_step);
 
     const abi_layout_module = b.createModule(.{
         .target = target,

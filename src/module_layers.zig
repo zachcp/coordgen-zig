@@ -2,6 +2,16 @@ const std = @import("std");
 
 /// Import direction is `from` imports `to`. The build graph must install this
 /// exact allow-list with explicit addImport calls; Zig itself permits cycles.
+///
+/// To declare a new edge: add a `.{ .from = ..., .to = ... }` entry to
+/// `approved_edges` below and run `zig build module-graph-check`. That step
+/// both validates this table (see `validate()`) and runs
+/// tools/check-module-imports, which independently confirms that (a) no
+/// source-relative @import crosses a layer boundary and (b) every bare-name
+/// cross-layer @import used anywhere in the tree has a matching entry here.
+/// build.zig's wireApprovedModuleEdges() derives its addImport calls
+/// directly from this table, so editing it is the only step needed to grant
+/// or revoke a layer's ability to import another layer by name.
 pub const Layer = enum(u8) {
     core,
     model,
