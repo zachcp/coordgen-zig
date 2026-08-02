@@ -150,6 +150,25 @@ coordgen_error_t validateInput(const coordgen_input_t* input) {
          * can be made explicit. */
         return COORDGEN_ERROR_UNSUPPORTED;
     }
+    if (input->options.build_from_fragments != 0) {
+        /* Upstream's sketcherMinimizer::buildFromFragments(bool) is not a
+         * stored option: it forwards straight to
+         * CoordgenMinimizer::buildFromFragments(bool firstTime) const, an
+         * imperative pipeline step, not a flag any later stage reads back.
+         * Every real upstream call site (sketcherMinimizer.cpp:300, 1160,
+         * 2287) invokes it with firstTime=true from inside a sequence
+         * (findFragments(); buildFromFragments(true); avoidClashes(); ...)
+         * that runGenerateCoordinates() already performs unconditionally.
+         * There is no upstream conditional this ABI flag could faithfully
+         * gate within the single-shot coordgen_generate() path: accepting
+         * true and silently no-op'ing it (as the previous pre-initialize()
+         * call did) misrepresents the option as doing something it cannot
+         * do without inventing pipeline behavior upstream itself never
+         * runs. The default (0/false) is accepted because it matches
+         * actual pinned behavior: fragments are always built during
+         * generation regardless of this flag. See cgz-7v2.8. */
+        return COORDGEN_ERROR_UNSUPPORTED;
+    }
     for (uint32_t i = 0; i < input->atoms.len; ++i) {
         const coordgen_atom_input_t& atom = input->atoms.ptr[i];
         if (atom.atomic_number == 0 || atom.atomic_number > 118) return COORDGEN_ERROR_INVALID_ATOMIC_NUMBER;
@@ -352,7 +371,8 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
     minimizer.setEvenAngles(input->options.even_angles != 0);
     minimizer.setSkipMinimization(input->options.skip_minimization != 0);
     minimizer.setForceOpenMacrocycles(input->options.force_open_macrocycles != 0);
-    minimizer.buildFromFragments(input->options.build_from_fragments != 0);
+    /* build_from_fragments is rejected in validateInput() when nonzero: see
+     * the comment there for why there is no faithful call to make here. */
     minimizer.initialize(molecule.release());
     if (input->options.constrain_all_atoms != 0) minimizer.constrainAllAtoms();
     OracleCapture capture;

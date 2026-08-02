@@ -146,8 +146,62 @@ static int no_template_probe_smoke(void) {
     return probe.owner == 0 ? 0 : 23;
 }
 
+/* cgz-7v2.8 regression: build_from_fragments must not be silently ignored.
+ * Upstream's sketcherMinimizer::buildFromFragments(bool) is an imperative
+ * pipeline step (forwards to CoordgenMinimizer::buildFromFragments(bool
+ * firstTime) const), not a stored option; runGenerateCoordinates() already
+ * calls it unconditionally with firstTime=true, and no upstream call site
+ * ever passes false. There is no faithful way for this ABI flag to change
+ * coordgen_generate()'s single-shot pipeline, so a nonzero value must be
+ * rejected rather than silently accepted-and-ignored. Before the fix, the
+ * adapter called buildFromFragments() before minimizer.initialize() (a
+ * guaranteed no-op, since m_molecules is empty at that point) and returned
+ * COORDGEN_OK regardless of the flag; this check fails against that code
+ * because it observes COORDGEN_OK instead of COORDGEN_ERROR_UNSUPPORTED. */
+static int build_from_fragments_rejected_smoke(void) {
+    coordgen_atom_input_t atoms[3] = {0};
+    coordgen_bond_input_t bonds[3] = {0};
+    coordgen_input_t input = {0};
+    coordgen_result_t result = {0};
+    coordgen_error_t error;
+    uint32_t index;
+
+    for (index = 0; index < 3; ++index) {
+        atoms[index].atomic_number = 6;
+        atoms[index].stereo_looking_from = COORDGEN_INVALID_INDEX;
+        atoms[index].stereo_atom_a = COORDGEN_INVALID_INDEX;
+        atoms[index].stereo_atom_b = COORDGEN_INVALID_INDEX;
+    }
+    bonds[0] = (coordgen_bond_input_t){0, 1, COORDGEN_BOND_SINGLE, 0, 0,
+                                        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 0, 1.0f, 0};
+    bonds[1] = (coordgen_bond_input_t){1, 2, COORDGEN_BOND_SINGLE, 0, 0,
+                                        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 0, 1.0f, 0};
+    bonds[2] = (coordgen_bond_input_t){2, 0, COORDGEN_BOND_SINGLE, 0, 0,
+                                        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 0, 1.0f, 0};
+    input.options = coordgen_default_options();
+    input.options.build_from_fragments = 1;
+    input.atoms = (coordgen_atom_span_t){atoms, 3, 0};
+    input.bonds = (coordgen_bond_span_t){bonds, 3, 0};
+
+    error = coordgen_generate(&input, &result);
+    if (error == COORDGEN_OK) {
+        coordgen_result_free(&result);
+        return 30;
+    }
+    if (error != COORDGEN_ERROR_UNSUPPORTED) return 31;
+    if (result.owner != 0) return 32;
+
+    /* The default (0/false) must remain accepted: it matches actual pinned
+     * behavior, since fragments are always built during generation. */
+    input.options.build_from_fragments = 0;
+    if (coordgen_generate(&input, &result) != COORDGEN_OK) return 33;
+    coordgen_result_free(&result);
+    return 0;
+}
+
 int main(void) {
     const int stable = stable_api_smoke();
     const int probe = stable != 0 ? stable : probe_api_smoke();
-    return probe != 0 ? probe : no_template_probe_smoke();
+    const int no_template = probe != 0 ? probe : no_template_probe_smoke();
+    return no_template != 0 ? no_template : build_from_fragments_rejected_smoke();
 }
