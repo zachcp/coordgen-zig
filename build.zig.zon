@@ -27,5 +27,6 @@
         "tools/git-tree-sha1.py",
         "tools/check-install-isolation",
         "tools/verify-upstream",
+        "tools/mae-fixture-totals.py",
     },
 }

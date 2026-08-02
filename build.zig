@@ -1,6 +1,48 @@
 const std = @import("std");
 const layer_contract = @import("src/module_layers.zig");
 
+/// Every `.mae` file in the pinned oracle package: upstream's six test
+/// fixtures plus the template source. Totals are derived from the fixture
+/// text by an independent tokenizer, never from this repository's reader, so
+/// the fixture gate cannot confirm itself.
+const fixture_expectations = [_]struct { path: []const u8, totals: []const u8 }{
+    .{
+        .path = "test/test.mae",
+        .totals = "structures=1,atoms=26,bonds=26,atomic_number_sum=128," ++
+            "bond_order_sum=31,x_sum=0.000000,y_sum=0.000000",
+    },
+    .{
+        .path = "test/test_mol.mae",
+        .totals = "structures=1,atoms=27,bonds=31,atomic_number_sum=174," ++
+            "bond_order_sum=40,x_sum=-3.763010,y_sum=-3.038242",
+    },
+    .{
+        .path = "test/testChirality.mae",
+        .totals = "structures=1,atoms=9,bonds=8,atomic_number_sum=50," ++
+            "bond_order_sum=8,x_sum=3.348949,y_sum=0.213781",
+    },
+    .{
+        .path = "test/macrocycle.mae",
+        .totals = "structures=1,atoms=59,bonds=67,atomic_number_sum=384," ++
+            "bond_order_sum=81,x_sum=0.000300,y_sum=-0.000300",
+    },
+    .{
+        .path = "test/metalZobs.mae",
+        .totals = "structures=1,atoms=6,bonds=5,atomic_number_sum=24," ++
+            "bond_order_sum=5,x_sum=4.980544,y_sum=-0.475011",
+    },
+    .{
+        .path = "test/nonterminalMetalZobs.mae",
+        .totals = "structures=1,atoms=6,bonds=5,atomic_number_sum=24," ++
+            "bond_order_sum=5,x_sum=4.980544,y_sum=-0.475011",
+    },
+    .{
+        .path = "templates.mae",
+        .totals = "structures=82,atoms=1704,bonds=1963,atomic_number_sum=10610," ++
+            "bond_order_sum=2162,x_sum=-932.150248,y_sum=-316.790238",
+    },
+};
+
 fn createInternalModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -46,7 +88,7 @@ pub fn build(b: *std.Build) !void {
     const generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig");
     const api = createInternalModule(b, target, optimize, "src/api.zig");
     const c_abi = createInternalModule(b, target, optimize, "src/c_abi_types.zig");
-    const conformance = createInternalModule(b, target, optimize, "src/conformance/probe_types.zig");
+    const conformance = createInternalModule(b, target, optimize, "src/conformance.zig");
     const layered_modules = [_]*std.Build.Module{
         core,
         model,
@@ -92,7 +134,7 @@ pub fn build(b: *std.Build) !void {
     const module_tests = b.addTest(.{ .root_module = coordgen });
     const run_module_tests = b.addRunArtifact(module_tests);
     const conformance_tests = b.addTest(.{
-        .name = "conformance-types-test",
+        .name = "conformance-module-test",
         .root_module = conformance,
     });
     const run_conformance_tests = b.addRunArtifact(conformance_tests);
@@ -211,6 +253,96 @@ pub fn build(b: *std.Build) !void {
             .max_bytes = 4096,
         });
         oracle_step.dependOn(&license_check.step);
+
+        // The upstream library is Boost-free and maeparser-free: only its
+        // CMake test target needs them, which is why the harness and fixture
+        // reading are re-hosted on the Zig side instead. Listing the pinned
+        // translation units explicitly makes an upstream file appearing or
+        // disappearing a build failure rather than a silent change in what
+        // the oracle contains.
+        const oracle_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        oracle_module.addCSourceFiles(.{
+            .root = oracle.path("."),
+            .files = &.{
+                "CoordgenFragmentBuilder.cpp",
+                "CoordgenFragmenter.cpp",
+                "CoordgenMacrocycleBuilder.cpp",
+                "CoordgenMinimizer.cpp",
+                "CoordgenTemplates.cpp",
+                "sketcherMinimizer.cpp",
+                "sketcherMinimizerAtom.cpp",
+                "sketcherMinimizerBond.cpp",
+                "sketcherMinimizerFragment.cpp",
+                "sketcherMinimizerMarchingSquares.cpp",
+                "sketcherMinimizerMolecule.cpp",
+                "sketcherMinimizerResidue.cpp",
+                "sketcherMinimizerResidueInteraction.cpp",
+                "sketcherMinimizerRing.cpp",
+            },
+            .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
+        });
+        const oracle_library = b.addLibrary(.{
+            .name = "coordgen-oracle",
+            .linkage = .static,
+            .root_module = oracle_module,
+        });
+        // Deliberately never installed: the oracle exists for conformance
+        // comparison only.
+        oracle_step.dependOn(&oracle_library.step);
+
+        // Upstream's own example program is the cheapest proof that the
+        // static library links and runs. Its two atoms must come out one
+        // bond-length (50) apart on the x axis, which is the baseline
+        // recorded when this build was first verified against the pin.
+        const oracle_example_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        oracle_example_module.addCSourceFile(.{
+            .file = oracle.path("example_dir/example.cpp"),
+            .flags = &.{"-std=c++17"},
+        });
+        oracle_example_module.linkLibrary(oracle_library);
+        const oracle_example = b.addExecutable(.{
+            .name = "oracle-example",
+            .root_module = oracle_example_module,
+        });
+        const run_oracle_example = b.addRunArtifact(oracle_example);
+        run_oracle_example.expectExitCode(0);
+        run_oracle_example.expectStdErrEqual("(-50, 0)  (0, 0)\n");
+        oracle_step.dependOn(&run_oracle_example.step);
+
+        // Fixture loading runs against the pinned fixtures themselves, so the
+        // reader is exercised by the same bytes the oracle harness will use.
+        const fixture_check_module = b.createModule(.{
+            .root_source_file = b.path("tests/mae_fixture_check.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "conformance", .module = conformance }},
+            .link_libc = false,
+            .link_libcpp = false,
+        });
+        const fixture_check = b.addExecutable(.{
+            .name = "mae-fixture-check",
+            .root_module = fixture_check_module,
+        });
+        const run_fixture_check = b.addRunArtifact(fixture_check);
+        run_fixture_check.expectExitCode(0);
+        // Totals are derived from the fixture text independently of this
+        // reader; see docs/architecture/CONFORMANCE_ORACLE.md.
+        for (fixture_expectations) |fixture| {
+            run_fixture_check.addArg("--fixture");
+            run_fixture_check.addFileArg(oracle.path(fixture.path));
+            run_fixture_check.addArg("--expect");
+            run_fixture_check.addArg(fixture.totals);
+        }
+        oracle_step.dependOn(&run_fixture_check.step);
+
         conformance_step.dependOn(oracle_step);
     } else {
         const oracle_disabled = b.addFail(
