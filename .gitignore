@@ -9,3 +9,8 @@
 .zig-cache/
 zig-out/
 zig-pkg/
+
+# Per-agent git worktrees. These are checkouts of this repo living inside it,
+# each with its own .tools/ and .zig-cache/, so a stray `git add -A` would
+# otherwise stage tens of thousands of files from another agent's tree.
+.claude/worktrees/
