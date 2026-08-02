@@ -72,12 +72,32 @@ jobs:
       # at /usr/aarch64-linux-gnu. Keeping both halves on glibc is deliberate —
       # a musl-linked cross oracle would put a second variable (libm) inside an
       # axis that is supposed to isolate the architecture.
+      #
+      # qemu-user-static must NOT be installed here, and no binfmt_misc handler
+      # for aarch64 may survive this step. zig reaches its qemu path only after
+      # spawning the foreign binary *fails*: see lib/compiler/Maker/Step/Run.zig,
+      # where the external executor is consulted in the error.InvalidExe branch.
+      # A registered handler makes the spawn succeed, the kernel runs qemu
+      # without the -L that zig would have supplied, and the guest dies in its
+      # loader — which is exactly how this failed the first two times.
       - name: Install foreign-architecture executor
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user qemu-user-static libc6-arm64-cross
+          sudo apt-get install -y qemu-user libc6-arm64-cross
           test -e /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1
+          command -v qemu-aarch64
+          for handler in /proc/sys/fs/binfmt_misc/*; do
+            case "${handler##*/}" in status|register|'*') continue ;; esac
+            if grep -qa 'aarch64\|arm64' "$handler" 2>/dev/null; then
+              echo "disabling binfmt_misc handler ${handler##*/}"
+              echo -1 | sudo tee "$handler" > /dev/null
+            fi
+          done
+          ! grep -qas 'aarch64\|arm64' /proc/sys/fs/binfmt_misc/* || {
+            echo "an aarch64 binfmt_misc handler is still registered; it would bypass zig's -L" >&2
+            exit 1
+          }
 
       - name: Classify corpus stability against recorded expectations
         env:
