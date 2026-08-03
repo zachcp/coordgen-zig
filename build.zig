@@ -475,6 +475,14 @@ pub fn build(b: *std.Build) !void {
     package_step.dependOn(&run_consumer_tests.step);
     package_step.dependOn(&external_consumer.step);
     package_step.dependOn(&install_isolation.step);
+    // The non-fuzzing backend list in tests/fuzz_backend.zig mirrors a private
+    // declaration in the toolchain, so it can go stale in the direction that
+    // fails open. This reads the switch out of the pinned toolchain in use and
+    // requires the two to agree, continuously rather than only when someone
+    // runs `zig build fuzz`.
+    const fuzz_backend_mirror = b.addSystemCommand(&.{ "python3", "tools/check-fuzz-backend" });
+    fuzz_backend_mirror.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    package_step.dependOn(&fuzz_backend_mirror.step);
     // package-check is the gate every commit already runs; folding the
     // module-import escape-hatch check in here means it cannot be silently
     // skipped by only remembering `zig build test`.
@@ -940,6 +948,22 @@ pub fn build(b: *std.Build) !void {
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
     const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
     fuzz_step.dependOn(&fuzz_pending.step);
+    // Attached now, before the harness exists, so cgz-7v2.4.4 inherits it
+    // rather than having to remember it: on a compiler backend whose
+    // std.testing.fuzz returns immediately, every fuzz target is a no-op that
+    // reports success. This makes `zig build fuzz` fail by name instead. It is
+    // deliberately not on `test` - a backend that cannot fuzz is no reason to
+    // block unrelated work. See cgz-r27.
+    const fuzz_backend_module = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fuzz_backend_tests = b.addTest(.{
+        .name = "fuzz-backend-test",
+        .root_module = fuzz_backend_module,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_backend_tests).step);
 
     // A step with no dependencies succeeds instantly and reports success, which
     // is the cgz-r20 failure mode. tools/check-gate-strength used to assert

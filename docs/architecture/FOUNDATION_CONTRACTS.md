@@ -139,8 +139,8 @@ vtable or raw atom pointer.
 | core | IDs, chemistry/error representations, f32 vectors, bond length, DOF and interaction values | nothing |
 | model | working atom/bond/ring/fragment/residue values and order maps | core |
 | geometry | geometry interfaces and algorithms | core |
-| topology | adjacency, components, rings, canonicalization, CIP/stereo structure | core, model, geometry |
-| layout | fragment construction, templates, rings, macrocycles, placement | core, model, geometry, topology |
+| topology | adjacency, components, ring *perception*, canonicalization, CIP/stereo structure | core, model, geometry |
+| layout | fragment construction, templates, ring *placement*, macrocycles, coordinate assignment | core, model, geometry, topology |
 | optimize | DOF search, interactions, continuous minimization | core, model, geometry; never concrete layout builders |
 | generator | orchestration and phase lifetimes | core, model, geometry, topology, layout, optimize |
 | api | safe public Zig conversion, validation, owned result | core, generator |
@@ -152,6 +152,21 @@ graph is one-way. The build graph must create these as named modules and add
 only the listed explicit imports. Tests may inspect internals; production code
 must never import conformance/oracle modules. Oracle/probe artifacts are never
 installed.
+
+"Rings" appears in two rows because two different things are being owned:
+topology decides *which* cycles exist (the perceived ring set, and each ring's
+membership and fusion relationships); layout decides *where* they go (template
+selection, macrocycle construction, coordinate assignment). A bead implementing
+one must not write the other's files.
+
+The table's granularity is one bead per layer, and at that granularity file
+ownership is unambiguous — every layer has a distinct root, and
+`tools/check-module-imports` already resolves `src/<layer>/` subdirectories, so
+a layer can grow files without ambiguity. Splitting a *single* layer across two
+parallel beads is not yet specified: `topology`, `layout`, `optimize`, and
+`generator` are still `build_support/empty_module.zig` stubs, and until they
+have real content there is no sub-file map to divide. Whoever splits a layer
+records the file boundary here first.
 
 A layer is a set of modules, not necessarily one. Every module of a layer gets
 that layer's row of the table above; a layer's secondary modules additionally
