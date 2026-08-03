@@ -144,7 +144,7 @@ vtable or raw atom pointer.
 | optimize | DOF search, interactions, continuous minimization | core, model, geometry; never concrete layout builders |
 | generator | orchestration and phase lifetimes | core, model, geometry, topology, layout, optimize |
 | api | safe public Zig conversion, validation, owned result | core, generator |
-| c_abi | handwritten stable C conversion/exports | core, api |
+| c_abi | handwritten stable C DTOs, and separately the exports that use them | core, api |
 | conformance | oracle adapters, probes, comparisons | any production layer; never imported by production |
 
 `src/module_layers.zig` is the machine-readable edge allow-list and proves the
@@ -152,6 +152,29 @@ graph is one-way. The build graph must create these as named modules and add
 only the listed explicit imports. Tests may inspect internals; production code
 must never import conformance/oracle modules. Oracle/probe artifacts are never
 installed.
+
+A layer is a set of modules, not necessarily one. Every module of a layer gets
+that layer's row of the table above; a layer's secondary modules additionally
+import its canonical module — the one other layers see — under the layer's own
+name. `c_abi` is the only layer split this way, and it is split for a linker
+reason:
+
+- `c_abi` (`src/c_abi_types.zig`, the canonical module) is the ABI's data
+  types and defines no linker name at all.
+- `c_abi_exports` (`src/c_abi/exports.zig`) is the sole Zig definition of
+  `coordgen_generate` and `coordgen_result_free`, and `src/coordgen.zig` — the
+  installed library's root — is the only file permitted to import it.
+
+`conformance/oracle_adapter.cpp` defines those same two symbol names on
+purpose, so that a C or C++ consumer of `include/coordgen_abi.h` can link the
+pinned upstream oracle without being rewritten. Any binary wanting the
+oracle's implementation *and* the ABI's Zig type declarations — the corpus
+runner is exactly that — would otherwise link two implementations of the same
+ABI. That is a hard `ld.lld: duplicate symbol` error on Linux and silently
+tolerated by macOS's linker, so the constraint is enforced statically instead:
+`tools/check-module-imports` asserts `c_abi_exports` has exactly one importer,
+and the reference is a `comptime` one, because a plain `pub const` `@import`
+does not force export discovery in a non-test build.
 
 ## Phase allocation policy
 

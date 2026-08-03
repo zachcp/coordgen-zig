@@ -65,6 +65,11 @@ pub const approved_edges = [_]Edge{
     // conformance needs those types to call it and to mirror the probe
     // result. Recorded here rather than duplicated: the layer table already
     // grants conformance every production layer.
+    //
+    // Types only, and that is the whole reason the c_abi layer is split
+    // across two modules: conformance links the *oracle's* implementation of
+    // coordgen_generate, so it must not also pull in the native one. See
+    // src/c_abi/exports.zig.
     .{ .from = .conformance, .to = .c_abi },
 };
 

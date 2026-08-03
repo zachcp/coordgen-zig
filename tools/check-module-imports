@@ -18,6 +18,15 @@ FOUNDATION_CONTRACTS.md's "Module ownership and imports" section:
      a second, independent check on top of the fact that an unapproved bare
      import would also fail to resolve at compile time (no such module name
      wired) - see the comment on wireApprovedModuleEdges in build.zig.
+  3. The `c_abi_exports` module has exactly one importer, src/coordgen.zig.
+     It is the sole Zig definition of the public coordgen_* symbols, and
+     conformance/oracle_adapter.cpp deliberately defines the same names so
+     that C and C++ consumers of the public header can link the pinned
+     upstream oracle unchanged. A binary that imports both gets two
+     definitions of coordgen_generate. That is `ld.lld: duplicate symbol` on
+     Linux - and nothing at all on macOS, whose linker tolerates it - so a
+     link-time diagnosis is a platform-dependent one. This rule is the
+     host-independent statement of the same constraint; see cgz-r28.
 
 Run with no arguments to scan this repository (exit non-zero on the first
 class of violation found). Run with --self-test to prove the checker itself
@@ -63,6 +72,11 @@ LAYER_NAMES = [
 # the layer name (see src/c_abi_types.zig).
 _LAYER_ROOT_FILES = {name: f"{name}.zig" for name in LAYER_NAMES}
 _LAYER_ROOT_FILES["c_abi"] = "c_abi_types.zig"
+
+# The module that defines the public C ABI symbols, and the single file
+# allowed to import it. See rule 3 in this file's docstring.
+_EXPORTS_MODULE = "c_abi_exports"
+_EXPORTS_SOLE_IMPORTER = "src/coordgen.zig"
 
 _IMPORT_RE = re.compile(r'@import\("([^"]+)"\)')
 _EDGE_RE = re.compile(r"\.from\s*=\s*\.(\w+)\s*,\s*\.to\s*=\s*\.(\w+)\s*\}")
@@ -111,6 +125,7 @@ def scan(root):
     at `root`. An empty list means the tree is clean."""
     edges = _parse_approved_edges(root)
     violations = []
+    exports_importers = []
     for relpath in sorted(_find_zig_files(root)):
         with open(os.path.join(root, relpath), "r", encoding="utf-8") as fh:
             text = fh.read()
@@ -119,6 +134,8 @@ def scan(root):
             target = match.group(1)
             if target == "std":
                 continue
+            if target == _EXPORTS_MODULE and relpath not in exports_importers:
+                exports_importers.append(relpath)
             if _is_relative_import(target):
                 target_path = os.path.normpath(
                     os.path.join(os.path.dirname(relpath), target)
@@ -141,6 +158,24 @@ def scan(root):
                         f"{relpath}: unapproved named edge {source_layer} -> {target}; "
                         f"add it to approved_edges in src/module_layers.zig first"
                     )
+
+    # A missing importer is as much a defect as an extra one: with none, the
+    # installed library goes back to exporting nothing, which is the original
+    # cgz-r28 bug.
+    for relpath in exports_importers:
+        if relpath != _EXPORTS_SOLE_IMPORTER:
+            violations.append(
+                f'{relpath}: forbidden import of "{_EXPORTS_MODULE}"; only '
+                f"{_EXPORTS_SOLE_IMPORTER} may define the public coordgen_* "
+                f"symbols, or a conformance binary linking the oracle ends up "
+                f"with two implementations of them"
+            )
+    if _EXPORTS_SOLE_IMPORTER not in exports_importers:
+        violations.append(
+            f'{_EXPORTS_SOLE_IMPORTER}: missing import of "{_EXPORTS_MODULE}"; '
+            f"without it the installed library exports no coordgen_* symbols "
+            f"at all"
+        )
     return violations
 
 
@@ -175,6 +210,19 @@ def run_self_test(repo_root):
         # itself resolves fine as a build-provided module.
         _write(os.path.join(src, "geometry.zig"), 'const bad = @import("layout");\n')
 
+        # The package root as it is supposed to look: the sole importer of the
+        # exports module. Fixtures 3 and 4 below perturb exactly this.
+        compliant_root = f'const exports = @import("{_EXPORTS_MODULE}");\n'
+        _write(os.path.join(src, "coordgen.zig"), compliant_root)
+
+        # Fixture 3: a second file claims the exports module. On Linux this
+        # is the duplicate-symbol link failure of cgz-r28; on macOS it links
+        # clean, which is why a static rule and not the linker is the gate.
+        _write(
+            os.path.join(src, "conformance.zig"),
+            f'const bad = @import("{_EXPORTS_MODULE}");\n',
+        )
+
         violations = scan(tmp)
         relative_hit = any(
             "forbidden relative cross-layer import" in v and v.startswith("src/model.zig")
@@ -184,7 +232,21 @@ def run_self_test(repo_root):
             "unapproved named edge" in v and v.startswith("src/geometry.zig")
             for v in violations
         )
-        if not (relative_hit and named_hit):
+        extra_exports_hit = any(
+            f'forbidden import of "{_EXPORTS_MODULE}"' in v
+            and v.startswith("src/conformance.zig")
+            for v in violations
+        )
+        # Fixture 4: nobody imports it. This is the original defect - the
+        # installed archive compiles, installs, and exports nothing.
+        os.remove(os.path.join(src, "conformance.zig"))
+        _write(os.path.join(src, "coordgen.zig"), "pub const marker = 1;\n")
+        missing_exports_hit = any(
+            f'missing import of "{_EXPORTS_MODULE}"' in v for v in scan(tmp)
+        )
+        _write(os.path.join(src, "coordgen.zig"), compliant_root)
+
+        if not (relative_hit and named_hit and extra_exports_hit and missing_exports_hit):
             print(
                 "check-module-imports: self-test FAILED to catch a planted violation",
                 file=sys.stderr,
@@ -202,7 +264,11 @@ def run_self_test(repo_root):
             'const helper = @import("topology/helper.zig");\n',
         )
         _write(os.path.join(src, "topology", "helper.zig"), "pub const marker = 1;\n")
-        control_violations = [v for v in scan(tmp) if v.startswith("src/topology")]
+        control_violations = [
+            v
+            for v in scan(tmp)
+            if v.startswith("src/topology") or v.startswith(_EXPORTS_SOLE_IMPORTER)
+        ]
         if control_violations:
             print(
                 "check-module-imports: self-test flagged a compliant import",
@@ -213,9 +279,10 @@ def run_self_test(repo_root):
             return False
 
         print(
-            "check-module-imports: self-test verified both a forbidden relative "
-            "cross-layer import and an unapproved named edge are caught, and a "
-            "compliant file is left alone"
+            "check-module-imports: self-test verified a forbidden relative "
+            "cross-layer import, an unapproved named edge, a second importer of "
+            f"{_EXPORTS_MODULE}, and no importer of it at all are each caught, "
+            "and a compliant file is left alone"
         )
         return True
     finally:

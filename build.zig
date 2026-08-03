@@ -225,20 +225,42 @@ fn createInternalModule(
     });
 }
 
-fn wireApprovedModuleEdges(modules: []const *std.Build.Module) void {
+/// One entry per declared layer, in `Layer` order. A layer is a *set* of
+/// modules, not necessarily a single one: the first entry is the layer's
+/// canonical module - the one other layers get when they import the layer by
+/// name - and any further entry is a second module inside the same layer,
+/// subject to the same row of `approved_edges` and additionally importing the
+/// canonical module under its own layer name. The `c_abi` layer is the only
+/// one that needs this today, and the reason is a linker constraint rather
+/// than a size one; see src/c_abi/exports.zig.
+fn wireApprovedModuleEdges(layer_modules: []const []const *std.Build.Module) void {
     layer_contract.validate() catch |err| {
         std.debug.panic("invalid approved module graph: {s}", .{@errorName(err)});
     };
 
     const layer_count = @typeInfo(layer_contract.Layer).@"enum".field_names.len;
-    if (modules.len != layer_count) @panic("build module table does not cover every declared layer");
+    if (layer_modules.len != layer_count) @panic("build module table does not cover every declared layer");
+    for (layer_modules) |members| {
+        if (members.len == 0) @panic("a declared layer has no module");
+    }
 
     // The build edge set is not a second hand-maintained list: every addImport
     // comes directly from the reviewed allow-list in src/module_layers.zig.
+    // Every module of a layer gets that layer's outgoing edges, so splitting a
+    // layer across files cannot quietly widen or narrow what it may reach.
     for (layer_contract.approved_edges) |edge| {
-        const from = modules[@backingInt(edge.from)];
-        const to = modules[@backingInt(edge.to)];
-        from.addImport(@tagName(edge.to), to);
+        const to = layer_modules[@backingInt(edge.to)][0];
+        for (layer_modules[@backingInt(edge.from)]) |from| {
+            from.addImport(@tagName(edge.to), to);
+        }
+    }
+
+    // Intra-layer: a layer's secondary modules reach its canonical module by
+    // the layer's own name. tools/check-module-imports permits that bare
+    // import precisely because it does not cross a layer boundary.
+    for (layer_modules, 0..) |members, index| {
+        const layer: layer_contract.Layer = @enumFromInt(index);
+        for (members[1..]) |member| member.addImport(@tagName(layer), members[0]);
     }
 }
 
@@ -255,6 +277,11 @@ const Layers = struct {
     generator: *std.Build.Module,
     api: *std.Build.Module,
     c_abi: *std.Build.Module,
+    /// The c_abi layer's second module: the only Zig-side definition of the
+    /// public coordgen_* symbols. Kept out of `c_abi` so that importing the
+    /// ABI's types never drags a competing implementation into a link that
+    /// already has one. Only the installed library's root should import it.
+    c_abi_exports: *std.Build.Module,
     conformance: *std.Build.Module,
 };
 
@@ -273,19 +300,20 @@ fn createLayers(
         .generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
         .api = createInternalModule(b, target, optimize, "src/api.zig"),
         .c_abi = createInternalModule(b, target, optimize, "src/c_abi_types.zig"),
+        .c_abi_exports = createInternalModule(b, target, optimize, "src/c_abi/exports.zig"),
         .conformance = createInternalModule(b, target, optimize, "src/conformance.zig"),
     };
-    const layered_modules = [_]*std.Build.Module{
-        layers.core,
-        layers.model,
-        layers.geometry,
-        layers.topology,
-        layers.layout,
-        layers.optimize_layer,
-        layers.generator,
-        layers.api,
-        layers.c_abi,
-        layers.conformance,
+    const layered_modules = [_][]const *std.Build.Module{
+        &.{layers.core},
+        &.{layers.model},
+        &.{layers.geometry},
+        &.{layers.topology},
+        &.{layers.layout},
+        &.{layers.optimize_layer},
+        &.{layers.generator},
+        &.{layers.api},
+        &.{ layers.c_abi, layers.c_abi_exports },
+        &.{layers.conformance},
     };
     wireApprovedModuleEdges(&layered_modules);
     return layers;
@@ -301,6 +329,7 @@ pub fn build(b: *std.Build) !void {
     const geometry = layers.geometry;
     const api = layers.api;
     const c_abi = layers.c_abi;
+    const c_abi_exports = layers.c_abi_exports;
     const conformance = layers.conformance;
 
     const module_layers = createInternalModule(b, target, optimize, "src/module_layers.zig");
@@ -318,6 +347,12 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "geometry", .module = geometry },
             .{ .name = "api", .module = api },
             .{ .name = "c_abi", .module = c_abi },
+            // The installed library is the one artifact that must contain the
+            // public coordgen_* definitions, so it is the one artifact that
+            // imports the exports module. Adding this import anywhere that
+            // also links the oracle-backed ABI is a duplicate-symbol link
+            // error, which is the point: cgz-r28.
+            .{ .name = "c_abi_exports", .module = c_abi_exports },
             .{ .name = "module_layers", .module = module_layers },
         },
         .link_libc = false,
@@ -344,6 +379,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "geometry-test", .module = geometry },
             .{ .name = "api-test", .module = api },
             .{ .name = "c-abi-test", .module = c_abi },
+            .{ .name = "c-abi-exports-test", .module = c_abi_exports },
         };
         var runs: [layer_modules.len]*std.Build.Step.Run = undefined;
         for (layer_modules, 0..) |entry, index| {

@@ -18,9 +18,17 @@ pub const bond_length = api.bond_length;
 // *this* real top-level path, not merely inside the test block below, or
 // coordgen_generate/coordgen_result_free would silently be absent from the
 // installed archive while still compiling and passing in test builds.
+//
+// This is the *only* place c_abi_exports may be imported. It defines the
+// public coordgen_* symbols, and conformance binaries link a second
+// implementation of those same names from the pinned C++ oracle; pulling it
+// into any of them is a duplicate-symbol link failure. Consumers that want
+// the ABI's data types import `c_abi`, which deliberately defines none of
+// them. See src/c_abi/exports.zig and cgz-r28.
 pub const c_abi = @import("c_abi");
+const c_abi_exports = @import("c_abi_exports");
 comptime {
-    _ = c_abi;
+    _ = c_abi_exports;
 }
 
 test {
@@ -29,6 +37,7 @@ test {
     // conformance types.
     _ = api;
     _ = c_abi;
+    _ = c_abi_exports;
     _ = @import("core");
     _ = @import("model");
     _ = @import("geometry");
