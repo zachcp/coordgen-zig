@@ -187,3 +187,38 @@ does not force export discovery in a non-test build.
 - Immutable compiled templates contain no mutable global initialization.
 - Public validation paths return errors, including OOM. Assertions are only
   for invariants established by prior validation or phase types.
+
+## What each gate proves
+
+cgz-r28 was a gate certifying an empty archive: `check-install-isolation`
+asserted that `libcoordgen.a` existed, that the probe header did not, and that
+no upstream C++ symbols had leaked — all true of a 2400-byte file exporting
+nothing. It never asked whether the library contained the ABI it claims to
+install. That is the third instance of one pattern (cgz-r19 was flags weakened
+to pass, cgz-r20 was steps reporting success unconditionally), so the gates are
+enumerated here with the distinction each one turns on.
+
+**Behavioral — recomputes or executes the thing it certifies:**
+
+| Gate | Proves |
+|---|---|
+| `tools/verify-upstream` | The pinned archive's SHA-256, byte count, Git tree hash, LICENSE hash, and Zig package hash, all recomputed with the pinned toolchain. The strongest gate in the tree. |
+| `tools/check-install-isolation` | Builds into a scratch prefix created empty and destroyed after, then compiles and runs `tests/install_consumer.c` against `$prefix` alone. An archive without the ABI fails to link. Wired into `package-check`. |
+| `abi-check` | Links `tests/abi_layout.c` against the real library, so a name or signature drift from `include/coordgen_abi.h` is a link error. |
+| `assertNoFalseGreenSteps` (build.zig) | Asks the constructed graph whether each public step has dependencies. Runs at configure time on every invocation. |
+| `tools/check-gate-strength` | Every one of build.zig's C/C++ compile sites uses an approved strict flag set, with a narrow enumerated exemption for upstream-owned sources. Universality, not presence. |
+| `tools/check-module-imports` | No relative import crosses a layer; no bare import lacks an approved edge; `c_abi_exports` has exactly one importer. |
+
+**Textual — reads the build description, and only proves what it says:**
+
+`tools/check-build-policy` asserts that build.zig and build.zig.zon *declare*
+a lazy oracle dependency, an `enable-oracle` opt-in, a public-header install,
+and no probe-header install. Those are properties of the build description, so
+text is the right level for them — but a declaration is not an outcome, and
+its summary line says so. The behavioral counterparts are named above.
+
+Both checkers with a `--self-test` mode (`check-module-imports`,
+`check-gate-strength`) plant a violation of each class they claim to catch,
+plus a compliant control, so a gate cannot decay into one that passes
+everything. New gates follow the same rule: state what is asserted, and if the
+name implies content, assert content.

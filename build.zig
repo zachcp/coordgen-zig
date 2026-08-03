@@ -126,9 +126,13 @@ fn addOracle(b: *std.Build, options: OracleOptions) Oracle {
         .file = options.instrumented_minimizer,
         .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
     });
+    // Repo-owned, so it is held to the strict flag set even though it is
+    // compiled into the oracle library beside upstream's own sources.
+    // -DIN_COORDGEN is what lets it see upstream internals; it is not a reason
+    // to stop treating warnings as errors in code this repo wrote.
     library_module.addCSourceFile(.{
         .file = b.path("conformance/oracle_hook.cpp"),
-        .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
+        .flags = &.{ "-std=c++17", "-DIN_COORDGEN", "-Wall", "-Wextra", "-Werror" },
     });
     const library = b.addLibrary(.{
         .name = b.fmt("coordgen-oracle-{s}", .{suffix}),
@@ -452,10 +456,25 @@ pub fn build(b: *std.Build) !void {
     external_consumer.addArgs(&.{ "build", "test", "--summary", "failures", "--cache-dir" });
     external_consumer.addDirectoryArg(std.Build.LazyPath.cache_root.path(b, "external-consumer"));
     external_consumer.setCwd(b.path("build_support/consumer"));
+    // The install gate the cgz-r28 defect walked straight through, now in the
+    // build graph rather than a documented two-command sequence. With no
+    // PREFIX argument the tool installs into a scratch directory it creates
+    // empty and destroys afterwards, so it can never certify files a previous
+    // run left behind, and it compiles and runs tests/install_consumer.c
+    // against that prefix alone - the check that would have caught an archive
+    // exporting nothing.
+    const install_isolation = b.addSystemCommand(&.{ "sh", "tools/check-install-isolation" });
+    install_isolation.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    install_isolation.addPrefixedDirectoryArg(
+        "--cache-dir=",
+        std.Build.LazyPath.cache_root.path(b, "install-isolation"),
+    );
+
     const package_step = b.step("package-check", "Verify package and dependency isolation policy");
     package_step.dependOn(&policy_command.step);
     package_step.dependOn(&run_consumer_tests.step);
     package_step.dependOn(&external_consumer.step);
+    package_step.dependOn(&install_isolation.step);
     // package-check is the gate every commit already runs; folding the
     // module-import escape-hatch check in here means it cannot be silently
     // skipped by only remembering `zig build test`.
@@ -921,4 +940,37 @@ pub fn build(b: *std.Build) !void {
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
     const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
     fuzz_step.dependOn(&fuzz_pending.step);
+
+    // A step with no dependencies succeeds instantly and reports success, which
+    // is the cgz-r20 failure mode. tools/check-gate-strength used to assert
+    // this by grepping build.zig for the string "<step>.dependOn(" - a text
+    // property, satisfiable by a call inside a branch that never runs. This
+    // asks the constructed graph instead, which is the thing that has to be
+    // true, and it runs at configure time on every single invocation rather
+    // than only under package-check.
+    assertNoFalseGreenSteps(&.{
+        test_step,
+        module_graph_step,
+        package_step,
+        abi_step,
+        oracle_step,
+        conformance_step,
+        examples_step,
+        regeneration_step,
+        fuzz_step,
+    });
+}
+
+/// Every publicly reachable step must do something. Configure-time panic
+/// rather than a build error because a gate that certifies nothing is a
+/// defect in the build description itself, not in what is being built.
+fn assertNoFalseGreenSteps(steps: []const *std.Build.Step) void {
+    for (steps) |step| {
+        if (step.dependencies.items.len == 0) {
+            std.debug.panic(
+                "build step '{s}' has no dependencies and would report success without checking anything",
+                .{step.name},
+            );
+        }
+    }
 }

@@ -46,6 +46,17 @@ fi
 dependency_count=$(grep -c '^        \.[A-Za-z0-9_]* = \.{' "$zon" || true)
 [ "$dependency_count" = 1 ] || fail "production package gained an unreviewed dependency"
 
-sh "$repo_root/tools/check-gate-strength"
+python3 "$repo_root/tools/check-gate-strength"
+python3 "$repo_root/tools/check-gate-strength" --self-test
 
-echo "verified std-only production package, public-header install, non-installed probe, and lazy oracle policy"
+# Every assertion above this line reads build.zig / build.zig.zon as *text*.
+# That is the right level for the things it checks - a lazy dependency, an
+# opt-in option name, an absent probe-header install are all properties of the
+# build description - but text is all it proves. The behavioral counterparts
+# live elsewhere and are named here so the division stays visible:
+#   - that the header is really installed, and the archive really exports the
+#     ABI, is tools/check-install-isolation, which builds into a fresh prefix
+#     and compiles a consumer against it (wired into package-check);
+#   - that the pinned oracle archive is really the reviewed commit is
+#     tools/verify-upstream, which recomputes hashes rather than reading them.
+echo "verified std-only production package, and - as declared in build.zig's text - public-header install, non-installed probe, and lazy oracle policy"
