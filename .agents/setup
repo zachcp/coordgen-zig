@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+step() {
+    local label=$1
+    shift
+    echo "setup: ${label}"
+    time "$@"
+}
+
+required_packages=(ca-certificates curl xz-utils qemu-user libc6-arm64-cross)
+missing_packages=()
+for package in "${required_packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -Fqx 'install ok installed'; then
+        missing_packages+=("$package")
+    fi
+done
+
+if ((${#missing_packages[@]})); then
+    step "refreshing apt metadata" sudo apt-get update
+    step "installing system packages: ${missing_packages[*]}" \
+        sudo apt-get install -y --no-install-recommends "${missing_packages[@]}"
+else
+    echo "setup: system packages already installed"
+fi
+
+install_dir="$HOME/.local/bin"
+mkdir -p "$install_dir"
+
+beads_version=1.1.2
+beads_archive="beads_${beads_version}_linux_amd64.tar.gz"
+beads_sha256=a72d71ed374955dc9f83a0f90b54bd7b6a0016709dd1676ae2e368651ed401c2
+beads_url="https://github.com/gastownhall/beads/releases/download/v${beads_version}/${beads_archive}"
+
+if ! command -v bd >/dev/null 2>&1 || \
+    ! bd version 2>/dev/null | grep -Eq "(^|[[:space:]])v?${beads_version}([[:space:]]|$)"; then
+    echo "setup: installing checksummed bd ${beads_version}"
+    beads_tmp="$(mktemp -d)"
+    trap 'rm -rf "$beads_tmp"' EXIT
+    curl --fail --location --retry 3 --output "$beads_tmp/$beads_archive" "$beads_url"
+    echo "$beads_sha256  $beads_tmp/$beads_archive" | sha256sum --check --status
+    tar -xzf "$beads_tmp/$beads_archive" -C "$beads_tmp"
+    beads_binary="$(find "$beads_tmp" -type f -name bd -perm -u+x -print -quit)"
+    test -n "$beads_binary"
+    install -m 0755 "$beads_binary" "$install_dir/bd"
+    rm -rf "$beads_tmp"
+    trap - EXIT
+else
+    echo "setup: bd ${beads_version} already installed"
+fi
+
+echo "setup: bootstrapping pinned Zig"
+SECONDS=0
+zig_path="$(tools/bootstrap-zig)"
+echo "setup: pinned Zig ready in ${SECONDS}s"
+ln -sfn "$zig_path" "$install_dir/zig"
+
+# The pinned Zig build rejects a final unterminated resolv.conf line. Orb DNS
+# configuration is otherwise valid, so preserve it and supply only the LF.
+if [[ -s /etc/resolv.conf ]] && \
+    [[ "$(tail -c 1 /etc/resolv.conf | od -An -t x1 | tr -d ' ')" != 0a ]]; then
+    echo "setup: terminating the orb resolver configuration with a newline"
+    printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
+fi
+
+step "fetching the Zig package graph" "$zig_path" build --fetch=all
+
+chmod 700 .beads
+if [[ ! -d .beads/embeddeddolt/cgz ]]; then
+    step "bootstrapping the Beads Dolt database" "$install_dir/bd" bootstrap
+else
+    echo "setup: Beads Dolt database already bootstrapped"
+fi
+
+echo "setup: ready ($("$install_dir/zig" version), $("$install_dir/bd" version))"
