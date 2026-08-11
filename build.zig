@@ -126,9 +126,13 @@ fn addOracle(b: *std.Build, options: OracleOptions) Oracle {
         .file = options.instrumented_minimizer,
         .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
     });
+    // Repo-owned, so it is held to the strict flag set even though it is
+    // compiled into the oracle library beside upstream's own sources.
+    // -DIN_COORDGEN is what lets it see upstream internals; it is not a reason
+    // to stop treating warnings as errors in code this repo wrote.
     library_module.addCSourceFile(.{
         .file = b.path("conformance/oracle_hook.cpp"),
-        .flags = &.{ "-std=c++17", "-DIN_COORDGEN" },
+        .flags = &.{ "-std=c++17", "-DIN_COORDGEN", "-Wall", "-Wextra", "-Werror" },
     });
     const library = b.addLibrary(.{
         .name = b.fmt("coordgen-oracle-{s}", .{suffix}),
@@ -225,20 +229,42 @@ fn createInternalModule(
     });
 }
 
-fn wireApprovedModuleEdges(modules: []const *std.Build.Module) void {
+/// One entry per declared layer, in `Layer` order. A layer is a *set* of
+/// modules, not necessarily a single one: the first entry is the layer's
+/// canonical module - the one other layers get when they import the layer by
+/// name - and any further entry is a second module inside the same layer,
+/// subject to the same row of `approved_edges` and additionally importing the
+/// canonical module under its own layer name. The `c_abi` layer is the only
+/// one that needs this today, and the reason is a linker constraint rather
+/// than a size one; see src/c_abi/exports.zig.
+fn wireApprovedModuleEdges(layer_modules: []const []const *std.Build.Module) void {
     layer_contract.validate() catch |err| {
         std.debug.panic("invalid approved module graph: {s}", .{@errorName(err)});
     };
 
     const layer_count = @typeInfo(layer_contract.Layer).@"enum".field_names.len;
-    if (modules.len != layer_count) @panic("build module table does not cover every declared layer");
+    if (layer_modules.len != layer_count) @panic("build module table does not cover every declared layer");
+    for (layer_modules) |members| {
+        if (members.len == 0) @panic("a declared layer has no module");
+    }
 
     // The build edge set is not a second hand-maintained list: every addImport
     // comes directly from the reviewed allow-list in src/module_layers.zig.
+    // Every module of a layer gets that layer's outgoing edges, so splitting a
+    // layer across files cannot quietly widen or narrow what it may reach.
     for (layer_contract.approved_edges) |edge| {
-        const from = modules[@backingInt(edge.from)];
-        const to = modules[@backingInt(edge.to)];
-        from.addImport(@tagName(edge.to), to);
+        const to = layer_modules[@backingInt(edge.to)][0];
+        for (layer_modules[@backingInt(edge.from)]) |from| {
+            from.addImport(@tagName(edge.to), to);
+        }
+    }
+
+    // Intra-layer: a layer's secondary modules reach its canonical module by
+    // the layer's own name. tools/check-module-imports permits that bare
+    // import precisely because it does not cross a layer boundary.
+    for (layer_modules, 0..) |members, index| {
+        const layer: layer_contract.Layer = @enumFromInt(index);
+        for (members[1..]) |member| member.addImport(@tagName(layer), members[0]);
     }
 }
 
@@ -255,6 +281,11 @@ const Layers = struct {
     generator: *std.Build.Module,
     api: *std.Build.Module,
     c_abi: *std.Build.Module,
+    /// The c_abi layer's second module: the only Zig-side definition of the
+    /// public coordgen_* symbols. Kept out of `c_abi` so that importing the
+    /// ABI's types never drags a competing implementation into a link that
+    /// already has one. Only the installed library's root should import it.
+    c_abi_exports: *std.Build.Module,
     conformance: *std.Build.Module,
 };
 
@@ -273,19 +304,20 @@ fn createLayers(
         .generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
         .api = createInternalModule(b, target, optimize, "src/api.zig"),
         .c_abi = createInternalModule(b, target, optimize, "src/c_abi_types.zig"),
+        .c_abi_exports = createInternalModule(b, target, optimize, "src/c_abi/exports.zig"),
         .conformance = createInternalModule(b, target, optimize, "src/conformance.zig"),
     };
-    const layered_modules = [_]*std.Build.Module{
-        layers.core,
-        layers.model,
-        layers.geometry,
-        layers.topology,
-        layers.layout,
-        layers.optimize_layer,
-        layers.generator,
-        layers.api,
-        layers.c_abi,
-        layers.conformance,
+    const layered_modules = [_][]const *std.Build.Module{
+        &.{layers.core},
+        &.{layers.model},
+        &.{layers.geometry},
+        &.{layers.topology},
+        &.{layers.layout},
+        &.{layers.optimize_layer},
+        &.{layers.generator},
+        &.{layers.api},
+        &.{ layers.c_abi, layers.c_abi_exports },
+        &.{layers.conformance},
     };
     wireApprovedModuleEdges(&layered_modules);
     return layers;
@@ -301,6 +333,7 @@ pub fn build(b: *std.Build) !void {
     const geometry = layers.geometry;
     const api = layers.api;
     const c_abi = layers.c_abi;
+    const c_abi_exports = layers.c_abi_exports;
     const conformance = layers.conformance;
 
     const module_layers = createInternalModule(b, target, optimize, "src/module_layers.zig");
@@ -318,6 +351,12 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "geometry", .module = geometry },
             .{ .name = "api", .module = api },
             .{ .name = "c_abi", .module = c_abi },
+            // The installed library is the one artifact that must contain the
+            // public coordgen_* definitions, so it is the one artifact that
+            // imports the exports module. Adding this import anywhere that
+            // also links the oracle-backed ABI is a duplicate-symbol link
+            // error, which is the point: cgz-r28.
+            .{ .name = "c_abi_exports", .module = c_abi_exports },
             .{ .name = "module_layers", .module = module_layers },
         },
         .link_libc = false,
@@ -344,6 +383,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "geometry-test", .module = geometry },
             .{ .name = "api-test", .module = api },
             .{ .name = "c-abi-test", .module = c_abi },
+            .{ .name = "c-abi-exports-test", .module = c_abi_exports },
         };
         var runs: [layer_modules.len]*std.Build.Step.Run = undefined;
         for (layer_modules, 0..) |entry, index| {
@@ -400,16 +440,53 @@ pub fn build(b: *std.Build) !void {
 
     const module_graph_step = b.step("module-graph-check", "Validate the approved named-module edge set");
     module_graph_step.dependOn(&run_layer_tests.step);
+    // Zig's own compile errors catch an unapproved *named* import (the
+    // module simply doesn't exist), but nothing stops a source-relative
+    // import from reaching another layer's private files on disk, bypassing
+    // the named-module table entirely. tools/check-module-imports is the
+    // independent, CI-enforced check for that escape hatch; its --self-test
+    // mode is the negative fixture proving it actually rejects one.
+    const module_import_check = b.addSystemCommand(&.{ "python3", "tools/check-module-imports" });
+    const module_import_self_test = b.addSystemCommand(&.{ "python3", "tools/check-module-imports", "--self-test" });
+    module_graph_step.dependOn(&module_import_check.step);
+    module_graph_step.dependOn(&module_import_self_test.step);
 
     const policy_command = b.addSystemCommand(&.{ "sh", "tools/check-build-policy" });
     const external_consumer = b.addRunFile(std.Build.LazyPath.zig_exe);
     external_consumer.addArgs(&.{ "build", "test", "--summary", "failures", "--cache-dir" });
     external_consumer.addDirectoryArg(std.Build.LazyPath.cache_root.path(b, "external-consumer"));
     external_consumer.setCwd(b.path("build_support/consumer"));
+    // The install gate the cgz-r28 defect walked straight through, now in the
+    // build graph rather than a documented two-command sequence. With no
+    // PREFIX argument the tool installs into a scratch directory it creates
+    // empty and destroys afterwards, so it can never certify files a previous
+    // run left behind, and it compiles and runs tests/install_consumer.c
+    // against that prefix alone - the check that would have caught an archive
+    // exporting nothing.
+    const install_isolation = b.addSystemCommand(&.{ "sh", "tools/check-install-isolation" });
+    install_isolation.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    install_isolation.addPrefixedDirectoryArg(
+        "--cache-dir=",
+        std.Build.LazyPath.cache_root.path(b, "install-isolation"),
+    );
+
     const package_step = b.step("package-check", "Verify package and dependency isolation policy");
     package_step.dependOn(&policy_command.step);
     package_step.dependOn(&run_consumer_tests.step);
     package_step.dependOn(&external_consumer.step);
+    package_step.dependOn(&install_isolation.step);
+    // The non-fuzzing backend list in tests/fuzz_backend.zig mirrors a private
+    // declaration in the toolchain, so it can go stale in the direction that
+    // fails open. This reads the switch out of the pinned toolchain in use and
+    // requires the two to agree, continuously rather than only when someone
+    // runs `zig build fuzz`.
+    const fuzz_backend_mirror = b.addSystemCommand(&.{ "python3", "tools/check-fuzz-backend" });
+    fuzz_backend_mirror.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    package_step.dependOn(&fuzz_backend_mirror.step);
+    // package-check is the gate every commit already runs; folding the
+    // module-import escape-hatch check in here means it cannot be silently
+    // skipped by only remembering `zig build test`.
+    package_step.dependOn(module_graph_step);
 
     const abi_layout_module = b.createModule(.{
         .target = target,
@@ -421,11 +498,18 @@ pub fn build(b: *std.Build) !void {
         .file = b.path("tests/abi_layout.c"),
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic" },
     });
+    // The static asserts above check the header against itself; linking the
+    // real library is what catches drift between the header's declared
+    // coordgen_generate/coordgen_result_free signatures and what the Zig
+    // implementation actually exports. A signature or name mismatch here is
+    // a link error, not a silent pass.
+    abi_layout_module.linkLibrary(library);
     const abi_layout = b.addExecutable(.{
         .name = "abi-layout-test",
         .root_module = abi_layout_module,
     });
     const run_abi_layout = b.addRunArtifact(abi_layout);
+    run_abi_layout.expectExitCode(0);
 
     const abi_cpp_module = b.createModule(.{
         .target = target,
@@ -862,6 +946,55 @@ pub fn build(b: *std.Build) !void {
     regeneration_step.dependOn(&regeneration_pending.step);
 
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
-    const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-r15");
+    const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
     fuzz_step.dependOn(&fuzz_pending.step);
+    // Attached now, before the harness exists, so cgz-7v2.4.4 inherits it
+    // rather than having to remember it: on a compiler backend whose
+    // std.testing.fuzz returns immediately, every fuzz target is a no-op that
+    // reports success. This makes `zig build fuzz` fail by name instead. It is
+    // deliberately not on `test` - a backend that cannot fuzz is no reason to
+    // block unrelated work. See cgz-r27.
+    const fuzz_backend_module = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const fuzz_backend_tests = b.addTest(.{
+        .name = "fuzz-backend-test",
+        .root_module = fuzz_backend_module,
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_backend_tests).step);
+
+    // A step with no dependencies succeeds instantly and reports success, which
+    // is the cgz-r20 failure mode. tools/check-gate-strength used to assert
+    // this by grepping build.zig for the string "<step>.dependOn(" - a text
+    // property, satisfiable by a call inside a branch that never runs. This
+    // asks the constructed graph instead, which is the thing that has to be
+    // true, and it runs at configure time on every single invocation rather
+    // than only under package-check.
+    assertNoFalseGreenSteps(&.{
+        test_step,
+        module_graph_step,
+        package_step,
+        abi_step,
+        oracle_step,
+        conformance_step,
+        examples_step,
+        regeneration_step,
+        fuzz_step,
+    });
+}
+
+/// Every publicly reachable step must do something. Configure-time panic
+/// rather than a build error because a gate that certifies nothing is a
+/// defect in the build description itself, not in what is being built.
+fn assertNoFalseGreenSteps(steps: []const *std.Build.Step) void {
+    for (steps) |step| {
+        if (step.dependencies.items.len == 0) {
+            std.debug.panic(
+                "build step '{s}' has no dependencies and would report success without checking anything",
+                .{step.name},
+            );
+        }
+    }
 }

@@ -152,12 +152,12 @@ vtable or raw atom pointer.
 | core | IDs, chemistry/error representations, f32 vectors, bond length, DOF and interaction values | nothing |
 | model | working atom/bond/ring/fragment/residue values and order maps | core |
 | geometry | geometry interfaces and algorithms | core |
-| topology | adjacency, components, rings, canonicalization, CIP/stereo structure | core, model, geometry |
-| layout | fragment construction, templates, rings, macrocycles, placement | core, model, geometry, topology |
+| topology | adjacency, components, ring *perception*, canonicalization, CIP/stereo structure | core, model, geometry |
+| layout | fragment construction, templates, ring *placement*, macrocycles, coordinate assignment | core, model, geometry, topology |
 | optimize | DOF search, interactions, continuous minimization | core, model, geometry; never concrete layout builders |
 | generator | orchestration and phase lifetimes | core, model, geometry, topology, layout, optimize |
 | api | safe public Zig conversion, validation, owned result | core, generator |
-| c_abi | handwritten stable C conversion/exports | core, api |
+| c_abi | handwritten stable C DTOs, and separately the exports that use them | core, api |
 | conformance | oracle adapters, probes, comparisons | any production layer; never imported by production |
 
 `src/module_layers.zig` is the machine-readable edge allow-list and proves the
@@ -165,6 +165,44 @@ graph is one-way. The build graph must create these as named modules and add
 only the listed explicit imports. Tests may inspect internals; production code
 must never import conformance/oracle modules. Oracle/probe artifacts are never
 installed.
+
+"Rings" appears in two rows because two different things are being owned:
+topology decides *which* cycles exist (the perceived ring set, and each ring's
+membership and fusion relationships); layout decides *where* they go (template
+selection, macrocycle construction, coordinate assignment). A bead implementing
+one must not write the other's files.
+
+The table's granularity is one bead per layer, and at that granularity file
+ownership is unambiguous — every layer has a distinct root, and
+`tools/check-module-imports` already resolves `src/<layer>/` subdirectories, so
+a layer can grow files without ambiguity. Splitting a *single* layer across two
+parallel beads is not yet specified: `topology`, `layout`, `optimize`, and
+`generator` are still `build_support/empty_module.zig` stubs, and until they
+have real content there is no sub-file map to divide. Whoever splits a layer
+records the file boundary here first.
+
+A layer is a set of modules, not necessarily one. Every module of a layer gets
+that layer's row of the table above; a layer's secondary modules additionally
+import its canonical module — the one other layers see — under the layer's own
+name. `c_abi` is the only layer split this way, and it is split for a linker
+reason:
+
+- `c_abi` (`src/c_abi_types.zig`, the canonical module) is the ABI's data
+  types and defines no linker name at all.
+- `c_abi_exports` (`src/c_abi/exports.zig`) is the sole Zig definition of
+  `coordgen_generate` and `coordgen_result_free`, and `src/coordgen.zig` — the
+  installed library's root — is the only file permitted to import it.
+
+`conformance/oracle_adapter.cpp` defines those same two symbol names on
+purpose, so that a C or C++ consumer of `include/coordgen_abi.h` can link the
+pinned upstream oracle without being rewritten. Any binary wanting the
+oracle's implementation *and* the ABI's Zig type declarations — the corpus
+runner is exactly that — would otherwise link two implementations of the same
+ABI. That is a hard `ld.lld: duplicate symbol` error on Linux and silently
+tolerated by macOS's linker, so the constraint is enforced statically instead:
+`tools/check-module-imports` asserts `c_abi_exports` has exactly one importer,
+and the reference is a `comptime` one, because a plain `pub const` `@import`
+does not force export discovery in a non-test build.
 
 ## Phase allocation policy
 
@@ -184,3 +222,38 @@ installed.
   template atoms belongs to the context. `cgz-r12` records this as corrected.
 - Public validation paths return errors, including OOM. Assertions are only
   for invariants established by prior validation or phase types.
+
+## What each gate proves
+
+cgz-r28 was a gate certifying an empty archive: `check-install-isolation`
+asserted that `libcoordgen.a` existed, that the probe header did not, and that
+no upstream C++ symbols had leaked — all true of a 2400-byte file exporting
+nothing. It never asked whether the library contained the ABI it claims to
+install. That is the third instance of one pattern (cgz-r19 was flags weakened
+to pass, cgz-r20 was steps reporting success unconditionally), so the gates are
+enumerated here with the distinction each one turns on.
+
+**Behavioral — recomputes or executes the thing it certifies:**
+
+| Gate | Proves |
+|---|---|
+| `tools/verify-upstream` | The pinned archive's SHA-256, byte count, Git tree hash, LICENSE hash, and Zig package hash, all recomputed with the pinned toolchain. The strongest gate in the tree. |
+| `tools/check-install-isolation` | Builds into a scratch prefix created empty and destroyed after, then compiles and runs `tests/install_consumer.c` against `$prefix` alone. An archive without the ABI fails to link. Wired into `package-check`. |
+| `abi-check` | Links `tests/abi_layout.c` against the real library, so a name or signature drift from `include/coordgen_abi.h` is a link error. |
+| `assertNoFalseGreenSteps` (build.zig) | Asks the constructed graph whether each public step has dependencies. Runs at configure time on every invocation. |
+| `tools/check-gate-strength` | Every one of build.zig's C/C++ compile sites uses an approved strict flag set, with a narrow enumerated exemption for upstream-owned sources. Universality, not presence. |
+| `tools/check-module-imports` | No relative import crosses a layer; no bare import lacks an approved edge; `c_abi_exports` has exactly one importer. |
+
+**Textual — reads the build description, and only proves what it says:**
+
+`tools/check-build-policy` asserts that build.zig and build.zig.zon *declare*
+a lazy oracle dependency, an `enable-oracle` opt-in, a public-header install,
+and no probe-header install. Those are properties of the build description, so
+text is the right level for them — but a declaration is not an outcome, and
+its summary line says so. The behavioral counterparts are named above.
+
+Both checkers with a `--self-test` mode (`check-module-imports`,
+`check-gate-strength`) plant a violation of each class they claim to catch,
+plus a compliant control, so a gate cannot decay into one that passes
+everything. New gates follow the same rule: state what is asserted, and if the
+name implies content, assert content.

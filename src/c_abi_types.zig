@@ -1,3 +1,13 @@
+//! The C ABI's data types, and nothing else.
+//!
+//! This file is the `c_abi` layer's root and defines no symbol that occupies
+//! a linker name. The public entry points the DTOs describe live in
+//! src/c_abi/exports.zig, in a module of their own, so that a binary can
+//! import these declarations while linking somebody else's implementation of
+//! coordgen_generate - which is precisely what the conformance corpus runner
+//! does against the pinned C++ oracle. See that file's header for the full
+//! reason and for cgz-r28.
+
 const std = @import("std");
 const core = @import("core");
 
@@ -134,7 +144,6 @@ pub const Result = extern struct {
     reserved: u32 = 0,
     owner: ?*anyopaque = null,
 };
-
 test "C DTO widths, alignments, and offsets are frozen on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(StringView));
     try std.testing.expectEqual(@as(usize, 52), @sizeOf(AtomInput));

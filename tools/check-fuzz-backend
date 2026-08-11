@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Prove tests/fuzz_backend.zig's backend list still matches the toolchain's.
+
+tests/fuzz_backend.zig refuses to let a fuzz gate report success on a compiler
+backend whose `std.testing.fuzz` returns immediately. It does that by mirroring
+`need_simple`, a private declaration in the pinned toolchain's
+lib/compiler/test_runner.zig.
+
+A mirror of a private declaration fails in the dangerous direction. If upstream
+adds a fourth non-fuzzing backend, our list is silently incomplete, the
+assertion passes, and the fuzz gate goes back to certifying nothing - which is
+the failure mode the assertion exists to prevent, reintroduced through the
+assertion itself.
+
+So the mirror is not trusted: this reads the switch out of the toolchain
+actually in use and requires the two sets to be equal. A toolchain bump that
+changes the set is then a build failure with a name, not a silent downgrade.
+See cgz-r27.
+
+Usage: check-fuzz-backend [ZIG]
+  ZIG defaults to $CGZ_ZIG, then to tools/bootstrap-zig.
+"""
+
+import os
+import re
+import subprocess
+import sys
+
+# `const need_simple = switch (builtin.zig_backend) { ... => true, else => false };`
+_NEED_SIMPLE_RE = re.compile(
+    r'const need_simple = switch \(builtin\.zig_backend\) \{(.*?)=> true,',
+    re.DOTALL,
+)
+_MIRROR_RE = re.compile(
+    r'pub const non_fuzzing_backends = \[_\]Backend\{(.*?)\};',
+    re.DOTALL,
+)
+_TAG_RE = re.compile(r'\.([A-Za-z0-9_]+)\s*,')
+
+
+def _fail(message):
+    print(f'check-fuzz-backend: {message}', file=sys.stderr)
+    return 1
+
+
+def _zig_lib_dir(zig_path, repo_root):
+    """`zig env` reports lib_dir; it may be relative to the cwd."""
+    out = subprocess.run(
+        [zig_path, 'env'], capture_output=True, text=True, check=True, cwd=repo_root
+    ).stdout
+    match = re.search(r'\.lib_dir = "([^"]*)"', out)
+    if match is None:
+        raise RuntimeError('zig env did not report lib_dir')
+    lib_dir = match.group(1)
+    if not os.path.isabs(lib_dir):
+        lib_dir = os.path.join(repo_root, lib_dir)
+    return lib_dir
+
+
+def main(argv):
+    repo_root = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
+    zig_path = argv[1] if len(argv) > 1 else os.environ.get('CGZ_ZIG', '')
+    if not zig_path:
+        zig_path = subprocess.run(
+            [os.path.join(repo_root, 'tools', 'bootstrap-zig')],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    runner = os.path.join(_zig_lib_dir(zig_path, repo_root), 'compiler', 'test_runner.zig')
+    if not os.path.isfile(runner):
+        return _fail(f'toolchain test runner not found at {runner}')
+
+    with open(runner, 'r', encoding='utf-8') as fh:
+        runner_text = fh.read()
+    match = _NEED_SIMPLE_RE.search(runner_text)
+    if match is None:
+        # Not a stale-list failure: the shape this check depends on is gone, so
+        # it can no longer prove anything and must not pretend otherwise.
+        return _fail(
+            f'could not find the need_simple switch in {runner}; the toolchain '
+            'changed shape and tests/fuzz_backend.zig can no longer be verified '
+            'against it - re-derive the non-fuzzing backend set by hand'
+        )
+    toolchain_set = set(_TAG_RE.findall(match.group(1)))
+    if not toolchain_set:
+        return _fail(f'the need_simple switch in {runner} listed no backends')
+
+    mirror_path = os.path.join(repo_root, 'tests', 'fuzz_backend.zig')
+    with open(mirror_path, 'r', encoding='utf-8') as fh:
+        mirror_match = _MIRROR_RE.search(fh.read())
+    if mirror_match is None:
+        return _fail(f'could not find non_fuzzing_backends in {mirror_path}')
+    mirror_set = set(_TAG_RE.findall(mirror_match.group(1)))
+
+    if mirror_set != toolchain_set:
+        missing = sorted(toolchain_set - mirror_set)
+        extra = sorted(mirror_set - toolchain_set)
+        detail = []
+        if missing:
+            detail.append(
+                'the toolchain treats these as non-fuzzing but tests/fuzz_backend.zig '
+                f'does not list them: {missing} - on one of these the fuzz gate would '
+                'report success while running nothing'
+            )
+        if extra:
+            detail.append(
+                f'tests/fuzz_backend.zig lists backends the toolchain does not: {extra} '
+                '- fuzzing would be refused on a backend that can do it'
+            )
+        return _fail('backend mirror is out of date; ' + '; and '.join(detail))
+
+    print(
+        'check-fuzz-backend: verified tests/fuzz_backend.zig mirrors the pinned '
+        f'toolchain\'s non-fuzzing backend set ({", ".join(sorted(toolchain_set))})'
+    )
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

@@ -155,6 +155,22 @@ pub const AtomStereo = enum(u32) {
     counter_clockwise = 2,
     r = 3,
     s = 4,
+
+    /// Safe conversion from a caller-controlled C ABI `uint32_t`. Never
+    /// convert an unchecked raw value with `@enumFromInt`: this enum is
+    /// exhaustive, so an out-of-range tag is illegal-behavior, not merely a
+    /// validation failure. Every numeric value outside 0...4 must be
+    /// rejected here, before it ever becomes an AtomStereo value.
+    pub fn fromPublic(value: u32) ?AtomStereo {
+        return switch (value) {
+            0 => .unspecified,
+            1 => .clockwise,
+            2 => .counter_clockwise,
+            3 => .r,
+            4 => .s,
+            else => null,
+        };
+    }
 };
 
 /// `cis`/`trans` describe referenced substituents; `z`/`e` describe the
@@ -165,6 +181,18 @@ pub const BondStereo = enum(u32) {
     trans = 2,
     z = 3,
     e = 4,
+
+    /// See AtomStereo.fromPublic: the same illegal-behavior hazard applies.
+    pub fn fromPublic(value: u32) ?BondStereo {
+        return switch (value) {
+            0 => .unspecified,
+            1 => .cis,
+            2 => .trans,
+            3 => .z,
+            4 => .e,
+            else => null,
+        };
+    }
 };
 
 /// Direction is part of the display value so the three upstream booleans
@@ -184,4 +212,13 @@ test "chemical enums have stable widths and zero-order bonds are conserved" {
     try std.testing.expectEqual(AtomicNumber.oganesson, AtomicNumber.fromPublic(118).?);
     try std.testing.expect(AtomicNumber.fromPublic(0) == null);
     try std.testing.expect(BondOrder.fromInt(4) == null);
+}
+
+test "AtomStereo and BondStereo reject raw values outside their defined range" {
+    try std.testing.expectEqual(AtomStereo.s, AtomStereo.fromPublic(4).?);
+    try std.testing.expect(AtomStereo.fromPublic(5) == null);
+    try std.testing.expect(AtomStereo.fromPublic(std.math.maxInt(u32)) == null);
+    try std.testing.expectEqual(BondStereo.e, BondStereo.fromPublic(4).?);
+    try std.testing.expect(BondStereo.fromPublic(5) == null);
+    try std.testing.expect(BondStereo.fromPublic(std.math.maxInt(u32)) == null);
 }

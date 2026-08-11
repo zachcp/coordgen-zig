@@ -1,13 +1,54 @@
 #!/bin/sh
 set -eu
 
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
 fail() {
     echo "check-install-isolation: $*" >&2
     exit 1
 }
 
-[ "$#" -eq 1 ] || fail "usage: check-install-isolation PREFIX"
-prefix=$1
+# usage: check-install-isolation [--cache-dir=PATH] [PREFIX]
+#
+# With a PREFIX, check an install the caller already produced. With none,
+# produce one first, into a scratch directory created empty and destroyed on
+# exit. The second form is what the build graph uses: a prefix that persists
+# between runs could satisfy every check below with files a previous build
+# left behind, which is the failure mode this whole gate exists to catch.
+zig_path=${CGZ_ZIG:-}
+if [ -z "$zig_path" ]; then
+    zig_path=$("$repo_root/tools/bootstrap-zig")
+fi
+
+scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/cgz-install-isolation.XXXXXX")
+trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
+
+# The scratch *prefix* is always fresh; the nested build's cache need not be,
+# and rebuilding the library from zero on every package-check would be the
+# reason someone stops running it. --cache-dir names a durable one.
+build_cache="$scratch_dir/cache"
+prefix=
+for arg in "$@"; do
+    case "$arg" in
+        --cache-dir=*) build_cache=${arg#--cache-dir=} ;;
+        -*) fail "unknown option: $arg" ;;
+        *)
+            [ -z "$prefix" ] || fail "usage: check-install-isolation [--cache-dir=PATH] [PREFIX]"
+            prefix=$arg
+            ;;
+    esac
+done
+
+if [ -z "$prefix" ]; then
+    prefix="$scratch_dir/prefix"
+    # A cache directory of its own: this is a nested `zig build`, and sharing
+    # the outer build's cache would contend on its lock.
+    (
+        cd "$repo_root" && "$zig_path" build --summary failures \
+            --prefix "$prefix" --cache-dir "$build_cache"
+    ) || fail "install build failed"
+fi
+
 library="$prefix/lib/libcoordgen.a"
 public_header="$prefix/include/coordgen_abi.h"
 
@@ -23,4 +64,23 @@ if grep -aE 'sketcherMinimizer|CoordgenMinimizer' "$library" >/dev/null; then
     fail "installed production archive contains upstream C++ symbols"
 fi
 
-echo "verified installed public ABI and exclusion of the C++ oracle/probe header"
+# The checks above are static (file presence, archive contents). The
+# installed-consumer test is behavioral: compile and run a program that only
+# ever sees $prefix (never this repo's include/ or zig-out/), proving the
+# archive actually contains coordgen_generate/coordgen_result_free under the
+# names and signatures coordgen_abi.h declares, from a genuine scratch
+# directory rather than the build tree.
+work_dir="$scratch_dir/consumer"
+mkdir -p "$work_dir"
+
+"$zig_path" cc -std=c11 -Wall -Wextra -Werror -pedantic \
+    -I "$prefix/include" \
+    "$repo_root/tests/install_consumer.c" \
+    -L "$prefix/lib" -lcoordgen \
+    -o "$work_dir/install-consumer" \
+    || fail "installed-consumer program did not compile/link against \$prefix alone"
+
+"$work_dir/install-consumer" \
+    || fail "installed-consumer program did not observe the documented ABI behavior"
+
+echo "verified installed public ABI, exclusion of the C++ oracle/probe header, and a scratch-directory consumer build"
