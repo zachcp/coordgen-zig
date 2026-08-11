@@ -117,6 +117,10 @@ jobs:
           HTTP_PROXY: http://127.0.0.1:9
           HTTPS_PROXY: http://127.0.0.1:9
           ALL_PROXY: http://127.0.0.1:9
+          # The isolation script must use the already checksummed toolchain.
+          # Its fallback bootstrap is deliberately blocked by the offline
+          # proxy used to prove the install has no network dependency.
+          CGZ_ZIG: ${{ steps.zig.outputs.zig }}
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
         run: |
