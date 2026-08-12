@@ -61,6 +61,7 @@ jobs:
           ${{ steps.zig.outputs.zig }} build abi-check
           ${{ steps.zig.outputs.zig }} build abi-check -Doptimize=safe
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true upstream-oracle
+          ${{ steps.zig.outputs.zig }} build -Denable-oracle=true template-regeneration-check
 
       # The architecture axis of the stability classification runs the other
       # CPU architecture's binaries. macOS arm64 runners do that through

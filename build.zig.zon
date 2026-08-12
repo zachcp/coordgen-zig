@@ -28,5 +28,6 @@
         "tools/check-install-isolation",
         "tools/verify-upstream",
         "tools/mae-fixture-totals.py",
+        "tools/extract-template-reference.py",
     },
 }

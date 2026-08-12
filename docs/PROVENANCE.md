@@ -32,6 +32,31 @@ The upstream BSD-3-Clause license is preserved verbatim at
 `LICENSES/coordgenlibs-BSD-3-Clause.txt` and is also required to be present in
 the fetched package.
 
+## Template provenance and normalization
+
+The parity target is the normalized template set loaded by upstream, not raw
+`templates.mae`. The pinned MAE contains 82 structures, 1704 atoms, and 1963
+bonds. `tools/extract-template-reference.py` independently parses the literal
+tuples and bonds in committed upstream `CoordgenTemplates.cpp` and produces
+`conformance/fixtures/templates_normalized.zig`; it does not use the Zig MAE
+reader. A separate raw-mode comparison proves every unnormalized atom tuple
+and bond agrees before normalization. The raw and normalized datasets agree
+exactly, so no discrepancy preference was required.
+
+Normalization reproduces `sketcherMinimizer.cpp`'s evaluation order: f32
+squared bond lengths are promoted for strict double-literal 0.9/1.1 comparisons, the
+largest cluster wins with the first cluster winning ties, and all coordinates
+are divided by the f32 square root of its representative. Atom indices remain
+storage order. The committed representation is immutable Zig data with f32
+coordinates encoded as bit patterns, avoiding textual floating-point drift.
+
+`zig build template-regeneration-check -Denable-oracle=true` extracts the C++
+reference afresh, generates from `templates.mae` twice, and compares all three
+outputs byte-for-byte with the committed fixture. The gate runs natively in
+both macOS arm64 and Linux x86_64 CI; fixture equality on each native target
+therefore supplies the cross-target determinism proof. Without the explicit
+option it fails clearly and the lazy upstream package is not fetched.
+
 ## Mirror requirement
 
 The exact archive URL currently points to the full GitHub commit and is
