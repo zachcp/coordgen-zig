@@ -298,7 +298,7 @@ fn createLayers(
         .core = createInternalModule(b, target, optimize, "src/core.zig"),
         .model = createInternalModule(b, target, optimize, "src/model.zig"),
         .geometry = createInternalModule(b, target, optimize, "src/geometry.zig"),
-        .topology = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
+        .topology = createInternalModule(b, target, optimize, "src/topology.zig"),
         .layout = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
         .optimize_layer = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
         .generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
@@ -331,6 +331,7 @@ pub fn build(b: *std.Build) !void {
     const core = layers.core;
     const model = layers.model;
     const geometry = layers.geometry;
+    const topology = layers.topology;
     const api = layers.api;
     const c_abi = layers.c_abi;
     const c_abi_exports = layers.c_abi_exports;
@@ -381,6 +382,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "core-test", .module = core },
             .{ .name = "model-test", .module = model },
             .{ .name = "geometry-test", .module = geometry },
+            .{ .name = "topology-test", .module = topology },
             .{ .name = "api-test", .module = api },
             .{ .name = "c-abi-test", .module = c_abi },
             .{ .name = "c-abi-exports-test", .module = c_abi_exports },
