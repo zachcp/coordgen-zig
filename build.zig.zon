@@ -30,5 +30,6 @@
         "tools/mae-fixture-totals.py",
         "tools/extract-template-reference.py",
         "tools/check-upstream-test-inventory.py",
+        "tools/check-requirements-coverage.py",
     },
 }

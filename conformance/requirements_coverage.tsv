@@ -1,0 +1,115 @@
+# schema_version	1
+# quantity means assertion sites for upstream_case, represented fields for DTO rows, and represented artifacts otherwise.
+# decision records the reviewed Bead for non-goals and the pinned SHA-256 for fixture rows.
+category	id	source	selector	quantity	evidence	disposition	decision
+upstream_case	upstream.SampleTest	test/test_coordgen.cpp	SampleTest	6	conformance/public_fixture_test_rehost.cpp::void SampleTest(	executable	-
+upstream_case	upstream.TemplateTest	test/test_coordgen.cpp	TemplateTest	4	conformance/public_fixture_test_rehost.cpp::void TemplateTest(	executable	-
+upstream_case	upstream.ClearWedgesTest	test/test_coordgen.cpp	ClearWedgesTest	7	conformance/public_fixture_test_rehost.cpp::void ClearWedgesTest(	executable	-
+upstream_case	upstream.DisableMetalZOBs	test/test_coordgen.cpp	DisableMetalZOBs	6	conformance/public_fixture_test_rehost.cpp::void DisableMetalZOBs(	executable	-
+upstream_case	upstream.terminalMetalZOBs	test/test_coordgen.cpp	terminalMetalZOBs	6	conformance/public_fixture_test_rehost.cpp::void terminalMetalZOBs(	executable	-
+upstream_case	upstream.testMinimizedRingsShape	test/test_coordgen.cpp	testMinimizedRingsShape	7	conformance/public_fixture_test_rehost.cpp::void testMinimizedRingsShape(	executable	-
+upstream_case	upstream.testPolyominoCoordinatesOfSubstituent	test/test_coordgen.cpp	testPolyominoCoordinatesOfSubstituent	2	conformance/public_test_rehost.cpp::void testPolyominoCoordinatesOfSubstituent()	executable	-
+upstream_case	upstream.testPolyominoSameAs	test/test_coordgen.cpp	testPolyominoSameAs	11	conformance/public_test_rehost.cpp::void testPolyominoSameAs()	executable	-
+upstream_case	upstream.testGetDoubleBondConstraints	test/test_coordgen.cpp	testGetDoubleBondConstraints	3	conformance/public_fixture_test_rehost.cpp::void testGetDoubleBondConstraints(	executable	-
+upstream_case	upstream.testClockwiseOrderedSubstituents	test/test_coordgen.cpp	testClockwiseOrderedSubstituents	13	conformance/public_test_rehost.cpp::void testClockwiseOrderedSubstituents()	executable	-
+upstream_case	upstream.testClockwiseOrderedNaN	test/test_coordgen.cpp	testClockwiseOrderedNaN	0	conformance/public_test_rehost.cpp::void testClockwiseOrderedNaN()	executable	-
+upstream_case	upstream.testbicyclopentane	test/test_coordgen.cpp	testbicyclopentane	6	conformance/public_test_rehost.cpp::void testbicyclopentane()	executable	-
+upstream_case	upstream.testFusedRings	test/test_coordgen.cpp	testFusedRings	2	conformance/public_test_rehost.cpp::void testFusedRings()	executable	-
+upstream_case	upstream.testTemplates	test/test_coordgen.cpp	testTemplates	1	conformance/public_test_rehost.cpp::void testTemplates()	executable	-
+upstream_case	upstream.testRingComplex	test/test_coordgen.cpp	testRingComplex	1	conformance/public_test_rehost.cpp::void testRingComplex()	executable	-
+upstream_case	upstream.testCoordgenFragmenter	test/test_coordgen.cpp	testCoordgenFragmenter	14	conformance/public_test_rehost.cpp::void testCoordgenFragmenter()	executable	-
+upstream_case	upstream.Basics	test/test_smilesparser.cpp	Basics	7	conformance/public_test_rehost.cpp::void Basics()	executable	-
+upstream_case	upstream.Rings	test/test_smilesparser.cpp	Rings	3	conformance/public_test_rehost.cpp::void Rings()	executable	-
+upstream_case	upstream.Branching	test/test_smilesparser.cpp	Branching	2	conformance/public_test_rehost.cpp::void Branching()	executable	-
+upstream_case	upstream.BondOrder	test/test_smilesparser.cpp	BondOrder	1	conformance/public_test_rehost.cpp::void BondOrder()	executable	-
+fixture	fixture.macrocycle	test/macrocycle.mae	macrocycle.mae	1	build.zig::"test/macrocycle.mae"	executable	sha256:72b2194a9ccc6249b6063057560013cdbbcd9c03b6ec0c251fbce4fc55bc3f5d
+fixture	fixture.metalZobs	test/metalZobs.mae	metalZobs.mae	1	build.zig::"test/metalZobs.mae"	executable	sha256:d8cd42d5bbd5c69000b797e5660359a75a13d2e5c6c1161d611c2ac7cdcb0250
+fixture	fixture.nonterminalMetalZobs	test/nonterminalMetalZobs.mae	nonterminalMetalZobs.mae	1	build.zig::"test/nonterminalMetalZobs.mae"	executable	sha256:7de805d7dcdaf3766516208a2ac4dcab22e6284981cb6a116e22df5b19743fe7
+fixture	fixture.sample	test/test.mae	test.mae	1	build.zig::"test/test.mae"	executable	sha256:7faafb01d97ef911097a2986cc9b1fcd87e7f2ad589d968728297deba5a05513
+fixture	fixture.chirality	test/testChirality.mae	testChirality.mae	1	build.zig::"test/testChirality.mae"	executable	sha256:8063fd4f41459ca88d94dff6c493b499c7da899b751d3313c34eb90bfe9e5a3b
+fixture	fixture.molecule	test/test_mol.mae	test_mol.mae	1	build.zig::"test/test_mol.mae"	executable	sha256:3189e0b7fc714f2ccc953a57f0f4e1289caeaa38fbd3282fe9b769bfb81e477d
+templates	templates.all	templates.mae	structures	82	tests/template_generate.zig::fixture.templates.len	executable	-
+example	example.upstream	example_dir/example.cpp	main	1	build.zig::run_oracle_example.expectStdErrEqual	executable	-
+zig_dto	zig.AtomStereoInput	src/api.zig	AtomStereoInput	4	src/api.zig::test "zero-order, hidden, fixed, constrained, templates, charge, and stereo validate"	executable	-
+zig_dto	zig.AtomInput	src/api.zig	AtomInput	8	src/api.zig::test "zero-order, hidden, fixed, constrained, templates, charge, and stereo validate"	executable	-
+zig_dto	zig.BondStereoInput	src/api.zig	BondStereoInput	3	src/api.zig::test "zero-order, hidden, fixed, constrained, templates, charge, and stereo validate"	executable	-
+zig_dto	zig.BondInput	src/api.zig	BondInput	7	src/api.zig::test "zero-order, hidden, fixed, constrained, templates, charge, and stereo validate"	executable	-
+zig_dto	zig.ResidueInput	src/api.zig	ResidueInput	4	src/c_abi/exports.zig::.residues = &.{.{ .atom = 9	executable	-
+zig_dto	zig.ResidueInteractionInput	src/api.zig	ResidueInteractionInput	5	src/c_abi/exports.zig::.residue_interactions = &.{.{ .start = 0	executable	-
+zig_dto	zig.Options	src/api.zig	Options	11	src/api.zig::test "complete option table has pinned defaults"	executable	-
+zig_dto	zig.Input	src/api.zig	Input	6	src/api.zig::test "caller-controlled invalid states return errors"	executable	-
+zig_dto	zig.Result	src/api.zig	Result	8	src/api.zig::test "result allocation has explicit leak-free ownership"	executable	-
+c_dto	c.StringView	src/c_abi_types.zig	StringView	3	tests/abi_layout.c::string view layout	executable	-
+c_dto	c.IndexSpan	src/c_abi_types.zig	IndexSpan	3	src/c_abi_types.zig::pub const IndexSpan	executable	-
+c_dto	c.AtomInput	src/c_abi_types.zig	AtomInput	10	tests/abi_layout.c::atom input layout	executable	-
+c_dto	c.BondInput	src/c_abi_types.zig	BondInput	10	tests/abi_layout.c::bond input layout	executable	-
+c_dto	c.ResidueInput	src/c_abi_types.zig	ResidueInput	5	tests/abi_layout.c::residue input layout	executable	-
+c_dto	c.ResidueInteractionInput	src/c_abi_types.zig	ResidueInteractionInput	6	tests/abi_layout.c::residue interaction layout	executable	-
+c_dto	c.Options	src/c_abi_types.zig	Options	11	tests/abi_layout.c::options layout	executable	-
+c_dto	c.Input	src/c_abi_types.zig	Input	6	tests/abi_layout.c::input layout	executable	-
+c_dto	c.Result	src/c_abi_types.zig	Result	9	tests/abi_layout.c::result layout	executable	-
+c_span_dto	c.spans	src/c_abi_types.zig	generated spans	18	tests/abi_layout.c::result layout	executable	-
+error	error.EmptyGraph	src/core/errors.zig	EmptyGraph	1	src/c_abi/exports.zig::rejects an empty graph and leaves result zeroed	executable	-
+error	error.TooManyItems	src/core/errors.zig	TooManyItems	1	src/api.zig::error.TooManyItems	executable	-
+error	error.InvalidAtomicNumber	src/core/errors.zig	InvalidAtomicNumber	1	src/c_abi/exports.zig::.invalid_atomic_number	executable	-
+error	error.InvalidBondOrder	src/core/errors.zig	InvalidBondOrder	1	src/c_abi/exports.zig::.invalid_bond_order	executable	-
+error	error.InvalidAtomIndex	src/core/errors.zig	InvalidAtomIndex	1	src/c_abi/exports.zig::.invalid_atom_index	executable	-
+error	error.InvalidStereo	src/core/errors.zig	InvalidStereo	1	src/c_abi/exports.zig::.invalid_stereo	executable	-
+error	error.InvalidCoordinate	src/core/errors.zig	InvalidCoordinate	1	src/c_abi/exports.zig::.invalid_coordinate	executable	-
+error	error.InvalidOption	src/core/errors.zig	InvalidOption	1	src/c_abi/exports.zig::.invalid_option	executable	-
+error	error.InvalidMapping	src/core/errors.zig	InvalidMapping	1	src/model.zig::mapping rejects duplicate and missing input positions	executable	-
+error	error.Unsupported	src/core/errors.zig	Unsupported	1	src/c_abi/exports.zig::.unsupported	executable	-
+error	error.OutOfMemory	src/core/errors.zig	OutOfMemory	1	src/topology.zig::reports and cleans up every allocation failure	executable	-
+ownership	ownership.zig-input-borrowed	docs/architecture/FOUNDATION_CONTRACTS.md	Zig input borrowed	1	tests/rdkit_consumer.cpp::checkInputOrderContract	executable	-
+ownership	ownership.zig-result-owned	docs/architecture/FOUNDATION_CONTRACTS.md	Zig result deinit	1	src/api.zig::result allocation has explicit leak-free ownership	executable	-
+ownership	ownership.c-input-borrowed	docs/architecture/FOUNDATION_CONTRACTS.md	C input borrowed	1	tests/abi_cpp_consumer.cpp::const coordgen_input_t *	executable	-
+ownership	ownership.c-failure-zero	docs/architecture/FOUNDATION_CONTRACTS.md	C failure zero result	1	src/c_abi/exports.zig::leaves result zeroed	executable	-
+ownership	ownership.c-result-free	docs/architecture/FOUNDATION_CONTRACTS.md	C result free once	1	src/c_abi/exports.zig::releases every owned span through the stored allocator	executable	-
+ownership	ownership.output-input-order	docs/architecture/FOUNDATION_CONTRACTS.md	Output caller order	1	src/model.zig::adversarial internal order emits coordinates in caller input order	executable	-
+observable	observable.status	src/conformance/comparison.zig	status	1	tests/oracle_corpus_run.zig::"status\t	executable	-
+observable	observable.clean_pose	src/conformance/comparison.zig	clean_pose	1	tests/oracle_corpus_run.zig::"clean_pose\t	executable	-
+observable	observable.coordinates	src/conformance/comparison.zig	coordinates	1	tests/oracle_corpus_run.zig::"coordinates\t	executable	-
+observable	observable.input_to_internal	src/conformance/comparison.zig	input_to_internal	1	tests/oracle_corpus_run.zig::"input_to_internal"	executable	-
+observable	observable.internal_to_input	src/conformance/comparison.zig	internal_to_input	1	tests/oracle_corpus_run.zig::"internal_to_input"	executable	-
+observable	observable.effective_bond_orders	src/conformance/comparison.zig	effective_bond_orders	1	tests/oracle_corpus_run.zig::"effective_bond_orders"	executable	-
+observable	observable.bond_displays	src/conformance/comparison.zig	bond_displays	1	tests/oracle_corpus_run.zig::"bond_displays"	executable	-
+observable	observable.atom_stereo	src/conformance/comparison.zig	atom_stereo	1	tests/oracle_corpus_run.zig::"atom_stereo"	executable	-
+observable	observable.probe_status	src/conformance/comparison.zig	probe_status	1	tests/oracle_corpus_run.zig::"probe_status\t	executable	-
+observable	observable.probe_clean_pose	src/conformance/comparison.zig	probe_clean_pose	1	tests/oracle_corpus_run.zig::"probe_clean_pose\t	executable	-
+observable	observable.morgan_ranks	src/conformance/comparison.zig	morgan_ranks	1	tests/oracle_corpus_run.zig::"morgan_ranks"	executable	-
+observable	observable.rings	src/conformance/comparison.zig	rings	1	tests/oracle_corpus_run.zig::"rings"	executable	-
+observable	observable.rings_set	src/conformance/comparison.zig	rings_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+observable	observable.fragments	src/conformance/comparison.zig	fragments	1	tests/oracle_corpus_run.zig::"fragments"	executable	-
+observable	observable.fragments_set	src/conformance/comparison.zig	fragments_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+observable	observable.dofs	src/conformance/comparison.zig	dofs	1	tests/oracle_corpus_run.zig::"dofs"	executable	-
+observable	observable.dofs_set	src/conformance/comparison.zig	dofs_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+observable	observable.dof_penalties	src/conformance/comparison.zig	dof_penalties	1	tests/oracle_corpus_run.zig::"dof_penalties"	executable	-
+observable	observable.dof_penalties_set	src/conformance/comparison.zig	dof_penalties_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+observable	observable.template_mappings	src/conformance/comparison.zig	template_mappings	1	tests/oracle_corpus_run.zig::"template_mappings"	executable	-
+observable	observable.template_mappings_set	src/conformance/comparison.zig	template_mappings_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+observable	observable.components	src/conformance/comparison.zig	components	1	tests/oracle_corpus_run.zig::"components"	executable	-
+observable	observable.components_set	src/conformance/comparison.zig	components_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+observable	observable.component_transforms	src/conformance/comparison.zig	component_transforms	1	tests/oracle_corpus_run.zig::"component_transforms"	executable	-
+observable	observable.component_transforms_set	src/conformance/comparison.zig	component_transforms_set	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+domain	domain.geometry	upstream/sketcherMinimizerMaths.h	geometry	1	src/geometry.zig::vector arithmetic preserves upstream degeneracy and rotation semantics	executable	-
+domain	domain.graph-storage	upstream/sketcherMinimizerMolecule.h	graph storage	1	src/model.zig::adversarial internal order emits coordinates in caller input order	executable	-
+domain	domain.adjacency	upstream/sketcherMinimizerMolecule.cpp	adjacency	1	src/topology.zig::adjacency filters nonstructural elements and retains paired bond order	executable	-
+domain	domain.components	upstream/sketcherMinimizer.cpp	components	1	src/topology.zig::cyclic and disconnected components repeat in stable traversal order	executable	-
+domain	domain.ring-perception	upstream/sketcherMinimizerMolecule.cpp	ring perception	1	tests/oracle_corpus_run.zig::"rings"	executable	-
+domain	domain.canonical-ordering	upstream/sketcherMinimizer.cpp	Morgan ordering	1	tests/oracle_corpus_run.zig::"morgan_ranks"	executable	-
+domain	domain.stereochemistry	upstream/sketcherMinimizer.cpp	stereochemistry	1	tests/oracle_corpus_run.zig::"atom_stereo"	executable	-
+domain	domain.fragmentation	upstream/CoordgenFragmenter.cpp	fragmentation	1	tests/oracle_corpus_run.zig::"fragments"	executable	-
+domain	domain.dofs	upstream/CoordgenFragmentBuilder.cpp	DOFs	1	src/core/dof.zig::all seven pinned upstream DOF subclasses have value variants	executable	-
+domain	domain.regular-rings	upstream/CoordgenFragmentBuilder.cpp	regular ring layout	1	tests/oracle_corpus_run.zig::emitCoordinates	executable	-
+domain	domain.fused-rings	upstream/CoordgenFragmentBuilder.cpp	fused ring layout	1	tests/oracle_corpus_run.zig::fn emitRecords	executable	-
+domain	domain.templates	upstream/CoordgenTemplates.cpp	template matching	1	tests/oracle_corpus_run.zig::"template_mappings"	executable	-
+domain	domain.macrocycles	upstream/CoordgenMacrocycleBuilder.cpp	macrocycle layout	1	src/conformance/corpus.zig::macrocycle.atoms.len	executable	-
+domain	domain.discrete-optimization	upstream/CoordgenMinimizer.cpp	discrete DOF search	1	tests/oracle_corpus_run.zig::"dof_penalties"	executable	-
+domain	domain.continuous-minimization	upstream/sketcherMinimizer.cpp	continuous minimization	1	src/core/interaction.zig::all pinned upstream minimizer interaction subclasses are covered	executable	-
+domain	domain.component-layout	upstream/sketcherMinimizer.cpp	component arrangement	1	tests/oracle_corpus_run.zig::"component_transforms"	executable	-
+domain	domain.residues	upstream/sketcherMinimizerResidue.cpp	residue placement	1	src/c_abi/exports.zig::.residues = &.{.{ .atom = 9	executable	-
+domain	domain.orchestration	upstream/sketcherMinimizer.cpp	runGenerateCoordinates	1	tests/oracle_abi_smoke.c::stable_api_smoke	executable	-
+domain	domain.c-abi	include/coordgen_abi.h	C interoperability	1	tests/rdkit_consumer.cpp::coordgen_generate	executable	-
+domain	domain.comparison	docs/architecture/COMPARISON_SEMANTICS.md	three-tier comparison	1	src/conformance/comparison.zig::tier selection stays per input and observable	executable	-
+domain	domain.fixture-reader	upstream/sketcherMaeReading.h	minimal MAE fields	1	src/conformance/mae.zig::reads the six fields upstream consumes and rebases atom references	executable	-
+non_goal	non-goal.proprietary-tests	upstream/README.md	unavailable internal suite	1	-	non_goal	cgz-7v2
