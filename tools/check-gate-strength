@@ -52,10 +52,10 @@ _FLAGS_RE = re.compile(r'\.flags = &\.\{([^}]*)\}')
 _STRING_RE = re.compile(r'"([^"]*)"')
 
 _REQUIRED_TEXT = [
-    # The placeholder gates: reserved step names that must fail loudly rather
-    # than pass vacuously until their owning bead attaches real artifacts.
+    # Remaining placeholder gates must fail loudly rather than pass vacuously
+    # until their owning beads attach real artifacts. Template regeneration is
+    # now a real gate and is covered by build.zig's graph-level assertion.
     'const examples_pending = b.addFail("examples is not implemented yet; see cgz-7v2")',
-    'const regeneration_pending = b.addFail("template-regeneration-check is not implemented yet; see cgz-r09")',
     'const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4")',
     # The real, graph-level false-green assertion. Whether each step actually
     # has dependencies is checked by build.zig itself at configure time, where

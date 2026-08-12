@@ -263,7 +263,7 @@ fn wireApprovedModuleEdges(layer_modules: []const []const *std.Build.Module) voi
     // the layer's own name. tools/check-module-imports permits that bare
     // import precisely because it does not cross a layer boundary.
     for (layer_modules, 0..) |members, index| {
-        const layer: layer_contract.Layer = @enumFromInt(index);
+        const layer: layer_contract.Layer = @fromBackingInt(@intCast(index));
         for (members[1..]) |member| member.addImport(@tagName(layer), members[0]);
     }
 }
@@ -573,6 +573,26 @@ pub fn build(b: *std.Build) !void {
 
     const oracle_step = b.step("upstream-oracle", "Validate the pinned conformance-only oracle package");
     const conformance_step = b.step("conformance", "Run oracle/native conformance checks");
+    const regeneration_step = b.step("template-regeneration-check", "Verify pinned C++ and MAE template provenance");
+    const template_fixture = b.createModule(.{
+        .root_source_file = b.path("conformance/fixtures/templates_normalized.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const template_generator_module = b.createModule(.{
+        .root_source_file = b.path("tests/template_generate.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "conformance", .module = conformance },
+            .{ .name = "template_fixture", .module = template_fixture },
+        },
+    });
+    const template_generator_tests = b.addTest(.{
+        .name = "template-generate-test",
+        .root_module = template_generator_module,
+    });
+    test_step.dependOn(&b.addRunArtifact(template_generator_tests).step);
 
     if (enable_oracle) {
         const oracle = try b.dependencyLazy("coordgenlibs_oracle", .{});
@@ -586,6 +606,50 @@ pub fn build(b: *std.Build) !void {
             .max_bytes = 4096,
         });
         oracle_step.dependOn(&license_check.step);
+
+        const template_generator = b.addExecutable(.{
+            .name = "template-generate",
+            .root_module = template_generator_module,
+        });
+
+        const generated_runs = [_]*std.Build.Step.Run{
+            b.addRunArtifact(template_generator),
+            b.addRunArtifact(template_generator),
+        };
+        var generated: [2]std.Build.LazyPath = undefined;
+        for (generated_runs, 0..) |run, index| {
+            run.addFileArg(oracle.path("templates.mae"));
+            generated[index] = run.addOutputFileArg(b.fmt("templates-normalized-{d}.zig", .{index}));
+        }
+        const compare_runs = b.addSystemCommand(&.{ "cmp", "-s" });
+        compare_runs.addFileArg(generated[0]);
+        compare_runs.addFileArg(generated[1]);
+        const compare_fixture = b.addSystemCommand(&.{ "cmp", "-s" });
+        compare_fixture.addFileArg(generated[0]);
+        compare_fixture.addFileArg(b.path("conformance/fixtures/templates_normalized.zig"));
+
+        const extract_cpp = b.addSystemCommand(&.{ "python3", "tools/extract-template-reference.py" });
+        extract_cpp.addFileArg(oracle.path("CoordgenTemplates.cpp"));
+        const extracted = extract_cpp.addOutputFileArg("templates-from-cpp.zig");
+        const compare_cpp = b.addSystemCommand(&.{ "cmp", "-s" });
+        compare_cpp.addFileArg(extracted);
+        compare_cpp.addFileArg(b.path("conformance/fixtures/templates_normalized.zig"));
+
+        const generate_raw = b.addRunArtifact(template_generator);
+        generate_raw.addFileArg(oracle.path("templates.mae"));
+        const mae_raw = generate_raw.addOutputFileArg("templates-mae-raw.zig");
+        generate_raw.addArg("--raw");
+        const extract_raw = b.addSystemCommand(&.{ "python3", "tools/extract-template-reference.py" });
+        extract_raw.addFileArg(oracle.path("CoordgenTemplates.cpp"));
+        const cpp_raw = extract_raw.addOutputFileArg("templates-cpp-raw.zig");
+        extract_raw.addArg("--raw");
+        const compare_raw = b.addSystemCommand(&.{ "cmp", "-s" });
+        compare_raw.addFileArg(mae_raw);
+        compare_raw.addFileArg(cpp_raw);
+        regeneration_step.dependOn(&compare_runs.step);
+        regeneration_step.dependOn(&compare_fixture.step);
+        regeneration_step.dependOn(&compare_cpp.step);
+        regeneration_step.dependOn(&compare_raw.step);
 
         // The upstream library is Boost-free and maeparser-free: only its
         // CMake test target needs them, which is why the harness and fixture
@@ -934,6 +998,7 @@ pub fn build(b: *std.Build) !void {
         );
         oracle_step.dependOn(&oracle_disabled.step);
         conformance_step.dependOn(&oracle_disabled.step);
+        regeneration_step.dependOn(&oracle_disabled.step);
     }
 
     // Reserve the public step vocabulary without creating false-green gates.
@@ -942,10 +1007,6 @@ pub fn build(b: *std.Build) !void {
     const examples_step = b.step("examples", "Build examples when example sources are present");
     const examples_pending = b.addFail("examples is not implemented yet; see cgz-7v2");
     examples_step.dependOn(&examples_pending.step);
-
-    const regeneration_step = b.step("template-regeneration-check", "Check generated template data when available");
-    const regeneration_pending = b.addFail("template-regeneration-check is not implemented yet; see cgz-r09");
-    regeneration_step.dependOn(&regeneration_pending.step);
 
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
     const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
