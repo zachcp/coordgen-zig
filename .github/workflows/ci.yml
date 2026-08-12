@@ -47,7 +47,22 @@ jobs:
         env:
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
-        run: ${{ steps.zig.outputs.zig }} build --fetch=all
+        run: |
+          # GitHub's archive endpoint occasionally closes a long response
+          # before Zig receives it (HttpConnectionClosing). Retry only this
+          # idempotent, checksummed fetch; all verification and offline build
+          # gates below still run exactly once against the resulting cache.
+          for attempt in 1 2 3; do
+            if ${{ steps.zig.outputs.zig }} build --fetch=all; then
+              exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "package fetch failed after ${attempt} attempts" >&2
+              exit 1
+            fi
+            echo "package fetch attempt ${attempt} failed; retrying in 10 seconds" >&2
+            sleep 10
+          done
 
       - name: Build and validate fetched packages offline
         env:
