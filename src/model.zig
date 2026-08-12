@@ -190,4 +190,86 @@ test "mapping rejects duplicate and missing input positions" {
         error.InvalidMapping,
         InputOrderMap.init(std.testing.allocator, &[_]u32{ 0, 0 }),
     );
+    try std.testing.expectError(
+        error.InvalidMapping,
+        InputOrderMap.init(std.testing.allocator, &[_]u32{ 0, 2 }),
+    );
+
+    var order = try InputOrderMap.initIdentity(std.testing.allocator, 2);
+    defer order.deinit();
+    var short_output: [1]u32 = undefined;
+    try std.testing.expectError(
+        error.InvalidMapping,
+        order.writeInputOrder(u32, &.{ 10, 20 }, &short_output),
+    );
+    var full_output: [2]u32 = undefined;
+    try std.testing.expectError(
+        error.InvalidMapping,
+        order.writeInputOrder(u32, &.{10}, &full_output),
+    );
+}
+
+fn constructAndDiscardOrder(
+    allocator: std.mem.Allocator,
+    source: []const core.ids.InputIndex,
+) !void {
+    var order = try InputOrderMap.init(allocator, source);
+    order.deinit();
+}
+
+fn constructAndDiscardIdentity(allocator: std.mem.Allocator, count: usize) !void {
+    var order = try InputOrderMap.initIdentity(allocator, count);
+    order.deinit();
+}
+
+test "input-order maps report and clean up every allocation failure" {
+    const source = [_]core.ids.InputIndex{ 2, 0, 3, 1 };
+
+    var map_counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try constructAndDiscardOrder(map_counter.allocator(), &source);
+    // The retained permutation and its inverse are separate allocation sites.
+    try std.testing.expectEqual(@as(usize, 2), map_counter.alloc_index);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        constructAndDiscardOrder,
+        .{&source},
+    );
+
+    var identity_counter = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try constructAndDiscardIdentity(identity_counter.allocator(), source.len);
+    // Identity construction also allocates its temporary source permutation.
+    try std.testing.expectEqual(@as(usize, 3), identity_counter.alloc_index);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        constructAndDiscardIdentity,
+        .{source.len},
+    );
+}
+
+test "input-order maps invert deterministic permutation families" {
+    for (1..65) |count| {
+        const source = try std.testing.allocator.alloc(core.ids.InputIndex, count);
+        defer std.testing.allocator.free(source);
+        const internal_values = try std.testing.allocator.alloc(u32, count);
+        defer std.testing.allocator.free(internal_values);
+        const output = try std.testing.allocator.alloc(u32, count);
+        defer std.testing.allocator.free(output);
+
+        const steps = [_]usize{ 1, count - 1 };
+        const shifts = [_]usize{ 0, count / 2 };
+        for (steps) |step| for (shifts) |shift| {
+            for (source, internal_values, 0..) |*input_index, *value, internal_index| {
+                input_index.* = @intCast((internal_index * step + shift) % count);
+                value.* = @intCast(internal_index);
+            }
+            var order = try InputOrderMap.init(std.testing.allocator, source);
+            defer order.deinit();
+            try order.writeInputOrder(u32, internal_values, output);
+
+            for (source, 0..) |input_index, internal_index| {
+                try std.testing.expectEqual(@as(u32, @intCast(internal_index)), output[input_index]);
+                try std.testing.expectEqual(@as(u32, @intCast(internal_index)), order.input_to_internal[input_index]);
+            }
+        };
+    }
 }

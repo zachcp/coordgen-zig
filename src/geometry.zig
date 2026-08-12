@@ -331,3 +331,38 @@ test "bounds point center and rigid transforms retain geometric invariants" {
     try std.testing.expectApproxEqAbs(@as(Scalar, 1), squaredLength(normalize(.{ .x = -5, .y = 12 })), 0.00001);
     try std.testing.expectEqual(squaredDistance(first, second), squaredDistance(second, first));
 }
+
+test "vector and rigid-transform properties hold across a deterministic grid" {
+    const values = [_]Scalar{ -100, -7, -0.25, 0, 0.25, 7, 100 };
+    const quarter_turns = [_]RigidTransform2{
+        .{ .cosine = 1, .sine = 0, .translation = .{ .x = 13, .y = -9 } },
+        .{ .cosine = 0, .sine = 1, .translation = .{ .x = -4, .y = 11 } },
+        .{ .cosine = -1, .sine = 0, .translation = .{ .x = 5, .y = 3 } },
+        .{ .cosine = 0, .sine = -1, .translation = .{ .x = -8, .y = -2 } },
+    };
+
+    for (values) |x1| for (values) |y1| {
+        const first: Vec2 = .{ .x = x1, .y = y1 };
+        try std.testing.expectEqual(first, negate(negate(first)));
+        if (length(first) > epsilon) {
+            try std.testing.expectApproxEqAbs(@as(Scalar, 1), squaredLength(normalize(first)), 0.00001);
+        }
+
+        for (values) |x2| for (values) |y2| {
+            const second: Vec2 = .{ .x = x2, .y = y2 };
+            try std.testing.expectEqual(first, subtract(add(first, second), second));
+            try std.testing.expectEqual(
+                squaredDistance(first, second),
+                squaredDistance(second, first),
+            );
+            try std.testing.expect(squaredDistance(first, second) >= 0);
+            for (quarter_turns) |transform| {
+                try std.testing.expectApproxEqAbs(
+                    squaredDistance(first, second),
+                    squaredDistance(transform.apply(first), transform.apply(second)),
+                    0.01,
+                );
+            }
+        };
+    };
+}

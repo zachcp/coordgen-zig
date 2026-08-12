@@ -331,6 +331,46 @@ test "cyclic and disconnected components repeat in stable traversal order" {
     try std.testing.expectEqualSlices(AtomId, first.component_atoms, second.component_atoms);
 }
 
+test "adjacency and component invariants hold across path and cycle families" {
+    for (1..65) |atom_count| {
+        const bond_count = if (atom_count > 2) atom_count else atom_count - 1;
+        const atoms = try std.testing.allocator.alloc(model.Atom, atom_count);
+        defer std.testing.allocator.free(atoms);
+        const bonds = try std.testing.allocator.alloc(model.Bond, bond_count);
+        defer std.testing.allocator.free(bonds);
+        for (atoms, 0..) |*atom, index| atom.* = makeAtom(@intCast(index));
+        for (bonds[0 .. atom_count - 1], 0..) |*bond, index| {
+            bond.* = makeBond(@intCast(index), @intCast(index), @intCast(index + 1));
+        }
+        if (atom_count > 2) {
+            bonds[bonds.len - 1] = makeBond(
+                @intCast(bonds.len - 1),
+                @intCast(atom_count - 1),
+                0,
+            );
+        }
+
+        var graph = try Graph.init(std.testing.allocator, atoms, bonds);
+        defer graph.deinit();
+        try std.testing.expectEqual(@as(u32, 1), graph.component_count);
+        try std.testing.expectEqual(atom_count, graph.componentMembers(MoleculeId.fromIndex(0)).len);
+
+        var degree_sum: usize = 0;
+        for (atoms, 0..) |_, atom_index| {
+            const atom = AtomId.fromIndex(@intCast(atom_index));
+            degree_sum += graph.degree(atom);
+            for (graph.neighbors(atom), graph.incidentBonds(atom)) |neighbor, bond_id| {
+                const bond = bonds[bond_id.index()];
+                try std.testing.expect(
+                    (bond.start == atom and bond.end == neighbor) or
+                        (bond.end == atom and bond.start == neighbor),
+                );
+            }
+        }
+        try std.testing.expectEqual(bond_count * 2, degree_sum);
+    }
+}
+
 test "empty and malformed internal graphs are handled without assertions" {
     var empty = try Graph.init(std.testing.allocator, &.{}, &.{});
     defer empty.deinit();
@@ -341,6 +381,23 @@ test "empty and malformed internal graphs are handled without assertions" {
     try std.testing.expectError(error.InvalidAtomIndex, Graph.init(std.testing.allocator, &atoms, &.{makeBond(0, 0, 1)}));
     var wrong_atom = makeAtom(1);
     try std.testing.expectError(error.InvalidMapping, Graph.init(std.testing.allocator, @as(*const [1]model.Atom, &wrong_atom), &.{}));
+
+    const two_atoms = [_]model.Atom{ makeAtom(0), makeAtom(1) };
+    const wrong_bond = makeBond(1, 0, 1);
+    try std.testing.expectError(
+        error.InvalidMapping,
+        Graph.init(std.testing.allocator, &two_atoms, @as(*const [1]model.Bond, &wrong_bond)),
+    );
+    var graph = try Graph.init(std.testing.allocator, &two_atoms, &.{});
+    defer graph.deinit();
+    try std.testing.expectError(
+        error.InvalidAtomIndex,
+        graph.reachableExcluding(std.testing.allocator, AtomId.fromIndex(9), AtomId.fromIndex(0)),
+    );
+    try std.testing.expectError(
+        error.InvalidAtomIndex,
+        graph.reachableExcluding(std.testing.allocator, AtomId.fromIndex(0), AtomId.fromIndex(9)),
+    );
 }
 
 fn constructAndDiscard(allocator: std.mem.Allocator) !void {
@@ -351,6 +408,10 @@ fn constructAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "graph construction reports and cleans up every allocation failure" {
+    var counting_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try constructAndDiscard(counting_allocator.allocator());
+    // Seven retained graph arrays plus the temporary adjacency cursor array.
+    try std.testing.expectEqual(@as(usize, 8), counting_allocator.alloc_index);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, constructAndDiscard, .{});
 }
 
@@ -364,5 +425,9 @@ test "cut traversal reports and cleans up every allocation failure" {
     const input_bonds = [_]model.Bond{ makeBond(0, 0, 1), makeBond(1, 1, 2) };
     var graph = try Graph.init(std.testing.allocator, &atoms, &input_bonds);
     defer graph.deinit();
+    var counting_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try traverseAndDiscard(counting_allocator.allocator(), graph);
+    // The visited bitmap and caller-owned result are independently fallible.
+    try std.testing.expectEqual(@as(usize, 2), counting_allocator.alloc_index);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, traverseAndDiscard, .{graph});
 }
