@@ -440,6 +440,22 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
+    const coverage_step = b.step("coverage-check", "Validate requirements-to-test traceability");
+    const coverage_check = b.addSystemCommand(&.{
+        "python3",
+        "tools/check-requirements-coverage.py",
+        "--summary",
+        "docs/architecture/REQUIREMENTS_COVERAGE.md",
+    });
+    const coverage_self_test = b.addSystemCommand(&.{
+        "python3",
+        "tools/check-requirements-coverage.py",
+        "--self-test",
+    });
+    coverage_step.dependOn(&coverage_check.step);
+    coverage_step.dependOn(&coverage_self_test.step);
+    test_step.dependOn(coverage_step);
+
     const module_graph_step = b.step("module-graph-check", "Validate the approved named-module edge set");
     module_graph_step.dependOn(&run_layer_tests.step);
     // Zig's own compile errors catch an unapproved *named* import (the
@@ -619,6 +635,18 @@ pub fn build(b: *std.Build) !void {
         public_test_inventory.addDirectoryArg(oracle.path("."));
         oracle_step.dependOn(&public_test_inventory.step);
 
+        const upstream_coverage = b.addSystemCommand(&.{
+            "python3",
+            "tools/check-requirements-coverage.py",
+            "--upstream",
+        });
+        upstream_coverage.addDirectoryArg(oracle.path("."));
+        upstream_coverage.addArgs(&.{
+            "--summary",
+            "docs/architecture/REQUIREMENTS_COVERAGE.md",
+        });
+        oracle_step.dependOn(&upstream_coverage.step);
+
         const template_generator = b.addExecutable(.{
             .name = "template-generate",
             .root_module = template_generator_module,
@@ -761,6 +789,79 @@ pub fn build(b: *std.Build) !void {
         const run_rdkit_consumer = b.addRunArtifact(rdkit_consumer);
         run_rdkit_consumer.expectExitCode(0);
         oracle_step.dependOn(&run_rdkit_consumer.step);
+
+        // Rehost all twenty public cases with repo-owned runners. The first
+        // thirteen do not consume MAE fixtures. The fixture-backed seven read
+        // deterministic dumps produced by our Zig MAE reader, so neither
+        // runner depends on Boost.Test or maeparser.
+        const public_tests_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        public_tests_module.addIncludePath(oracle.path("."));
+        public_tests_module.addCSourceFile(.{
+            .file = b.path("conformance/public_test_rehost.cpp"),
+            .flags = &.{ "-std=c++17", "-DIN_COORDGEN", "-Wall", "-Wextra", "-Werror" },
+        });
+        public_tests_module.linkLibrary(oracle_library);
+        const public_tests = b.addExecutable(.{
+            .name = "upstream-public-tests",
+            .root_module = public_tests_module,
+        });
+        const run_public_tests = b.addRunArtifact(public_tests);
+        run_public_tests.expectExitCode(0);
+        oracle_step.dependOn(&run_public_tests.step);
+
+        const mae_public_test_dump_module = b.createModule(.{
+            .root_source_file = b.path("tests/mae_public_test_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "conformance", .module = conformance }},
+        });
+        const mae_public_test_dump = b.addExecutable(.{
+            .name = "mae-public-test-dump",
+            .root_module = mae_public_test_dump_module,
+        });
+        const fixture_paths = [_][]const u8{
+            "test/test.mae",
+            "templates.mae",
+            "test/testChirality.mae",
+            "test/nonterminalMetalZobs.mae",
+            "test/metalZobs.mae",
+            "test/macrocycle.mae",
+            "test/test_mol.mae",
+        };
+        var fixture_dumps: [fixture_paths.len]std.Build.LazyPath = undefined;
+        for (fixture_paths, 0..) |fixture_path, index| {
+            const dump_fixture = b.addRunArtifact(mae_public_test_dump);
+            dump_fixture.addFileArg(oracle.path(fixture_path));
+            fixture_dumps[index] = dump_fixture.addOutputFileArg(
+                b.fmt("public-test-fixture-{d}.txt", .{index}),
+            );
+        }
+
+        const fixture_public_tests_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libcpp = true,
+        });
+        fixture_public_tests_module.addIncludePath(oracle.path("."));
+        fixture_public_tests_module.addCSourceFile(.{
+            .file = b.path("conformance/public_fixture_test_rehost.cpp"),
+            .flags = &.{ "-std=c++17", "-DIN_COORDGEN", "-Wall", "-Wextra", "-Werror" },
+        });
+        fixture_public_tests_module.linkLibrary(oracle_library);
+        const fixture_public_tests = b.addExecutable(.{
+            .name = "upstream-public-fixture-tests",
+            .root_module = fixture_public_tests_module,
+        });
+        const run_fixture_public_tests = b.addRunArtifact(fixture_public_tests);
+        for (fixture_dumps) |dump| {
+            run_fixture_public_tests.addFileArg(dump);
+        }
+        run_fixture_public_tests.expectExitCode(0);
+        oracle_step.dependOn(&run_fixture_public_tests.step);
 
         // Upstream's own example program is the cheapest proof that the
         // static library links and runs. Its two atoms must come out one
@@ -1054,6 +1155,7 @@ pub fn build(b: *std.Build) !void {
         abi_step,
         oracle_step,
         conformance_step,
+        coverage_step,
         examples_step,
         regeneration_step,
         fuzz_step,
