@@ -145,19 +145,109 @@ pub const Result = extern struct {
     owner: ?*anyopaque = null,
 };
 test "C DTO widths, alignments, and offsets are frozen on supported 64-bit targets" {
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(StringView));
-    try std.testing.expectEqual(@as(usize, 52), @sizeOf(AtomInput));
-    try std.testing.expectEqual(@as(usize, 40), @sizeOf(BondInput));
-    try std.testing.expectEqual(@as(usize, 32), @sizeOf(ResidueInput));
-    try std.testing.expectEqual(@as(usize, 56), @sizeOf(ResidueInteractionInput));
-    try std.testing.expectEqual(@as(usize, 56), @sizeOf(Options));
-    try std.testing.expectEqual(@as(usize, 136), @sizeOf(Input));
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(Result));
-    try std.testing.expectEqual(@as(usize, 8), @alignOf(Input));
-    try std.testing.expectEqual(@as(usize, 28), @offsetOf(AtomInput, "template_coordinates"));
-    try std.testing.expectEqual(@as(usize, 48), @offsetOf(AtomInput, "reserved"));
-    try std.testing.expectEqual(@as(usize, 40), @offsetOf(Options, "template_directory"));
-    try std.testing.expectEqual(@as(usize, 104), @offsetOf(Result, "owner"));
+    try expectLayout(core.math.Vec2, 8, 4);
+    try expectOffset(core.math.Vec2, "x", 0);
+    try expectOffset(core.math.Vec2, "y", 4);
+    try expectLayout(core.math.Vec3, 12, 4);
+    try expectOffset(core.math.Vec3, "x", 0);
+    try expectOffset(core.math.Vec3, "y", 4);
+    try expectOffset(core.math.Vec3, "z", 8);
+
+    try expectLayout(StringView, 16, 8);
+    try expectOffset(StringView, "ptr", 0);
+    try expectOffset(StringView, "len", 8);
+    try expectOffset(StringView, "reserved", 12);
+    try expectLayout(IndexSpan, 16, 8);
+    try expectOffset(IndexSpan, "ptr", 0);
+    try expectOffset(IndexSpan, "len", 8);
+    try expectOffset(IndexSpan, "reserved", 12);
+
+    try expectLayout(AtomInput, 52, 4);
+    try expectOffset(AtomInput, "atomic_number", 0);
+    try expectOffset(AtomInput, "formal_charge", 4);
+    try expectOffset(AtomInput, "flags", 8);
+    try expectOffset(AtomInput, "stereo", 12);
+    try expectOffset(AtomInput, "stereo_looking_from", 16);
+    try expectOffset(AtomInput, "stereo_atom_a", 20);
+    try expectOffset(AtomInput, "stereo_atom_b", 24);
+    try expectOffset(AtomInput, "template_coordinates", 28);
+    try expectOffset(AtomInput, "coordinates_3d", 36);
+    try expectOffset(AtomInput, "reserved", 48);
+
+    try expectLayout(BondInput, 40, 4);
+    try expectOffset(BondInput, "start", 0);
+    try expectOffset(BondInput, "end", 4);
+    try expectOffset(BondInput, "order", 8);
+    try expectOffset(BondInput, "flags", 12);
+    try expectOffset(BondInput, "stereo", 16);
+    try expectOffset(BondInput, "stereo_atom_a", 20);
+    try expectOffset(BondInput, "stereo_atom_b", 24);
+    try expectOffset(BondInput, "display", 28);
+    try expectOffset(BondInput, "crossing_penalty_multiplier", 32);
+    try expectOffset(BondInput, "reserved", 36);
+
+    try expectLayout(ResidueInput, 32, 8);
+    try expectOffset(ResidueInput, "atom", 0);
+    try expectOffset(ResidueInput, "residue_number", 4);
+    try expectOffset(ResidueInput, "closest_ligand_atom", 8);
+    try expectOffset(ResidueInput, "reserved", 12);
+    try expectOffset(ResidueInput, "chain", 16);
+
+    try expectLayout(ResidueInteractionInput, 56, 8);
+    try expectOffset(ResidueInteractionInput, "start", 0);
+    try expectOffset(ResidueInteractionInput, "end", 4);
+    try expectOffset(ResidueInteractionInput, "other_start_atoms", 8);
+    try expectOffset(ResidueInteractionInput, "other_end_atoms", 24);
+    try expectOffset(ResidueInteractionInput, "crossing_penalty_multiplier", 40);
+    try expectOffset(ResidueInteractionInput, "reserved", 44);
+
+    inline for (.{ AtomSpan, BondSpan, ResidueSpan, ResidueInteractionSpan, Vec2Span, U32Span }) |Span| {
+        try expectLayout(Span, 16, 8);
+        try expectOffset(Span, "ptr", 0);
+        try expectOffset(Span, "len", 8);
+        try expectOffset(Span, "reserved", 12);
+    }
+
+    try expectLayout(Options, 56, 8);
+    try expectOffset(Options, "precision", 0);
+    try expectOffset(Options, "score_residue_interactions", 4);
+    try expectOffset(Options, "treat_nonterminal_bonds_to_metal_as_zero_order", 8);
+    try expectOffset(Options, "even_angles", 12);
+    try expectOffset(Options, "skip_minimization", 16);
+    try expectOffset(Options, "force_open_macrocycles", 20);
+    try expectOffset(Options, "constrain_all_atoms", 24);
+    try expectOffset(Options, "build_from_fragments", 28);
+    try expectOffset(Options, "debug_coordinates", 32);
+    try expectOffset(Options, "load_templates", 36);
+    try expectOffset(Options, "template_directory", 40);
+
+    try expectLayout(Input, 136, 8);
+    try expectOffset(Input, "options", 0);
+    try expectOffset(Input, "atoms", 56);
+    try expectOffset(Input, "bonds", 72);
+    try expectOffset(Input, "residues", 88);
+    try expectOffset(Input, "residue_interactions", 104);
+    try expectOffset(Input, "extra_bonds", 120);
+
+    try expectLayout(Result, 112, 8);
+    try expectOffset(Result, "coordinates", 0);
+    try expectOffset(Result, "input_to_internal", 16);
+    try expectOffset(Result, "internal_to_input", 32);
+    try expectOffset(Result, "effective_bond_orders", 48);
+    try expectOffset(Result, "bond_displays", 64);
+    try expectOffset(Result, "atom_stereo", 80);
+    try expectOffset(Result, "clean_pose", 96);
+    try expectOffset(Result, "reserved", 100);
+    try expectOffset(Result, "owner", 104);
+}
+
+fn expectLayout(comptime T: type, size: usize, alignment: usize) !void {
+    try std.testing.expectEqual(size, @sizeOf(T));
+    try std.testing.expectEqual(alignment, @alignOf(T));
+}
+
+fn expectOffset(comptime T: type, comptime field: []const u8, offset: usize) !void {
+    try std.testing.expectEqual(offset, @offsetOf(T, field));
 }
 
 test "ABI numeric values match conserved chemistry types" {

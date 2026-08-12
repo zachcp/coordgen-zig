@@ -51,9 +51,11 @@ fi
 
 library="$prefix/lib/libcoordgen.a"
 public_header="$prefix/include/coordgen_abi.h"
+pkg_config="$prefix/lib/pkgconfig/coordgen.pc"
 
 [ -f "$library" ] || fail "installed coordgen library is missing"
 [ -f "$public_header" ] || fail "installed public C header is missing"
+[ -f "$pkg_config" ] || fail "installed pkg-config metadata is missing"
 if find "$prefix" -type f -name 'coordgen_probe.h' | grep . >/dev/null; then
     fail "conformance-only probe header was installed"
 fi
@@ -83,4 +85,19 @@ mkdir -p "$work_dir"
 "$work_dir/install-consumer" \
     || fail "installed-consumer example did not observe the documented ABI behavior"
 
-echo "verified installed public ABI, exclusion of the C++ oracle/probe header, and a scratch-directory consumer build"
+# pkg-config is the supported non-Zig discovery mechanism. Restrict its search
+# path to this fresh prefix so a system installation cannot make the check
+# pass, and compile a second consumer from the flags the metadata reports.
+command -v pkg-config >/dev/null || fail "pkg-config is required to validate installed metadata"
+pc_flags=$(PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" pkg-config --cflags --libs coordgen) \
+    || fail "installed pkg-config metadata did not resolve"
+# Intentional splitting: pkg-config returns compiler arguments.
+# shellcheck disable=SC2086
+"$zig_path" cc -std=c11 -Wall -Wextra -Werror -pedantic \
+    "$repo_root/examples/install_consumer.c" $pc_flags \
+    -o "$work_dir/pkg-config-consumer" \
+    || fail "pkg-config consumer did not compile/link from installed metadata"
+"$work_dir/pkg-config-consumer" \
+    || fail "pkg-config consumer did not observe the documented ABI behavior"
+
+echo "verified installed public ABI and pkg-config metadata, exclusion of the C++ oracle/probe header, and scratch-directory consumer builds"
