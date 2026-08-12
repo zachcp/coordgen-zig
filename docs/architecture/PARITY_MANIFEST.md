@@ -14,6 +14,53 @@ The catalog is consumed under the frozen three-tier policy in
 [`COMPARISON_SEMANTICS.md`](COMPARISON_SEMANTICS.md), including its
 reflection-safe coordinate normalization and same-build baseline rule.
 
+## Pinned public-test baseline
+
+`tools/check-upstream-test-inventory.py` derives the public-test inventory
+directly from the two pinned Boost.Test translation units. It recognizes an
+assertion site as a C/C++ token matching
+`BOOST_(CHECK|REQUIRE|TEST)[_A-Z]*`, followed by optional whitespace and `(`.
+`BOOST_AUTO_TEST_CASE` declarations are test cases, not assertion sites.
+Comments and calls made dynamically by a site do not add to the static count.
+
+At `d20e735d96480385b2e257522288004038a08cc9` the reproducible baseline is:
+
+| Item | Count |
+|---|---:|
+| `test_coordgen.cpp` cases | 16 |
+| `test_smilesparser.cpp` cases | 4 |
+| Assertion macro sites | **102** |
+| Test fixtures | 6 |
+| Fixture atoms / bonds | 133 / 142 |
+| Example programs | 1 |
+
+The 102 sites are 8 `CHECK`, 1 `CHECK_EQUAL`, 1
+`CHECK_EQUAL_COLLECTIONS`, 2 `CHECK_MESSAGE`, 40 `REQUIRE`, 19
+`REQUIRE_EQUAL`, and 31 `TEST`. The earlier 95-site audit was not a different
+counting convention: it searched for `BOOST_REQUIRE(` literally and missed
+seven valid invocations written as `BOOST_REQUIRE (`. The build runs the
+token-aware checker as part of `upstream-oracle`, so whitespace cannot silently
+reduce the baseline again.
+
+### Corrections to the upstream test system
+
+The pinned harness has six defects. They are evidence to preserve, not
+behavior to reproduce:
+
+| Upstream defect | Correct local treatment |
+|---|---|
+| CTest registers `test_smilesparser` with the `test_coordgen` executable, so its four cases never run. | The inventory reads both source files independently. The requirements matrix and rehosted tests must carry all 20 named cases; CTest discovery is never the source of truth. |
+| The example test is registered even when example building is disabled. | The oracle example exists only inside the explicit `-Denable-oracle=true` build branch. Ordinary and oracle-disabled builds neither build nor run it. |
+| The example prints coordinates but asserts nothing. | The Zig build requires exit code 0 **and** exact stderr `(-50, 0)  (0, 0)`, turning the observed output into an executable assertion. |
+| Test setup fetches maeparser from moving branch `master`. | The production package has no maeparser dependency. The only upstream package is an immutable commit URL plus Zig package hash, cross-checked against `upstream/coordgenlibs.lock`. |
+| Valgrind options are configured but no CI job invokes CTest's MemCheck action. | Repo-owned Zig fixture parsing uses `checkAllAllocationFailures`; production tests run without the C++/maeparser harness. Memory claims must come from executed Zig allocation/fuzz gates, never dormant CMake options. |
+| `coordgenBasicSMILES.h` uses `sketcherMinimizerAtom` members without including its definition, making compilation depend on include order. | Native corpus construction is Zig and has no textual include order. The conformance-only C++ validator includes each complete atom, bond, and molecule type explicitly before using the upstream helper; that workaround is not exposed as a local header contract. |
+
+The checker deliberately verifies that all six defects are still present in
+the pinned source. If a future pin fixes one, the gate fails and requires this
+correction table and its corresponding local test to be re-audited instead of
+quietly retaining stale assumptions.
+
 ## What is measured
 
 The same corpus runs through three oracle builds that differ in exactly one

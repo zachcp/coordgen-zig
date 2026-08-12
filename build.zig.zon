@@ -29,5 +29,6 @@
         "tools/verify-upstream",
         "tools/mae-fixture-totals.py",
         "tools/extract-template-reference.py",
+        "tools/check-upstream-test-inventory.py",
     },
 }
