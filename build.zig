@@ -607,6 +607,18 @@ pub fn build(b: *std.Build) !void {
         });
         oracle_step.dependOn(&license_check.step);
 
+        // Count public tests from their declarations, not from upstream's
+        // CTest registration: its SMILES target accidentally runs
+        // test_coordgen a second time. The inventory checker also pins the six
+        // harness defects whose corrected local treatment is documented in
+        // PARITY_MANIFEST.md.
+        const public_test_inventory = b.addSystemCommand(&.{
+            "python3",
+            "tools/check-upstream-test-inventory.py",
+        });
+        public_test_inventory.addDirectoryArg(oracle.path("."));
+        oracle_step.dependOn(&public_test_inventory.step);
+
         const template_generator = b.addExecutable(.{
             .name = "template-generate",
             .root_module = template_generator_module,
