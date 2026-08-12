@@ -65,7 +65,7 @@ if grep -aE 'sketcherMinimizer|CoordgenMinimizer' "$library" >/dev/null; then
 fi
 
 # The checks above are static (file presence, archive contents). The
-# installed-consumer test is behavioral: compile and run a program that only
+# installed-consumer example is behavioral: compile and run a program that only
 # ever sees $prefix (never this repo's include/ or zig-out/), proving the
 # archive actually contains coordgen_generate/coordgen_result_free under the
 # names and signatures coordgen_abi.h declares, from a genuine scratch
@@ -75,12 +75,12 @@ mkdir -p "$work_dir"
 
 "$zig_path" cc -std=c11 -Wall -Wextra -Werror -pedantic \
     -I "$prefix/include" \
-    "$repo_root/tests/install_consumer.c" \
+    "$repo_root/examples/install_consumer.c" \
     -L "$prefix/lib" -lcoordgen \
     -o "$work_dir/install-consumer" \
-    || fail "installed-consumer program did not compile/link against \$prefix alone"
+    || fail "installed-consumer example did not compile/link against \$prefix alone"
 
 "$work_dir/install-consumer" \
-    || fail "installed-consumer program did not observe the documented ABI behavior"
+    || fail "installed-consumer example did not observe the documented ABI behavior"
 
 echo "verified installed public ABI, exclusion of the C++ oracle/probe header, and a scratch-directory consumer build"

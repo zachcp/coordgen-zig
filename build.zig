@@ -478,7 +478,7 @@ pub fn build(b: *std.Build) !void {
     // build graph rather than a documented two-command sequence. With no
     // PREFIX argument the tool installs into a scratch directory it creates
     // empty and destroys afterwards, so it can never certify files a previous
-    // run left behind, and it compiles and runs tests/install_consumer.c
+    // run left behind, and it compiles and runs examples/install_consumer.c
     // against that prefix alone - the check that would have caught an archive
     // exporting nothing.
     const install_isolation = b.addSystemCommand(&.{ "sh", "tools/check-install-isolation" });
@@ -1114,12 +1114,13 @@ pub fn build(b: *std.Build) !void {
         regeneration_step.dependOn(&oracle_disabled.step);
     }
 
-    // Reserve the public step vocabulary without creating false-green gates.
-    // Each owning bead removes its addFail dependency when it attaches the
-    // corresponding artifacts.
-    const examples_step = b.step("examples", "Build examples when example sources are present");
-    const examples_pending = b.addFail("examples is not implemented yet; see cgz-7v2");
-    examples_step.dependOn(&examples_pending.step);
+    // Both examples execute as real consumers: Zig reads its source from the
+    // external dependency package, while C compiles against a fresh scratch
+    // install prefix. Sharing these runs with package-check keeps the package
+    // and examples gates from drifting apart.
+    const examples_step = b.step("examples", "Run package and installed-artifact examples");
+    examples_step.dependOn(&external_consumer.step);
+    examples_step.dependOn(&install_isolation.step);
 
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
     const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
