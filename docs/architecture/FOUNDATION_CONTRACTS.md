@@ -176,10 +176,10 @@ The table's granularity is one bead per layer, and at that granularity file
 ownership is unambiguous — every layer has a distinct root, and
 `tools/check-module-imports` already resolves `src/<layer>/` subdirectories, so
 a layer can grow files without ambiguity. Splitting a *single* layer across two
-parallel beads is not yet specified: `topology`, `layout`, `optimize`, and
-`generator` are still `build_support/empty_module.zig` stubs, and until they
-have real content there is no sub-file map to divide. Whoever splits a layer
-records the file boundary here first.
+parallel beads is not yet specified. `layout`, `optimize`, and `generator` are
+still `build_support/empty_module.zig` stubs, and until they have real content
+there is no sub-file map to divide. Whoever splits a layer records the file
+boundary here first.
 
 A layer is a set of modules, not necessarily one. Every module of a layer gets
 that layer's row of the table above; a layer's secondary modules additionally
