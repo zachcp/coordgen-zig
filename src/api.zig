@@ -99,14 +99,13 @@ pub const Input = struct {
 
     pub fn validate(self: Input) core.errors.Error!void {
         if (self.atoms.len == 0) return error.EmptyGraph;
-        if (self.atoms.len > std.math.maxInt(u32) or
-            self.bonds.len > std.math.maxInt(u32) or
-            self.residues.len > std.math.maxInt(u32) or
-            self.residue_interactions.len > std.math.maxInt(u32) or
-            self.extra_bonds.len > std.math.maxInt(u32))
-        {
-            return error.TooManyItems;
-        }
+        try validateItemCounts(
+            self.atoms.len,
+            self.bonds.len,
+            self.residues.len,
+            self.residue_interactions.len,
+            self.extra_bonds.len,
+        );
         if (!std.math.isFinite(self.options.precision) or self.options.precision <= 0) {
             return error.InvalidOption;
         }
@@ -141,6 +140,23 @@ pub const Input = struct {
         }
     }
 };
+
+fn validateItemCounts(
+    atom_count: usize,
+    bond_count: usize,
+    residue_count: usize,
+    interaction_count: usize,
+    extra_bond_count: usize,
+) core.errors.Error!void {
+    if (atom_count > std.math.maxInt(u32) or
+        bond_count > std.math.maxInt(u32) or
+        residue_count > std.math.maxInt(u32) or
+        interaction_count > std.math.maxInt(u32) or
+        extra_bond_count > std.math.maxInt(u32))
+    {
+        return error.TooManyItems;
+    }
+}
 
 fn validateIndex(index: InputIndex, count: usize) core.errors.Error!void {
     if (index == invalid_input_index or index >= count) return error.InvalidAtomIndex;
@@ -288,6 +304,28 @@ test "result allocation has explicit leak-free ownership" {
     result.deinit();
 }
 
+fn allocateAndDiscardResult(
+    allocator: std.mem.Allocator,
+    atom_count: usize,
+    bond_count: usize,
+) !void {
+    var result = try Result.init(allocator, atom_count, bond_count);
+    result.deinit();
+}
+
+test "result reports and cleans up every allocation failure" {
+    var counting_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try allocateAndDiscardResult(counting_allocator.allocator(), 3, 2);
+    // One independently-fallible allocation for each owned output slice. A
+    // decrease means an output stopped participating in the OOM sweep.
+    try std.testing.expectEqual(@as(usize, 6), counting_allocator.alloc_index);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        allocateAndDiscardResult,
+        .{ 3, 2 },
+    );
+}
+
 test "caller-controlled invalid states return errors" {
     try std.testing.expectError(error.EmptyGraph, (Input{
         .atoms = &.{},
@@ -307,4 +345,137 @@ test "caller-controlled invalid states return errors" {
         .bonds = &.{.{ .start = 0, .end = 1 }},
         .options = .{ .precision = std.math.nan(f32) },
     }).validate());
+}
+
+test "all safe API malformed fields return their documented errors" {
+    const atoms = [_]AtomInput{
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .oxygen },
+        .{ .atomic_number = .hydrogen },
+        .{ .atomic_number = .hydrogen },
+    };
+
+    try std.testing.expectError(error.InvalidAtomicNumber, (Input{
+        .atoms = &.{.{ .atomic_number = .virtual }},
+        .bonds = &.{},
+    }).validate());
+    try std.testing.expectError(error.InvalidCoordinate, (Input{
+        .atoms = &.{.{ .template_coordinates = .{ .x = std.math.nan(f32), .y = 0 } }},
+        .bonds = &.{},
+    }).validate());
+    try std.testing.expectError(error.InvalidCoordinate, (Input{
+        .atoms = &.{.{ .coordinates_3d = .{ .x = 0, .y = 0, .z = std.math.inf(f32) } }},
+        .bonds = &.{},
+    }).validate());
+
+    const invalid_atom_stereo = [_]struct { stereo: AtomStereoInput, expected: core.errors.Error }{
+        .{ .stereo = .{ .looking_from = 0 }, .expected = error.InvalidStereo },
+        .{ .stereo = .{ .value = .clockwise }, .expected = error.InvalidStereo },
+        .{
+            .stereo = .{ .value = .clockwise, .looking_from = 0, .atom_a = 1, .atom_b = 9 },
+            .expected = error.InvalidAtomIndex,
+        },
+        .{ .stereo = .{ .value = .r, .atom_a = 1 }, .expected = error.InvalidStereo },
+    };
+    for (invalid_atom_stereo) |case| {
+        var changed = atoms;
+        changed[0].stereo = case.stereo;
+        try std.testing.expectError(case.expected, (Input{
+            .atoms = &changed,
+            .bonds = &.{},
+        }).validate());
+    }
+
+    const invalid_bonds = [_]struct { bond: BondInput, expected: core.errors.Error }{
+        .{ .bond = .{ .start = 0, .end = 0 }, .expected = error.InvalidAtomIndex },
+        .{ .bond = .{ .start = 0, .end = 9 }, .expected = error.InvalidAtomIndex },
+        .{
+            .bond = .{ .start = 0, .end = 1, .crossing_penalty_multiplier = -1 },
+            .expected = error.InvalidOption,
+        },
+        .{
+            .bond = .{ .start = 0, .end = 1, .crossing_penalty_multiplier = std.math.inf(f32) },
+            .expected = error.InvalidOption,
+        },
+        .{
+            .bond = .{ .start = 0, .end = 1, .stereo = .{ .atom_a = 2 } },
+            .expected = error.InvalidStereo,
+        },
+        .{
+            .bond = .{ .start = 0, .end = 1, .stereo = .{ .value = .cis, .atom_a = 2 } },
+            .expected = error.InvalidStereo,
+        },
+        .{
+            .bond = .{ .start = 0, .end = 1, .stereo = .{ .value = .trans, .atom_a = 2, .atom_b = 9 } },
+            .expected = error.InvalidAtomIndex,
+        },
+        .{
+            .bond = .{ .start = 0, .end = 1, .stereo = .{ .value = .z, .atom_a = 2 } },
+            .expected = error.InvalidStereo,
+        },
+    };
+    for (invalid_bonds) |case| {
+        try std.testing.expectError(case.expected, (Input{
+            .atoms = &atoms,
+            .bonds = @as(*const [1]BondInput, &case.bond),
+        }).validate());
+    }
+
+    try std.testing.expectError(error.InvalidAtomIndex, (Input{
+        .atoms = &atoms,
+        .bonds = &.{},
+        .extra_bonds = &.{.{ .start = 0, .end = 9 }},
+    }).validate());
+    try std.testing.expectError(error.InvalidAtomIndex, (Input{
+        .atoms = &atoms,
+        .bonds = &.{},
+        .residues = &.{.{ .atom = 9 }},
+    }).validate());
+    try std.testing.expectError(error.InvalidAtomIndex, (Input{
+        .atoms = &atoms,
+        .bonds = &.{},
+        .residues = &.{.{ .atom = 0, .closest_ligand_atom = 9 }},
+    }).validate());
+
+    const invalid_interactions = [_]ResidueInteractionInput{
+        .{ .start = 9, .end = 1 },
+        .{ .start = 0, .end = 9 },
+        .{ .start = 0, .end = 1, .crossing_penalty_multiplier = -1 },
+        .{ .start = 0, .end = 1, .crossing_penalty_multiplier = std.math.nan(f32) },
+        .{ .start = 0, .end = 1, .other_start_atoms = &.{9} },
+        .{ .start = 0, .end = 1, .other_end_atoms = &.{9} },
+    };
+    for (invalid_interactions) |interaction| {
+        const expected: core.errors.Error = if (!std.math.isFinite(interaction.crossing_penalty_multiplier) or
+            interaction.crossing_penalty_multiplier < 0)
+            error.InvalidOption
+        else
+            error.InvalidAtomIndex;
+        try std.testing.expectError(expected, (Input{
+            .atoms = &atoms,
+            .bonds = &.{},
+            .residue_interactions = @as(*const [1]ResidueInteractionInput, &interaction),
+        }).validate());
+    }
+
+    for ([_]f32{ 0, -1, std.math.inf(f32), std.math.nan(f32) }) |precision| {
+        try std.testing.expectError(error.InvalidOption, (Input{
+            .atoms = &atoms,
+            .bonds = &.{},
+            .options = .{ .precision = precision },
+        }).validate());
+    }
+}
+
+test "every item-count field rejects values wider than the public index type" {
+    if (@sizeOf(usize) <= @sizeOf(u32)) return;
+    const too_many = @as(usize, std.math.maxInt(u32)) + 1;
+    inline for (0..5) |position| {
+        var counts = [_]usize{ 1, 0, 0, 0, 0 };
+        counts[position] = too_many;
+        try std.testing.expectError(
+            error.TooManyItems,
+            validateItemCounts(counts[0], counts[1], counts[2], counts[3], counts[4]),
+        );
+    }
 }

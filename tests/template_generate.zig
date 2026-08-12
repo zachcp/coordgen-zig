@@ -174,3 +174,55 @@ test "committed fixture is valid immutable Zig data" {
     try std.testing.expectEqual(fixture.atoms.len, atom_end);
     try std.testing.expectEqual(fixture.bonds.len, bond_end);
 }
+
+const TemplateSummary = struct {
+    digest: u64,
+    atom_count: usize,
+    bond_count: usize,
+};
+
+fn mixTemplateField(digest: *u64, value: u64) void {
+    digest.* = (digest.* ^ value) *% 0x100000001b3;
+}
+
+fn summarizeTemplates() TemplateSummary {
+    var digest: u64 = 0xcbf29ce484222325;
+    for (fixture.templates) |template| {
+        mixTemplateField(&digest, template.atom_start);
+        mixTemplateField(&digest, template.atom_len);
+        mixTemplateField(&digest, template.bond_start);
+        mixTemplateField(&digest, template.bond_len);
+    }
+    for (fixture.atoms) |atom| {
+        mixTemplateField(&digest, atom.atomic_number);
+        mixTemplateField(&digest, atom.x_bits);
+        mixTemplateField(&digest, atom.y_bits);
+    }
+    for (fixture.bonds) |bond| {
+        mixTemplateField(&digest, bond.from);
+        mixTemplateField(&digest, bond.to);
+        mixTemplateField(&digest, bond.order);
+    }
+    return .{
+        .digest = digest,
+        .atom_count = fixture.atoms.len,
+        .bond_count = fixture.bonds.len,
+    };
+}
+
+fn summarizeTemplatesOnThread(output: *TemplateSummary) void {
+    output.* = summarizeTemplates();
+}
+
+test "immutable templates produce serial-identical results on two threads" {
+    const serial = summarizeTemplates();
+    var first: TemplateSummary = undefined;
+    var second: TemplateSummary = undefined;
+    const first_thread = try std.Thread.spawn(.{}, summarizeTemplatesOnThread, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, summarizeTemplatesOnThread, .{&second});
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expectEqual(serial, first);
+    try std.testing.expectEqual(serial, second);
+}
