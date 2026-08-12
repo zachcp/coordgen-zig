@@ -175,12 +175,21 @@ iterations of a *trivial* target in 15.1 s on aarch64-macos. Coordinate
 generation is orders of magnitude heavier per iteration, so per-target limits
 cannot be extrapolated from it and must be measured when the harness exists.
 
-## Performance gate — deliberately not numbered yet
+## Performance gate — baseline infrastructure, threshold deliberately unset
 
-**The repo contains no performance measurement of any kind.** There is no
-benchmark, no timer, and no native implementation to time. Any ratio stated
+`zig build performance-baseline -Denable-oracle=true` now records absolute
+oracle median and p95 generation time for 20 versioned members in each atom-count
+bucket. The harness is fixed to ReleaseFast, runs both warmup and measured calls
+in one process, times the public C generation call and result deallocation, and
+uses a monotonic clock. CI captures the report on both supported native targets.
+Its 100-member population is listed in `tests/oracle_benchmark.zig`: all seven
+drug-like members plus the lowest-index adversarial members needed to fill every
+bucket. Changing that population requires a decision Bead.
+
+There is still no native implementation to time. Any native/oracle ratio stated
 today — including the epic's illustrative 1.5× — would be invented, so none is
-set here.
+set here. `zig build performance-check` therefore remains an explicit failure,
+not a false-green gate.
 
 What is fixed now is the **method and the trigger**:
 

@@ -590,6 +590,15 @@ pub fn build(b: *std.Build) !void {
     const oracle_step = b.step("upstream-oracle", "Validate the pinned conformance-only oracle package");
     const conformance_step = b.step("conformance", "Run oracle/native conformance checks");
     const regeneration_step = b.step("template-regeneration-check", "Verify pinned C++ and MAE template provenance");
+    const performance_baseline_step = b.step(
+        "performance-baseline",
+        "Measure the absolute oracle baseline on the representative corpus",
+    );
+    const performance_step = b.step("performance-check", "Enforce native/oracle performance thresholds");
+    const performance_pending = b.addFail(
+        "performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cgz-7v2.4.7",
+    );
+    performance_step.dependOn(&performance_pending.step);
     const template_fixture = b.createModule(.{
         .root_source_file = b.path("conformance/fixtures/templates_normalized.zig"),
         .target = target,
@@ -922,6 +931,36 @@ pub fn build(b: *std.Build) !void {
             .oracle_abi = corpus_oracle,
             .descending_allocator = true,
         });
+        const benchmark_module = b.createModule(.{
+            .root_source_file = b.path("tests/oracle_benchmark.zig"),
+            .target = target,
+            .optimize = corpus_optimize,
+            .imports = &.{
+                .{ .name = "conformance", .module = corpus_layers.conformance },
+                .{ .name = "c_abi", .module = corpus_layers.c_abi },
+            },
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        benchmark_module.addCSourceFile(.{
+            .file = b.path("conformance/benchmark_clock.c"),
+            .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic" },
+        });
+        benchmark_module.linkLibrary(corpus_oracle);
+        const benchmark = b.addExecutable(.{
+            .name = "oracle-performance-baseline",
+            .root_module = benchmark_module,
+        });
+        const benchmark_tests = b.addTest(.{
+            .name = "oracle-performance-contract-test",
+            .root_module = benchmark_module,
+        });
+        oracle_step.dependOn(&b.addRunArtifact(benchmark_tests).step);
+        const run_benchmark = b.addRunArtifact(benchmark);
+        // Timings are evidence, not deterministic cache outputs: print them
+        // for capture by the caller and rerun the process on every invocation.
+        run_benchmark.stdio = .inherit;
+        performance_baseline_step.dependOn(&run_benchmark.step);
         const allocator_smoke_module = b.createModule(.{
             .target = target,
             .optimize = corpus_optimize,
@@ -1112,6 +1151,7 @@ pub fn build(b: *std.Build) !void {
         oracle_step.dependOn(&oracle_disabled.step);
         conformance_step.dependOn(&oracle_disabled.step);
         regeneration_step.dependOn(&oracle_disabled.step);
+        performance_baseline_step.dependOn(&oracle_disabled.step);
     }
 
     // Both examples execute as real consumers: Zig reads its source from the
@@ -1159,6 +1199,8 @@ pub fn build(b: *std.Build) !void {
         coverage_step,
         examples_step,
         regeneration_step,
+        performance_baseline_step,
+        performance_step,
         fuzz_step,
     });
 }
