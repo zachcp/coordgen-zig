@@ -302,9 +302,9 @@ fn createLayers(
         .model = createInternalModule(b, target, optimize, "src/model.zig"),
         .geometry = createInternalModule(b, target, optimize, "src/geometry.zig"),
         .topology = createInternalModule(b, target, optimize, "src/topology.zig"),
-        .layout = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
-        .optimize_layer = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
-        .generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
+        .layout = createInternalModule(b, target, optimize, "src/layout.zig"),
+        .optimize_layer = createInternalModule(b, target, optimize, "src/optimize/continuous.zig"),
+        .generator = createInternalModule(b, target, optimize, "src/generator/minimal.zig"),
         .api = createInternalModule(b, target, optimize, "src/api.zig"),
         .c_abi = createInternalModule(b, target, optimize, "src/c_abi_types.zig"),
         .c_abi_exports = createInternalModule(b, target, optimize, "src/c_abi/exports.zig"),
@@ -335,6 +335,7 @@ pub fn build(b: *std.Build) !void {
     const model = layers.model;
     const geometry = layers.geometry;
     const topology = layers.topology;
+    const generator = layers.generator;
     const api = layers.api;
     const c_abi = layers.c_abi;
     const c_abi_exports = layers.c_abi_exports;
@@ -387,6 +388,9 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "model-test", .module = model },
             .{ .name = "geometry-test", .module = geometry },
             .{ .name = "topology-test", .module = topology },
+            .{ .name = "layout-test", .module = layers.layout },
+            .{ .name = "optimize-test", .module = layers.optimize_layer },
+            .{ .name = "generator-test", .module = generator },
             .{ .name = "api-test", .module = api },
             .{ .name = "c-abi-test", .module = c_abi },
             .{ .name = "c-abi-exports-test", .module = c_abi_exports },
@@ -416,6 +420,22 @@ pub fn build(b: *std.Build) !void {
         .root_module = corpus_classify_module,
     });
     const run_corpus_classify_tests = b.addRunArtifact(corpus_classify_tests);
+    const native_minimal_module = b.createModule(.{
+        .root_source_file = b.path("tests/native_minimal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api", .module = api },
+            .{ .name = "generator", .module = generator },
+        },
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    const native_minimal_tests = b.addTest(.{
+        .name = "native-minimal-test",
+        .root_module = native_minimal_module,
+    });
+    const run_native_minimal_tests = b.addRunArtifact(native_minimal_tests);
     const layer_tests = b.addTest(.{
         .name = "module-layer-test",
         .root_module = module_layers,
@@ -441,6 +461,7 @@ pub fn build(b: *std.Build) !void {
     for (layer_test_runs) |run| test_step.dependOn(&run.step);
     test_step.dependOn(&run_conformance_tests.step);
     test_step.dependOn(&run_corpus_classify_tests.step);
+    test_step.dependOn(&run_native_minimal_tests.step);
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
@@ -610,7 +631,7 @@ pub fn build(b: *std.Build) !void {
     );
     performance_step.dependOn(&performance_pending.step);
     const template_fixture = b.createModule(.{
-        .root_source_file = b.path("conformance/fixtures/templates_normalized.zig"),
+        .root_source_file = b.path("src/layout/templates/data.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -685,14 +706,14 @@ pub fn build(b: *std.Build) !void {
         compare_runs.addFileArg(generated[1]);
         const compare_fixture = b.addSystemCommand(&.{ "cmp", "-s" });
         compare_fixture.addFileArg(generated[0]);
-        compare_fixture.addFileArg(b.path("conformance/fixtures/templates_normalized.zig"));
+        compare_fixture.addFileArg(b.path("src/layout/templates/data.zig"));
 
         const extract_cpp = b.addSystemCommand(&.{ "python3", "tools/extract-template-reference.py" });
         extract_cpp.addFileArg(oracle.path("CoordgenTemplates.cpp"));
         const extracted = extract_cpp.addOutputFileArg("templates-from-cpp.zig");
         const compare_cpp = b.addSystemCommand(&.{ "cmp", "-s" });
         compare_cpp.addFileArg(extracted);
-        compare_cpp.addFileArg(b.path("conformance/fixtures/templates_normalized.zig"));
+        compare_cpp.addFileArg(b.path("src/layout/templates/data.zig"));
 
         const generate_raw = b.addRunArtifact(template_generator);
         generate_raw.addFileArg(oracle.path("templates.mae"));
@@ -1166,6 +1187,27 @@ pub fn build(b: *std.Build) !void {
             run_fixture_check.addArg(fixture.totals);
         }
         oracle_step.dependOn(&run_fixture_check.step);
+
+        const native_macrocycle_module = b.createModule(.{
+            .root_source_file = b.path("tests/native_macrocycle_mae.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "api", .module = api },
+                .{ .name = "conformance", .module = conformance },
+                .{ .name = "generator", .module = generator },
+            },
+            .link_libc = false,
+            .link_libcpp = false,
+        });
+        const native_macrocycle = b.addExecutable(.{
+            .name = "native-macrocycle-mae",
+            .root_module = native_macrocycle_module,
+        });
+        const run_native_macrocycle = b.addRunArtifact(native_macrocycle);
+        run_native_macrocycle.expectExitCode(0);
+        run_native_macrocycle.addFileArg(oracle.path("test/macrocycle.mae"));
+        oracle_step.dependOn(&run_native_macrocycle.step);
 
         conformance_step.dependOn(oracle_step);
     } else {

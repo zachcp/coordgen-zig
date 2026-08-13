@@ -2,14 +2,24 @@
 #include "coordgen_probe.h"
 #include "coordgen_oracle_hook.hpp"
 
-#include "sketcherMinimizer.h"
-
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
+#include <map>
 #include <new>
 #include <unordered_map>
 #include <vector>
+
+/* Conformance-only structural introspection. Production headers remain
+ * untouched; standard headers are parsed before these access macros. */
+#define protected public
+#define private public
+#include "sketcherMinimizerFragment.h"
+#undef private
+#undef protected
+#include "sketcherMinimizer.h"
 
 namespace {
 
@@ -25,6 +35,7 @@ struct Generation {
     std::vector<uint32_t> fragment_atoms;
     std::vector<uint32_t> fragment_rings;
     std::vector<uint32_t> component_atoms;
+    std::vector<uint32_t> dof_affected_atoms;
     std::vector<coordgen_probe_template_mapping_t> template_mapping;
     std::vector<coordgen_probe_ring_t> rings;
     std::vector<coordgen_probe_fragment_t> fragments;
@@ -446,8 +457,8 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
             output.rings.push_back(record_ring);
         }
     }
-    for (sketcherMinimizerFragment* fragment : minimizer._fragments) {
-        fragment_indices.emplace(fragment, static_cast<uint32_t>(output.fragments.size()));
+    for (uint32_t index = 0; index < minimizer._fragments.size(); ++index) {
+        fragment_indices.emplace(minimizer._fragments[index], index);
     }
     std::unordered_map<const sketcherMinimizerFragment*, const TemplateCapture*> template_captures;
     for (const TemplateCapture& template_capture : capture.templates) {
@@ -480,6 +491,27 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
             probe.atom_b = COORDGEN_INVALID_INDEX;
             probe.ring = COORDGEN_INVALID_INDEX;
             probe.current_penalty = dof->getCurrentPenalty();
+            probe.affected_start = static_cast<uint32_t>(output.dof_affected_atoms.size());
+            probe.affected_count = static_cast<uint32_t>(dof->m_atoms.size());
+            for (const sketcherMinimizerAtom* atom : dof->m_atoms) {
+                output.dof_affected_atoms.push_back(atomIndex(atom));
+            }
+            if (const auto* scale = dynamic_cast<const CoordgenScaleAtomsDOF*>(dof)) {
+                probe.atom_a = atomIndex(scale->m_pivotAtom);
+            } else if (const auto* invert = dynamic_cast<const CoordgenInvertBondDOF*>(dof)) {
+                probe.atom_a = atomIndex(invert->m_pivotAtom);
+                probe.atom_b = atomIndex(invert->m_boundAtom);
+            } else if (const auto* flip = dynamic_cast<const CoordgenFlipRingDOF*>(dof)) {
+                probe.atom_a = atomIndex(flip->m_pivotAtom1);
+                probe.atom_b = atomIndex(flip->m_pivotAtom2);
+                probe.variant_penalty_multiplier = flip->m_penalty;
+                for (const sketcherMinimizerRing* ring : fragment_rings) {
+                    if (ring->_atoms == flip->m_atoms) {
+                        probe.ring = ring_indices.at(ring);
+                        break;
+                    }
+                }
+            }
             output.dofs.push_back(probe);
         }
         record.dof_count = static_cast<uint32_t>(output.dofs.size()) - record.dof_start;
@@ -512,6 +544,7 @@ void fillProbe(Generation& value, coordgen_probe_result_t* result) {
     result->fragment_atoms = { value.fragment_atoms.data(), static_cast<uint32_t>(value.fragment_atoms.size()), 0 };
     result->fragment_rings = { value.fragment_rings.data(), static_cast<uint32_t>(value.fragment_rings.size()), 0 };
     result->component_atoms = { value.component_atoms.data(), static_cast<uint32_t>(value.component_atoms.size()), 0 };
+    result->dof_affected_atoms = { value.dof_affected_atoms.data(), static_cast<uint32_t>(value.dof_affected_atoms.size()), 0 };
     result->template_mapping = const_cast<coordgen_probe_template_mapping_t*>(value.template_mapping.data());
     result->template_mapping_count = static_cast<uint32_t>(value.template_mapping.size());
     result->rings = const_cast<coordgen_probe_ring_t*>(value.rings.data());

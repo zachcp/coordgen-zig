@@ -13,6 +13,10 @@ pub const Atom = struct {
     coordinates_3d: ?core.math.Vec3 = null,
     coordinates: core.math.Vec2 = .{},
     stereo: core.chemistry.AtomStereo = .unspecified,
+    stereo_looking_from: core.ids.AtomId = .invalid,
+    stereo_atom_a: core.ids.AtomId = .invalid,
+    stereo_atom_b: core.ids.AtomId = .invalid,
+    cross_layout: bool = false,
 };
 
 pub const Bond = struct {
@@ -25,13 +29,18 @@ pub const Bond = struct {
     effective_order: core.chemistry.BondOrder,
     skip: bool = false,
     stereo: core.chemistry.BondStereo = .unspecified,
+    stereo_atom_a: core.ids.AtomId = .invalid,
+    stereo_atom_b: core.ids.AtomId = .invalid,
     display: core.chemistry.BondDisplay = .none,
+    crossing_penalty_multiplier: f32 = 1,
 };
 
 pub const Ring = struct {
     id: core.ids.RingId,
     atom_start: u32,
     atom_count: u32,
+    bond_start: u32,
+    bond_count: u32,
 };
 
 pub const Fragment = struct {
@@ -64,9 +73,23 @@ pub const ResidueInteraction = struct {
 };
 
 pub const ExtraBond = struct {
+    input_index: core.ids.InputIndex,
     start: core.ids.AtomId,
     end: core.ids.AtomId,
-    order: core.chemistry.BondOrder = .single,
+    input_order: core.chemistry.BondOrder = .single,
+    effective_order: core.chemistry.BondOrder = .single,
+    skip: bool = false,
+    stereo: core.chemistry.BondStereo = .unspecified,
+    stereo_atom_a: core.ids.AtomId = .invalid,
+    stereo_atom_b: core.ids.AtomId = .invalid,
+    display: core.chemistry.BondDisplay = .none,
+    crossing_penalty_multiplier: f32 = 1,
+};
+
+pub const ProximityRelation = union(enum) {
+    bond: core.ids.BondId,
+    extra_bond: core.ids.InputIndex,
+    residue_interaction: core.ids.InputIndex,
 };
 
 /// Owns both directions of the canonical/internal permutation. The source
@@ -134,6 +157,28 @@ pub const InputOrderMap = struct {
             output[input_index] = value;
         }
     }
+
+    /// Upstream removes hidden atoms before exposing canonical order. Internal
+    /// storage retains them after `active_count`; these helpers serialize the
+    /// exact observable partial permutation without losing owned hidden data.
+    pub fn activeInternalToInput(self: InputOrderMap, active_count: u32) []const core.ids.InputIndex {
+        std.debug.assert(active_count <= self.internal_to_input.len);
+        return self.internal_to_input[0..active_count];
+    }
+
+    pub fn writeActiveInputToInternal(
+        self: InputOrderMap,
+        active_count: u32,
+        output: []u32,
+    ) core.errors.Error!void {
+        if (active_count > self.internal_to_input.len or output.len != self.input_to_internal.len) {
+            return error.InvalidMapping;
+        }
+        @memset(output, std.math.maxInt(u32));
+        for (self.internal_to_input[0..active_count], 0..) |input_index, internal_index| {
+            output[input_index] = @intCast(internal_index);
+        }
+    }
 };
 
 /// Long-lived native graph storage for one generation context. Phase-local
@@ -151,8 +196,16 @@ pub const WorkingGraph = struct {
     /// Backing storage for every residue chain range.
     string_bytes: []u8,
     order: InputOrderMap,
+    /// Canonical visible atoms occupy this prefix. Hidden atoms remain in the
+    /// owned backing array so caller-indexed stereo and bond data stay valid,
+    /// but are excluded from every structural phase.
+    active_atom_count: u32,
+    /// Zero-order ordinary and extra bonds retained outside structural
+    /// adjacency in the same stable groups used by upstream initialization.
+    proximity_relations: []ProximityRelation,
 
     pub fn deinit(self: *WorkingGraph) void {
+        self.allocator.free(self.proximity_relations);
         self.order.deinit();
         self.allocator.free(self.string_bytes);
         self.allocator.free(self.residue_interaction_atoms);
@@ -206,6 +259,15 @@ test "mapping rejects duplicate and missing input positions" {
     try std.testing.expectError(
         error.InvalidMapping,
         order.writeInputOrder(u32, &.{10}, &full_output),
+    );
+
+    var active_output: [2]u32 = undefined;
+    try order.writeActiveInputToInternal(1, &active_output);
+    try std.testing.expectEqualSlices(u32, &.{ 0, std.math.maxInt(u32) }, &active_output);
+    try std.testing.expectEqualSlices(u32, &.{0}, order.activeInternalToInput(1));
+    try std.testing.expectError(
+        error.InvalidMapping,
+        order.writeActiveInputToInternal(3, &active_output),
     );
 }
 

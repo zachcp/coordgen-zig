@@ -146,6 +146,81 @@ static int no_template_probe_smoke(void) {
     return probe.owner == 0 ? 0 : 23;
 }
 
+static int fragment_parent_probe_smoke(void) {
+    coordgen_atom_input_t atoms[5] = {0};
+    coordgen_bond_input_t bonds[4] = {0};
+    coordgen_input_t input = {0};
+    coordgen_probe_result_t probe = {0};
+    uint32_t index;
+    static const uint32_t kinds[13] = {0, 1, 2, 3, 3, 0, 1, 2, 0, 1, 2, 3, 3};
+    static const uint32_t fragments[13] = {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2};
+    static const uint32_t counts[13] = {1, 7, 1, 2, 2, 2, 7, 5, 2, 7, 5, 2, 2};
+    static const uint32_t tiers[13] = {0, 2, 3, 4, 4, 0, 2, 3, 0, 2, 3, 4, 4};
+    static const uint32_t affected[13] = {0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1};
+    static const uint32_t affected_starts[13] = {0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 3};
+    static const uint32_t affected_atoms[4] = {0, 1, 4, 3};
+    static const uint32_t pivots[13] = {
+        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 1, 0,
+        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX,
+        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 3, 4
+    };
+
+    for (index = 0; index < 5; ++index) {
+        atoms[index].atomic_number = 6;
+        atoms[index].stereo_looking_from = COORDGEN_INVALID_INDEX;
+        atoms[index].stereo_atom_a = COORDGEN_INVALID_INDEX;
+        atoms[index].stereo_atom_b = COORDGEN_INVALID_INDEX;
+    }
+    for (index = 0; index < 4; ++index) {
+        bonds[index].start = index;
+        bonds[index].end = index + 1;
+        bonds[index].order = COORDGEN_BOND_SINGLE;
+        bonds[index].stereo_atom_a = COORDGEN_INVALID_INDEX;
+        bonds[index].stereo_atom_b = COORDGEN_INVALID_INDEX;
+        bonds[index].crossing_penalty_multiplier = 1.0f;
+    }
+    input.options = coordgen_default_options();
+    input.atoms = (coordgen_atom_span_t){atoms, 5, 0};
+    input.bonds = (coordgen_bond_span_t){bonds, 4, 0};
+    if (coordgen_probe_generate(&input, &probe) != COORDGEN_OK) return 24;
+    if (probe.fragment_count != 3 ||
+        probe.fragments[0].parent != COORDGEN_INVALID_INDEX ||
+        probe.fragments[1].parent != 0 ||
+        probe.fragments[2].parent != 1) {
+        coordgen_probe_result_free(&probe);
+        return 25;
+    }
+    if (probe.dof_count != 13 || probe.dof_affected_atoms.len != 4) {
+        coordgen_probe_result_free(&probe);
+        return 26;
+    }
+    for (index = 0; index < 4; ++index) {
+        if (probe.dof_affected_atoms.ptr[index] != affected_atoms[index]) {
+            coordgen_probe_result_free(&probe);
+            return 27;
+        }
+    }
+    for (index = 0; index < probe.dof_count; ++index) {
+        const coordgen_probe_dof_t *d = &probe.dofs[index];
+        const float expected_penalty = (index == 5 || index == 8) ? 10.0f : 0.0f;
+        if (d->id != index || d->kind != kinds[index] || d->fragment != fragments[index] ||
+            d->current_state != 0 || d->optimal_state != 0 || d->state_count != counts[index] ||
+            d->tier != tiers[index] || d->affected_start != affected_starts[index] ||
+            d->affected_count != affected[index] ||
+            d->atom_a != pivots[index] || d->atom_b != COORDGEN_INVALID_INDEX ||
+            d->current_penalty != expected_penalty) {
+            coordgen_probe_result_free(&probe);
+            return 28;
+        }
+    }
+    if (probe.clean_pose != 0) {
+        coordgen_probe_result_free(&probe);
+        return 29;
+    }
+    coordgen_probe_result_free(&probe);
+    return probe.owner == 0 ? 0 : 30;
+}
+
 /* cgz-7v2.8 regression: build_from_fragments must not be silently ignored.
  * Upstream's sketcherMinimizer::buildFromFragments(bool) is an imperative
  * pipeline step (forwards to CoordgenMinimizer::buildFromFragments(bool
@@ -203,5 +278,6 @@ int main(void) {
     const int stable = stable_api_smoke();
     const int probe = stable != 0 ? stable : probe_api_smoke();
     const int no_template = probe != 0 ? probe : no_template_probe_smoke();
-    return no_template != 0 ? no_template : build_from_fragments_rejected_smoke();
+    const int fragment_parent = no_template != 0 ? no_template : fragment_parent_probe_smoke();
+    return fragment_parent != 0 ? fragment_parent : build_from_fragments_rejected_smoke();
 }
