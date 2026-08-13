@@ -827,6 +827,144 @@ test "CIP branch order and relative double-bond stereo produce absolute Z/E" {
     ));
 }
 
+fn tetrahedralFixture(stereo_value: core.chemistry.AtomStereo) struct {
+    [5]model.Atom,
+    [4]model.Bond,
+} {
+    var atoms = [_]model.Atom{ makeAtom(0), makeAtom(1), makeAtom(2), makeAtom(3), makeAtom(4) };
+    atoms[0].stereo = stereo_value;
+    atoms[0].stereo_atom_a = AtomId.fromIndex(4);
+    atoms[0].stereo_atom_b = AtomId.fromIndex(3);
+    atoms[0].stereo_looking_from = AtomId.fromIndex(1);
+    atoms[1].atomic_number = .fluorine;
+    atoms[2].atomic_number = .chlorine;
+    atoms[3].atomic_number = .bromine;
+    atoms[4].atomic_number = .iodine;
+    atoms[0].coordinates = .{};
+    atoms[1].coordinates = .{ .x = 1 };
+    atoms[2].coordinates = .{ .y = 1 };
+    atoms[3].coordinates = .{ .x = -1 };
+    atoms[4].coordinates = .{ .y = -1 };
+    const bonds = [_]model.Bond{
+        makeBond(0, 0, 1),
+        makeBond(1, 0, 2),
+        makeBond(2, 0, 3),
+        makeBond(3, 0, 4),
+    };
+    return .{ atoms, bonds };
+}
+
+test "relative atom stereo resolves to absolute CIP and mirrored input inverts" {
+    var clockwise = tetrahedralFixture(.counter_clockwise);
+    var graph = try Graph.init(std.testing.allocator, &clockwise[0], &clockwise[1]);
+    defer graph.deinit();
+    try std.testing.expectEqual(.r, try stereo.absoluteAtomStereo(
+        std.testing.allocator,
+        &clockwise[0],
+        &clockwise[1],
+        graph,
+        AtomId.fromIndex(0),
+    ));
+
+    var mirrored = tetrahedralFixture(.clockwise);
+    try std.testing.expectEqual(.s, try stereo.absoluteAtomStereo(
+        std.testing.allocator,
+        &mirrored[0],
+        &mirrored[1],
+        graph,
+        AtomId.fromIndex(0),
+    ));
+}
+
+test "absolute atom stereo writes deterministic displays and pseudo depth" {
+    var fixture = tetrahedralFixture(.counter_clockwise);
+    var graph = try Graph.init(std.testing.allocator, &fixture[0], &fixture[1]);
+    defer graph.deinit();
+    var membership = try RingMembership.init(std.testing.allocator, graph, &fixture[1]);
+    defer membership.deinit();
+    try stereo.writeAtomBondDisplays(std.testing.allocator, &fixture[0], &fixture[1], graph, membership);
+    try std.testing.expectEqual(.r, fixture[0][0].stereo);
+    var displayed: usize = 0;
+    for (fixture[1]) |bond| displayed += @intFromBool(bond.display != .none);
+    try std.testing.expectEqual(@as(usize, 2), displayed);
+
+    const pseudo_z = try stereo.assignPseudoZ(std.testing.allocator, &fixture[0], &fixture[1], graph);
+    defer std.testing.allocator.free(pseudo_z);
+    try std.testing.expectEqual(@as(f32, 0), pseudo_z[0]);
+    try std.testing.expectEqual(@as(f32, 1), @abs(pseudo_z[2]) + @abs(pseudo_z[1]) + @abs(pseudo_z[3]) + @abs(pseudo_z[4]) - 1);
+}
+
+fn resolveTetrahedralAndDiscard(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: Graph,
+) !void {
+    _ = try stereo.absoluteAtomStereo(allocator, atoms, bonds, graph, AtomId.fromIndex(0));
+}
+
+fn writeTetrahedralAndDiscard(
+    allocator: std.mem.Allocator,
+    source_atoms: []const model.Atom,
+    source_bonds: []const model.Bond,
+    graph: Graph,
+    membership: RingMembership,
+) !void {
+    const atoms = try allocator.dupe(model.Atom, source_atoms);
+    defer allocator.free(atoms);
+    const bonds = try allocator.dupe(model.Bond, source_bonds);
+    defer allocator.free(bonds);
+    try stereo.writeAtomBondDisplays(allocator, atoms, bonds, graph, membership);
+}
+
+test "malformed and allocation-failing atom stereo is rejected cleanly" {
+    var fixture = tetrahedralFixture(.counter_clockwise);
+    var graph = try Graph.init(std.testing.allocator, &fixture[0], &fixture[1]);
+    defer graph.deinit();
+    fixture[0][0].stereo_atom_b = fixture[0][0].stereo_atom_a;
+    try std.testing.expectError(error.InvalidStereo, stereo.absoluteAtomStereo(
+        std.testing.allocator,
+        &fixture[0],
+        &fixture[1],
+        graph,
+        AtomId.fromIndex(0),
+    ));
+    fixture[0][0].stereo_atom_b = AtomId.fromIndex(3);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        resolveTetrahedralAndDiscard,
+        .{ &fixture[0], &fixture[1], graph },
+    );
+    var membership = try RingMembership.init(std.testing.allocator, graph, &fixture[1]);
+    defer membership.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        writeTetrahedralAndDiscard,
+        .{ &fixture[0], &fixture[1], graph, membership },
+    );
+}
+
+test "peptide mirror scoring follows the pinned N-to-carbonyl preference" {
+    var atoms = [_]model.Atom{ makeAtom(0), makeAtom(1), makeAtom(2), makeAtom(3) };
+    atoms[1].atomic_number = .nitrogen;
+    atoms[3].atomic_number = .oxygen;
+    atoms[1].coordinates.x = 1;
+    atoms[2].coordinates.x = -1;
+    var bonds = [_]model.Bond{
+        makeBond(0, 0, 1),
+        makeBond(1, 0, 2),
+        makeBond(2, 2, 3),
+    };
+    bonds[2].input_order = .double;
+    bonds[2].effective_order = .double;
+    var graph = try Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    try std.testing.expectEqual(@as(f32, -100), stereo.peptideFlipScore(&atoms, &bonds, graph));
+    atoms[1].coordinates.x = -1;
+    atoms[2].coordinates.x = 1;
+    try std.testing.expectEqual(@as(f32, 100), stereo.peptideFlipScore(&atoms, &bonds, graph));
+}
+
 test "adjacency and component invariants hold across path and cycle families" {
     for (1..65) |atom_count| {
         const bond_count = if (atom_count > 2) atom_count else atom_count - 1;
