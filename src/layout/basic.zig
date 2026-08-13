@@ -226,7 +226,6 @@ fn coordinateCenter(coordinates: []const core.math.Vec2) core.math.Vec2 {
 }
 
 fn assembleFragments(atoms: []model.Atom, bonds: []const model.Bond, graph: topology.Graph, fragmentation: fragments.Fragmentation) core.errors.Error!void {
-    _ = graph;
     for (1..fragmentation.fragments.len) |depth| {
         for (fragmentation.fragments) |fragment| {
             if (!fragment.parent.isValid() or fragmentDepth(fragmentation.fragments, fragment.id) != depth) continue;
@@ -235,20 +234,56 @@ fn assembleFragments(atoms: []model.Atom, bonds: []const model.Bond, graph: topo
             const child_endpoint = if (fragmentation.atom_fragment[bond.start.index()] == fragment.id) bond.start else bond.end;
             const parent_endpoint = if (child_endpoint == bond.start) bond.end else bond.start;
             const child_center = fragmentCenter(atoms, fragmentation.members(fragment.id));
-            const parent_center = fragmentCenter(atoms, fragmentation.members(fragment.parent));
-            var outward = subtract(atoms[parent_endpoint.index()].coordinates, parent_center);
-            if (length(outward) < 0.0001) outward = .{ .x = 1 };
+            var outward = openValenceDirection(atoms, graph, fragmentation, fragment.id, parent_endpoint, depth);
             outward = scale(outward, bond_length / length(outward));
             const target = add(atoms[parent_endpoint.index()].coordinates, outward);
             var child_direction = subtract(child_center, atoms[child_endpoint.index()].coordinates);
             if (length(child_direction) < 0.0001) child_direction = .{ .x = 1 };
-            const angle = std.math.atan2(outward.y, outward.x) - std.math.atan2(child_direction.y, child_direction.x);
+            var desired_child_direction = outward;
+            if (graph.degree(child_endpoint) == 2) {
+                desired_child_direction = rotateVector(scale(outward, -1), 2 * std.math.pi / 3);
+            }
+            const angle = std.math.atan2(desired_child_direction.y, desired_child_direction.x) - std.math.atan2(child_direction.y, child_direction.x);
             const source = atoms[child_endpoint.index()].coordinates;
             for (fragmentation.members(fragment.id)) |atom| {
                 atoms[atom.index()].coordinates = transformFromPivot(atoms[atom.index()].coordinates, source, target, angle);
             }
         }
     }
+}
+
+fn openValenceDirection(
+    atoms: []const model.Atom,
+    graph: topology.Graph,
+    fragmentation: fragments.Fragmentation,
+    child: core.ids.FragmentId,
+    center: core.ids.AtomId,
+    child_depth: usize,
+) core.math.Vec2 {
+    var direction_sum: core.math.Vec2 = .{};
+    var first_direction: core.math.Vec2 = .{};
+    var count: usize = 0;
+    for (graph.neighbors(center)) |neighbor| {
+        const neighbor_fragment = fragmentation.atom_fragment[neighbor.index()];
+        if (neighbor_fragment == child or !neighbor_fragment.isValid() or
+            fragmentDepth(fragmentation.fragments, neighbor_fragment) >= child_depth) continue;
+        const direction = subtract(atoms[neighbor.index()].coordinates, atoms[center.index()].coordinates);
+        if (length(direction) < 0.0001) continue;
+        const normalized = scale(direction, 1 / length(direction));
+        if (count == 0) first_direction = normalized;
+        direction_sum = add(direction_sum, normalized);
+        count += 1;
+    }
+    if (count == 0) return .{ .x = 1 };
+    if (count == 1) return rotateVector(first_direction, -2 * std.math.pi / 3);
+    if (length(direction_sum) < 0.0001) return rotateVector(first_direction, std.math.pi);
+    return scale(direction_sum, -1 / length(direction_sum));
+}
+
+fn rotateVector(value: core.math.Vec2, angle: f32) core.math.Vec2 {
+    const cosine = @cos(angle);
+    const sine = @sin(angle);
+    return .{ .x = value.x * cosine - value.y * sine, .y = value.x * sine + value.y * cosine };
 }
 
 fn fragmentDepth(records: []const fragments.Fragment, fragment: core.ids.FragmentId) usize {
@@ -506,9 +541,28 @@ test "fragment assembly preserves every acyclic parent bond length" {
     try layoutFixture(&atoms, &bonds);
     try expectBondLengths(&atoms, &bonds);
     for (atoms) |atom| try std.testing.expect(atom.coordinates.isFinite());
+    for (1..atoms.len - 1) |center| {
+        const left = subtract(atoms[center - 1].coordinates, atoms[center].coordinates);
+        const right = subtract(atoms[center + 1].coordinates, atoms[center].coordinates);
+        const cosine = (left.x * right.x + left.y * right.y) / (length(left) * length(right));
+        try std.testing.expectApproxEqAbs(@as(f32, -0.5), cosine, 0.001);
+    }
     const first = atoms;
     try layoutFixture(&atoms, &bonds);
     for (first, atoms) |left, right| try std.testing.expectEqual(left.coordinates, right.coordinates);
+
+    var reversed_atoms: [5]model.Atom = undefined;
+    for (&reversed_atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    var reversed_bonds = bonds;
+    for (&reversed_bonds) |*bond| std.mem.swap(core.ids.AtomId, &bond.start, &bond.end);
+    try layoutFixture(&reversed_atoms, &reversed_bonds);
+    for (0..atoms.len) |left| for (0..atoms.len) |right| {
+        try std.testing.expectApproxEqAbs(
+            distance(atoms[left].coordinates, atoms[right].coordinates),
+            distance(reversed_atoms[left].coordinates, reversed_atoms[right].coordinates),
+            0.001,
+        );
+    };
 }
 
 test "constrained alignment, fixed reset, and valid 3D fallback are deterministic" {
