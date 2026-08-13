@@ -695,10 +695,12 @@ pub fn generateShape(
     }
     var chosen_start: usize = 0;
     var chosen_score: i32 = path_failed;
+    var found = false;
     if (coordinates.len > @as(usize, @intCast(std.math.maxInt(i32) / 5))) return error.TooManyItems;
     const acceptable_score: i32 = if (coordinates.len < 10) 0 else -@as(i32, @intCast(coordinates.len * 5));
     while (shapes.items.items.len != 0) {
         if (try matchShapes(allocator, shapes, data.constraints(), data.restraints(), &checked)) |matched| {
+            found = true;
             if (matched.score > chosen_score) {
                 if (chosen) |*shape| shape.deinit();
                 chosen = try shapes.items.items[matched.shape].clone(allocator);
@@ -706,7 +708,7 @@ pub fn generateShape(
                 chosen_score = matched.score;
                 if (matched.score > acceptable_score) break;
             }
-        }
+        } else found = false;
         if (checked > max_macrocycles) break;
         var equivalents = try shapes.equivalents();
         errdefer equivalents.deinit();
@@ -715,10 +717,10 @@ pub fn generateShape(
         shapes = equivalents;
         equivalents = ShapeCollection.init(allocator);
     }
-    if (chosen) |shape| {
+    if (found) if (chosen) |shape| {
         try writeCoordinates(shape, chosen_start, coordinates, coordinates_set);
         return .matched;
-    }
+    };
     return .no_shape;
 }
 

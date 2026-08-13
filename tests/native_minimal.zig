@@ -78,7 +78,8 @@ test "minimal native generation explicitly rejects domains owned by later phases
     const path = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
     const cycle = [_]api.BondInput{ path[0], path[1], .{ .start = 2, .end = 0 } };
     const disconnected = [_]api.BondInput{path[0]};
-    try expectUnsupported(.{ .atoms = &atoms, .bonds = &cycle });
+    var cycle_result = try generate(std.testing.allocator, .{ .atoms = &atoms, .bonds = &cycle });
+    cycle_result.deinit();
     try expectUnsupported(.{ .atoms = &atoms, .bonds = &disconnected });
 
     var changed = atoms;
@@ -131,12 +132,50 @@ test "minimal native generation explicitly rejects domains owned by later phases
 
     inline for (.{
         api.Options{ .even_angles = true },
-        api.Options{ .force_open_macrocycles = true },
         api.Options{ .constrain_all_atoms = true },
         api.Options{ .build_from_fragments = true },
         api.Options{ .debug_coordinates = true },
         api.Options{ .template_directory = "fixtures" },
     }) |options| try expectUnsupported(.{ .atoms = &atoms, .bonds = &path, .options = options });
+}
+
+test "minimal native generation reaches macrocycle lattice and forced-open fallback" {
+    const ring_size = 13;
+    var atoms: [ring_size]api.AtomInput = undefined;
+    var bonds: [ring_size]api.BondInput = undefined;
+    for (&atoms, &bonds, 0..) |*atom, *bond, index| {
+        atom.* = .{};
+        bond.* = .{
+            .start = @intCast(index),
+            .end = @intCast((index + 1) % ring_size),
+        };
+    }
+    const input = api.Input{ .atoms = &atoms, .bonds = &bonds };
+    var lattice = try generate(std.testing.allocator, input);
+    defer lattice.deinit();
+    var repeated = try generate(std.testing.allocator, input);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, lattice.coordinates, repeated.coordinates);
+    for (lattice.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+
+    var opened = try generate(std.testing.allocator, .{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .options = .{ .force_open_macrocycles = true },
+    });
+    defer opened.deinit();
+    var changed = false;
+    for (lattice.coordinates, opened.coordinates) |lattice_coordinate, opened_coordinate| {
+        changed = changed or !std.meta.eql(lattice_coordinate, opened_coordinate);
+    }
+    try std.testing.expect(changed);
+    for (opened.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .options = .{ .force_open_macrocycles = true },
+    }});
 }
 
 test "minimal native validation rejects malformed input before generation" {

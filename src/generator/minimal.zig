@@ -20,15 +20,14 @@ pub const Result = struct {
 };
 
 /// Compose validated safe-API-shaped input through native preparation,
-/// fragmentation, and basic layout. This intentionally rejects every domain
-/// whose owning native phase is not integrated yet.
+/// fragmentation, and basic/macrocycle layout. This intentionally rejects
+/// every domain whose owning native phase is not integrated yet.
 pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.errors.Error!Result {
     try rejectOutOfScope(input);
     var prepared = try topology.prepareInput(allocator, input);
     defer prepared.deinit();
     if (prepared.working.active_atom_count != input.atoms.len or
         prepared.graph.component_count != 1 or
-        prepared.rings.rings.len != 0 or
         prepared.working.proximity_relations.len != 0)
     {
         return error.Unsupported;
@@ -42,13 +41,14 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.rings,
     );
     defer fragmentation.deinit();
-    try layout.initializeCoordinates(
+    try layout.initializeCoordinatesWithOptions(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
         prepared.graph,
         prepared.rings,
         fragmentation,
+        input.options.force_open_macrocycles,
     );
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
@@ -70,8 +70,7 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
 
 fn rejectOutOfScope(input: anytype) core.errors.Error!void {
     if (input.residues.len != 0 or input.residue_interactions.len != 0 or input.extra_bonds.len != 0) return error.Unsupported;
-    if (input.options.even_angles or input.options.force_open_macrocycles or
-        input.options.constrain_all_atoms or input.options.build_from_fragments or
+    if (input.options.even_angles or input.options.constrain_all_atoms or input.options.build_from_fragments or
         input.options.debug_coordinates or input.options.template_directory != null) return error.Unsupported;
     for (input.atoms) |atom| {
         if (atom.hidden or atom.fixed or atom.constrained or atom.template_coordinates != null or
