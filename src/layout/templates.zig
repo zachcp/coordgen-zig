@@ -6,6 +6,13 @@ const data = @import("templates/data.zig");
 
 pub const template_count = data.templates.len;
 
+pub const Options = struct {
+    load_templates: bool = true,
+    /// Runtime MAE templates are unavailable in the dependency-free build and
+    /// therefore rejected explicitly, matching the stable oracle adapter.
+    template_directory: ?[]const u8 = null,
+};
+
 pub const Edge = struct {
     start: u8,
     end: u8,
@@ -97,13 +104,14 @@ pub fn findGraph(
 /// `load_templates = false` is a real no-op rather than a lazy-init switch.
 pub fn findRingSet(
     allocator: std.mem.Allocator,
-    load_templates: bool,
+    options: Options,
     atom_count: usize,
     bonds: []const model.Bond,
     membership: anytype,
     ring_ids: []const core.ids.RingId,
 ) core.errors.Error!?RingMatch {
-    if (!load_templates or ring_ids.len < 2) return null;
+    if (options.template_directory != null) return error.Unsupported;
+    if (!options.load_templates or ring_ids.len < 2) return null;
     const local_index = allocator.alloc(u8, atom_count) catch return error.OutOfMemory;
     defer allocator.free(local_index);
     @memset(local_index, std.math.maxInt(u8));
@@ -586,7 +594,7 @@ test "native fused ring set selects and applies embedded template 80" {
     var ring_ids: [2]core.ids.RingId = undefined;
     try std.testing.expectEqual(ring_ids.len, rings.rings.len);
     for (&ring_ids, 0..) |*ring_id, index| ring_id.* = core.ids.RingId.fromIndex(@intCast(index));
-    var match = (try findRingSet(std.testing.allocator, true, atoms.len, &bonds, rings, &ring_ids)).?;
+    var match = (try findRingSet(std.testing.allocator, .{}, atoms.len, &bonds, rings, &ring_ids)).?;
     defer match.deinit();
     try std.testing.expectEqual(@as(u8, 80), match.match.template_index);
     try match.apply(&atoms);
@@ -595,7 +603,15 @@ test "native fused ring set selects and applies embedded template 80" {
         try std.testing.expectEqual(expected.x * core.math.bond_length, atoms[atom_id.index()].coordinates.x);
         try std.testing.expectEqual(expected.y * core.math.bond_length, atoms[atom_id.index()].coordinates.y);
     }
-    try std.testing.expect((try findRingSet(std.testing.allocator, false, atoms.len, &bonds, rings, &ring_ids)) == null);
+    try std.testing.expect((try findRingSet(std.testing.allocator, .{ .load_templates = false }, atoms.len, &bonds, rings, &ring_ids)) == null);
+    try std.testing.expectError(error.Unsupported, findRingSet(
+        std.testing.allocator,
+        .{ .template_directory = "user-templates" },
+        atoms.len,
+        &bonds,
+        rings,
+        &ring_ids,
+    ));
 }
 
 test "template application aligns constraints and restores fixed coordinates" {
@@ -647,7 +663,7 @@ fn findRingSetAndDiscard(
     rings: topology.RingMembership,
     ring_ids: []const core.ids.RingId,
 ) !void {
-    var match = (try findRingSet(allocator, true, 5, bonds, rings, ring_ids)) orelse return error.Unsupported;
+    var match = (try findRingSet(allocator, .{}, 5, bonds, rings, ring_ids)) orelse return error.Unsupported;
     match.deinit();
 }
 
@@ -679,7 +695,7 @@ fn renderTemplate80(result: *ThreadResult) void {
     defer graph.deinit();
     defer rings.deinit();
     const ring_ids = [_]core.ids.RingId{ core.ids.RingId.fromIndex(0), core.ids.RingId.fromIndex(1) };
-    var match = (findRingSet(allocator, true, atoms.len, &bonds, rings, &ring_ids) catch |err| {
+    var match = (findRingSet(allocator, .{}, atoms.len, &bonds, rings, &ring_ids) catch |err| {
         result.err = err;
         return;
     }) orelse {
