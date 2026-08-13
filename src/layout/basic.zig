@@ -117,7 +117,7 @@ fn placeFragmentRings(
         var selected_score: usize = 0;
         for (membership.rings) |ring| {
             const ring_atoms = membership.atoms(ring.id);
-            if (ring_atoms.len == 0 or
+            if (ring_atoms.len < 3 or
                 fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
             var already_complete = true;
             var shared: usize = 0;

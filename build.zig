@@ -1187,6 +1187,27 @@ pub fn build(b: *std.Build) !void {
         }
         oracle_step.dependOn(&run_fixture_check.step);
 
+        const native_macrocycle_module = b.createModule(.{
+            .root_source_file = b.path("tests/native_macrocycle_mae.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "api", .module = api },
+                .{ .name = "conformance", .module = conformance },
+                .{ .name = "generator", .module = generator },
+            },
+            .link_libc = false,
+            .link_libcpp = false,
+        });
+        const native_macrocycle = b.addExecutable(.{
+            .name = "native-macrocycle-mae",
+            .root_module = native_macrocycle_module,
+        });
+        const run_native_macrocycle = b.addRunArtifact(native_macrocycle);
+        run_native_macrocycle.expectExitCode(0);
+        run_native_macrocycle.addFileArg(oracle.path("test/macrocycle.mae"));
+        oracle_step.dependOn(&run_native_macrocycle.step);
+
         conformance_step.dependOn(oracle_step);
     } else {
         const oracle_disabled = b.addFail(
