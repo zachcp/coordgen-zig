@@ -6,9 +6,11 @@ const layout = @import("layout");
 const optimize = @import("optimize");
 
 pub const components = @import("components.zig");
+pub const residues = @import("residues.zig");
 
 test {
     _ = components;
+    _ = residues;
 }
 
 /// Restricted proof result. Coordinates and both maps are allocator-owned;
