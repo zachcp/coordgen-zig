@@ -1600,7 +1600,11 @@ test "five-atom path DOFs match the stable upstream probe" {
 }
 
 test "topology path extraction and bounded shape orchestration clean every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, collectAndGenerateFixture, .{false});
+    // ArrayList growth can remap in place through the debug allocator on
+    // macOS depending on the address reused by the preceding injected-failure
+    // run. Page allocation makes those growth decisions stable while
+    // FailingAllocator still verifies every allocation index and byte balance.
+    try std.testing.checkAllAllocationFailures(std.heap.page_allocator, collectAndGenerateFixture, .{false});
 }
 
 test "macrocycle substituents emit invert-bond DOFs for exactly the bound atom" {
