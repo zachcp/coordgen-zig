@@ -753,6 +753,44 @@ pub fn generateRingShape(
     return result;
 }
 
+/// Select the least disruptive bond for the recursive acyclic fallback. The
+/// score and strict first-wins tie behavior mirror pinned upstream.
+pub fn findBondToOpen(
+    ring: core.ids.RingId,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+) ?core.ids.BondId {
+    if (!ring.isValid() or ring.index() >= membership.rings.len) return null;
+    const is_macrocycle = membership.atoms(ring).len >= topology.rings.macrocycle_size;
+    var best: ?core.ids.BondId = null;
+    var best_score: f32 = 0;
+    for (membership.ringBonds(ring)) |bond_id| {
+        const bond = bonds[bond_id.index()];
+        if (is_macrocycle) {
+            if (bond.effective_order != .single) continue;
+            var next_to_stereo = false;
+            for (graph.incidentBonds(bond.start)) |other| if (bonds[other.index()].stereo != .unspecified) {
+                next_to_stereo = true;
+                break;
+            };
+            if (!next_to_stereo) for (graph.incidentBonds(bond.end)) |other| if (bonds[other.index()].stereo != .unspecified) {
+                next_to_stereo = true;
+                break;
+            };
+            if (next_to_stereo) continue;
+        }
+        if (!std.math.isFinite(bond.crossing_penalty_multiplier) or bond.crossing_penalty_multiplier <= 0) continue;
+        const score = @as(f32, @floatFromInt(membership.bondRings(bond_id).len * 10 + graph.degree(bond.start) + graph.degree(bond.end))) /
+            bond.crossing_penalty_multiplier;
+        if (best == null or score < best_score) {
+            best = bond_id;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
 pub fn lowestPeriod(neighbors: []const u8) usize {
     for (1..neighbors.len) |period| {
         var different = false;
@@ -1152,6 +1190,11 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator) !void {
     var membership = try topology.RingMembership.init(allocator, graph, &bonds);
     defer membership.deinit();
     try std.testing.expectEqual(@as(usize, 1), membership.rings.len);
+    const opened = findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, membership) orelse return error.InvalidMapping;
+    try std.testing.expect(bonds[opened.index()].start != core.ids.AtomId.fromIndex(0));
+    try std.testing.expect(bonds[opened.index()].end != core.ids.AtomId.fromIndex(0));
+    try std.testing.expect(bonds[opened.index()].start != core.ids.AtomId.fromIndex(1));
+    try std.testing.expect(bonds[opened.index()].end != core.ids.AtomId.fromIndex(1));
     var data = try collectPathData(allocator, core.ids.RingId.fromIndex(0), &atoms, &bonds, graph, membership);
     defer data.deinit();
     try std.testing.expectEqual(@as(usize, ring_size), data.ordered_atoms.len);

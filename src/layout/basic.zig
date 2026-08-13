@@ -19,6 +19,30 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, false);
+}
+
+pub fn initializeCoordinatesWithOptions(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    force_open_macrocycles: bool,
+) core.errors.Error!void {
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, force_open_macrocycles);
+}
+
+fn initializeCoordinatesInternal(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    force_open_macrocycles: bool,
+) core.errors.Error!void {
     const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(placed);
     @memset(placed, false);
@@ -26,7 +50,7 @@ pub fn initializeCoordinates(
     defer allocator.free(queue);
 
     for (fragmentation.fragments) |fragment| {
-        try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed);
+        try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, force_open_macrocycles);
 
         const members = fragmentation.members(fragment.id);
         var head: usize = 0;
@@ -84,6 +108,7 @@ fn placeFragmentRings(
     fragmentation: fragments.Fragmentation,
     fragment: fragments.Fragment,
     placed: []bool,
+    force_open_macrocycles: bool,
 ) core.errors.Error!void {
     var remaining: usize = fragment.ring_count;
     while (remaining != 0) {
@@ -118,8 +143,12 @@ fn placeFragmentRings(
                 graph,
                 membership,
                 placed,
-                false,
+                force_open_macrocycles,
             ) == .matched) {
+                remaining -= 1;
+                continue;
+            }
+            if (try openCycleAndGenerateCoordinates(allocator, ring.id, atoms, bonds, graph, membership, placed)) {
                 remaining -= 1;
                 continue;
             }
@@ -156,6 +185,50 @@ fn placeFragmentRings(
         }
         remaining -= 1;
     }
+}
+
+fn openCycleAndGenerateCoordinates(
+    allocator: std.mem.Allocator,
+    ring: core.ids.RingId,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    placed: []bool,
+) core.errors.Error!bool {
+    const bond_to_open = macrocycle.findBondToOpen(ring, bonds, graph, membership) orelse return false;
+    const ring_atoms = membership.atoms(ring);
+    if (ring_atoms.len == 0) return false;
+    const component = graph.component(ring_atoms[0]) orelse return false;
+    const temporary_atoms = allocator.dupe(model.Atom, atoms) catch return error.OutOfMemory;
+    defer allocator.free(temporary_atoms);
+    for (temporary_atoms) |*atom| {
+        if (graph.component(atom.id) != component) atom.hidden = true;
+    }
+    const temporary_bonds = allocator.dupe(model.Bond, bonds) catch return error.OutOfMemory;
+    defer allocator.free(temporary_bonds);
+    temporary_bonds[bond_to_open.index()].skip = true;
+    var temporary_graph = try topology.Graph.init(allocator, temporary_atoms, temporary_bonds);
+    defer temporary_graph.deinit();
+    var temporary_rings = try topology.RingMembership.init(allocator, temporary_graph, temporary_bonds);
+    defer temporary_rings.deinit();
+    var temporary_fragments = try fragments.Fragmentation.init(allocator, temporary_atoms, temporary_bonds, temporary_graph, temporary_rings);
+    defer temporary_fragments.deinit();
+    try initializeCoordinatesInternal(
+        allocator,
+        temporary_atoms,
+        temporary_bonds,
+        temporary_graph,
+        temporary_rings,
+        temporary_fragments,
+        true,
+    );
+    for (atoms, temporary_atoms, placed) |*atom, temporary_atom, *is_placed| {
+        if (graph.component(atom.id) != component) continue;
+        atom.coordinates = temporary_atom.coordinates;
+        is_placed.* = true;
+    }
+    return true;
 }
 
 fn regularRingCoordinates(allocator: std.mem.Allocator, count: usize) core.errors.Error![]core.math.Vec2 {
@@ -484,6 +557,21 @@ test "macrocycles dispatch through native polyomino placement" {
         hex_edges += @intFromBool(@abs(edge_length - bond_length * @sqrt(@as(f32, 3))) < 0.001);
     }
     try std.testing.expect(hex_edges > 0);
+
+    const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
+    try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, true);
+    for (bonds) |bond| {
+        if (bond.id == opened) continue;
+        try std.testing.expectApproxEqAbs(
+            bond_length,
+            distance(atoms[bond.start.index()].coordinates, atoms[bond.end.index()].coordinates),
+            0.001,
+        );
+    }
+    try std.testing.expect(@abs(distance(
+        atoms[bonds[opened.index()].start.index()].coordinates,
+        atoms[bonds[opened.index()].end.index()].coordinates,
+    ) - bond_length) > 0.001);
 }
 
 fn layoutFixture(atoms: []model.Atom, bonds: []const model.Bond) !void {
