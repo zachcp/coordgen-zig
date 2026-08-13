@@ -115,7 +115,7 @@ fn optimizeDiscrete(
     fragmentation: layout.Fragmentation,
     precision: f32,
 ) core.errors.Error!void {
-    var dofs = try layout.macrocycle.collectDofs(allocator, bonds, graph, rings, fragmentation);
+    var dofs = try layout.macrocycle.collectAllDofs(allocator, bonds, graph, rings, fragmentation);
     defer dofs.deinit();
     if (dofs.items.len == 0) return;
 

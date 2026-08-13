@@ -843,6 +843,68 @@ pub fn collectDofs(
     return .{ .allocator = allocator, .items = owned_dofs, .affected_atoms = owned_affected };
 }
 
+/// Collect the always-present primary fragment DOFs together with specialized
+/// macrocycle DOFs in upstream fragment-local order.
+pub fn collectAllDofs(
+    allocator: std.mem.Allocator,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+) core.errors.Error!core.dof.Collection {
+    var specialized = try collectDofs(allocator, bonds, graph, membership, fragmentation);
+    defer specialized.deinit();
+    var items: std.ArrayList(core.dof.Dof) = .empty;
+    defer items.deinit(allocator);
+    var affected: std.ArrayList(core.ids.AtomId) = .empty;
+    defer affected.deinit(allocator);
+
+    for (fragmentation.fragments) |fragment| {
+        const primary = [_]struct { payload: core.dof.Payload, count: u32, tier: u32 }{
+            .{
+                .payload = .{ .flip_fragment = .{} },
+                .count = if (fragment.parent.isValid()) 2 else 1,
+                .tier = core.dof.Tier.flip_fragment,
+            },
+            .{
+                .payload = .{ .change_parent_bond_length = .{} },
+                .count = 7,
+                .tier = core.dof.Tier.change_parent_bond_length,
+            },
+            .{
+                .payload = .{ .rotate_fragment = .{} },
+                .count = if (fragment.parent.isValid()) 5 else 1,
+                .tier = core.dof.Tier.rotate_fragment,
+            },
+        };
+        for (primary) |entry| {
+            if (items.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+            items.append(allocator, .{
+                .id = core.ids.DofId.fromIndex(@intCast(items.items.len)),
+                .fragment = fragment.id,
+                .state = .{ .count = entry.count, .tier = entry.tier },
+                .payload = entry.payload,
+            }) catch return error.OutOfMemory;
+        }
+        for (specialized.items) |dof| {
+            if (dof.fragment != fragment.id) continue;
+            const source_start = dof.affected_atoms.start;
+            const source_end = std.math.add(u32, source_start, dof.affected_atoms.len) catch return error.InvalidMapping;
+            if (source_end > specialized.affected_atoms.len or affected.items.len > std.math.maxInt(u32)) return error.InvalidMapping;
+            const affected_start: u32 = @intCast(affected.items.len);
+            affected.appendSlice(allocator, specialized.affected_atoms[source_start..source_end]) catch return error.OutOfMemory;
+            var copied = dof;
+            copied.id = core.ids.DofId.fromIndex(@intCast(items.items.len));
+            copied.affected_atoms.start = affected_start;
+            items.append(allocator, copied) catch return error.OutOfMemory;
+        }
+    }
+    const owned_items = items.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(owned_items);
+    const owned_affected = affected.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{ .allocator = allocator, .items = owned_items, .affected_atoms = owned_affected };
+}
+
 pub fn lowestPeriod(neighbors: []const u8) usize {
     for (1..neighbors.len) |period| {
         var different = false;
@@ -1271,6 +1333,23 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
             collectDofsAndDiscard,
             .{ &bonds, graph, membership, fragmentation },
         );
+        var all_dofs = try collectAllDofs(allocator, &bonds, graph, membership, fragmentation);
+        defer all_dofs.deinit();
+        try std.testing.expectEqual(fragmentation.fragments.len * 3 + 1, all_dofs.items.len);
+        var dof_index: usize = 0;
+        for (fragmentation.fragments) |fragment| {
+            try std.testing.expectEqual(core.dof.DofKind.flip_fragment, all_dofs.items[dof_index].kind());
+            try std.testing.expectEqual(core.dof.DofKind.change_parent_bond_length, all_dofs.items[dof_index + 1].kind());
+            try std.testing.expectEqual(core.dof.DofKind.rotate_fragment, all_dofs.items[dof_index + 2].kind());
+            try std.testing.expectEqual(fragment.id, all_dofs.items[dof_index].fragment);
+            dof_index += 3;
+            while (dof_index < all_dofs.items.len and all_dofs.items[dof_index].fragment == fragment.id) dof_index += 1;
+        }
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            collectAllDofsAndDiscard,
+            .{ &bonds, graph, membership, fragmentation },
+        );
     }
     var data = try collectPathData(allocator, core.ids.RingId.fromIndex(0), &atoms, &bonds, graph, membership);
     defer data.deinit();
@@ -1312,6 +1391,17 @@ fn collectDofsAndDiscard(
     fragmentation: fragments.Fragmentation,
 ) !void {
     var dofs = try collectDofs(allocator, bonds, graph, membership, fragmentation);
+    defer dofs.deinit();
+}
+
+fn collectAllDofsAndDiscard(
+    allocator: std.mem.Allocator,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+) !void {
+    var dofs = try collectAllDofs(allocator, bonds, graph, membership, fragmentation);
     defer dofs.deinit();
 }
 
