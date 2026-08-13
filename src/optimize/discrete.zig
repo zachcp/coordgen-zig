@@ -491,6 +491,42 @@ pub fn scoreAtomsInsideRings(
     return energy;
 }
 
+/// Apply upstream's terminal-bond fallback after discrete search fails. The
+/// caller re-scores the pose after this deterministic coordinate mutation.
+pub fn avoidTerminalClashes(
+    initial_score: f32,
+    bonds: []const BondScoreView,
+    atom_degrees: []const u32,
+    fixed: []const bool,
+    coordinates: []core.math.Vec2,
+) core.errors.Error!bool {
+    if (atom_degrees.len != coordinates.len or fixed.len != coordinates.len) return error.InvalidMapping;
+    if (initial_score < 0.1) return false;
+    var changed = false;
+    for (bonds) |bond| {
+        if (bond.residue_interaction or !bond.terminal) continue;
+        try validateScoreBond(bond, coordinates.len);
+        var terminal = bond.end;
+        var root = bond.start;
+        if (atom_degrees[terminal.index()] != 1) {
+            terminal = bond.start;
+            root = bond.end;
+        }
+        if (fixed[terminal.index()]) continue;
+        for (bonds) |other| {
+            if (other.residue_interaction) continue;
+            try validateScoreBond(other, coordinates.len);
+            if (!bondsClash(bond, other, coordinates)) continue;
+            coordinates[terminal.index()] = add(
+                coordinates[root.index()],
+                scale(subtract(coordinates[terminal.index()], coordinates[root.index()]), 0.1),
+            );
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 fn validateScoreBond(bond: BondScoreView, atom_count: usize) core.errors.Error!void {
     if (!bond.start.isValid() or !bond.end.isValid() or bond.start.index() >= atom_count or
         bond.end.index() >= atom_count or bond.start == bond.end or
@@ -723,6 +759,12 @@ test "discrete clash crossing and atoms-in-rings scores preserve pinned penaltie
         .{ .start = core.ids.AtomId.fromIndex(4), .end = core.ids.AtomId.fromIndex(5) },
     };
     try std.testing.expectEqual(@as(f32, 120_000), try scoreCrossBonds(&bonds, &coordinates));
+
+    var terminal_coordinates = coordinates;
+    const degrees = [_]u32{ 2, 1, 1, 1, 1, 1 };
+    const fixed = [_]bool{ false, false, false, false, false, false };
+    try std.testing.expect(try avoidTerminalClashes(120_000, &bonds, &degrees, &fixed, &terminal_coordinates));
+    try std.testing.expectEqual(core.math.Vec2{ .x = -1.6 }, terminal_coordinates[1]);
 
     const ring_atoms = [_]core.ids.AtomId{
         core.ids.AtomId.fromIndex(0),
