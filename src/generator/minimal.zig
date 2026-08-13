@@ -12,6 +12,7 @@ pub const Result = struct {
     coordinates: []core.math.Vec2,
     input_to_internal: []u32,
     internal_to_input: []core.ids.InputIndex,
+    clean_pose: bool,
 
     pub fn deinit(self: *Result) void {
         self.allocator.free(self.internal_to_input);
@@ -52,7 +53,7 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         fragmentation,
         input.options.force_open_macrocycles,
     );
-    try optimizeDiscrete(
+    const clean_pose = try optimizeDiscrete(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
@@ -76,6 +77,7 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         .coordinates = coordinates,
         .input_to_internal = input_to_internal,
         .internal_to_input = internal_to_input,
+        .clean_pose = clean_pose,
     };
 }
 
@@ -114,10 +116,10 @@ fn optimizeDiscrete(
     rings: topology.RingMembership,
     fragmentation: layout.Fragmentation,
     precision: f32,
-) core.errors.Error!void {
+) core.errors.Error!bool {
     var dofs = try layout.macrocycle.collectAllDofs(allocator, bonds, graph, rings, fragmentation);
     defer dofs.deinit();
-    if (dofs.items.len == 0) return;
+    if (dofs.items.len == 0) return false;
 
     const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_has_dofs);
@@ -193,8 +195,9 @@ fn optimizeDiscrete(
     };
     var cache = try optimize.discrete.SolutionCache.init(allocator, dofs.items.len, precision, evaluator.evaluator());
     defer cache.deinit();
-    _ = try optimize.discrete.tieredSearch(allocator, dofs.items, &cache, precision, 0);
+    const search = try optimize.discrete.tieredSearch(allocator, dofs.items, &cache, precision, 0);
     for (atoms, global) |*atom, coordinate| atom.coordinates = coordinate;
+    return search.clean_pose;
 }
 
 fn rejectOutOfScope(input: anytype) core.errors.Error!void {

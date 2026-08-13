@@ -213,8 +213,12 @@ static int fragment_parent_probe_smoke(void) {
             return 28;
         }
     }
+    if (probe.clean_pose != 0) {
+        coordgen_probe_result_free(&probe);
+        return 29;
+    }
     coordgen_probe_result_free(&probe);
-    return probe.owner == 0 ? 0 : 29;
+    return probe.owner == 0 ? 0 : 30;
 }
 
 /* cgz-7v2.8 regression: build_from_fragments must not be silently ignored.

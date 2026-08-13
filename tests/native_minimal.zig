@@ -26,6 +26,19 @@ test "minimal native ethane and propane are finite deterministic caller-order la
     try std.testing.expect(first.coordinates[0].x != first.coordinates[1].x or first.coordinates[0].y != first.coordinates[1].y);
 }
 
+test "five-atom path clean pose matches the stable upstream probe" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 4 },
+    };
+    var result = try generate(std.testing.allocator, .{ .atoms = &atoms, .bonds = &bonds });
+    defer result.deinit();
+    try std.testing.expect(!result.clean_pose);
+}
+
 test "minimal native result maps canonical coordinates back to caller order without mutating input" {
     const atoms = [_]api.AtomInput{
         .{ .atomic_number = .carbon },
