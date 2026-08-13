@@ -7,6 +7,193 @@ pub const PenaltyContext = struct {
     chain_with_chain_parent: bool = false,
 };
 
+pub const clash_energy_threshold: f32 = 10;
+pub const rejected_solution_score: f32 = @floatFromInt(99_999_999);
+pub const sketcher_epsilon: f32 = 0.0001;
+pub const maximum_scored_solutions: usize = 10_000;
+
+pub const Evaluator = struct {
+    context: ?*anyopaque = null,
+    scoreFn: *const fn (?*anyopaque, []const u32) anyerror!f32,
+
+    fn score(self: Evaluator, states: []const u32) !f32 {
+        return self.scoreFn(self.context, states);
+    }
+};
+
+pub const SolutionCache = struct {
+    allocator: std.mem.Allocator,
+    state_count: usize,
+    max_solutions: usize,
+    evaluator: Evaluator,
+    states: std.ArrayList(u32) = .empty,
+    scores: std.ArrayList(f32) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, state_count: usize, precision: f32, evaluator: Evaluator) core.errors.Error!SolutionCache {
+        if (!std.math.isFinite(precision) or precision <= 0) return error.InvalidOption;
+        const scaled = @as(f64, maximum_scored_solutions) * @as(f64, precision);
+        if (scaled > @as(f64, @floatFromInt(std.math.maxInt(usize)))) return error.TooManyItems;
+        return .{
+            .allocator = allocator,
+            .state_count = state_count,
+            .max_solutions = @intFromFloat(scaled),
+            .evaluator = evaluator,
+        };
+    }
+
+    pub fn deinit(self: *SolutionCache) void {
+        self.scores.deinit(self.allocator);
+        self.states.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn count(self: SolutionCache) usize {
+        return self.scores.items.len;
+    }
+
+    pub fn score(self: *SolutionCache, candidate: []const u32) !f32 {
+        if (candidate.len != self.state_count) return error.InvalidMapping;
+        for (0..self.count()) |index| {
+            if (std.mem.eql(u32, self.solution(index), candidate)) return self.scores.items[index];
+        }
+        // Preserve upstream's strict `>` guard: one entry beyond the scaled
+        // nominal maximum is accepted before later unseen states are rejected.
+        if (self.count() > self.max_solutions) return rejected_solution_score;
+        const result = try self.evaluator.score(candidate);
+        try self.states.ensureUnusedCapacity(self.allocator, candidate.len);
+        try self.scores.ensureUnusedCapacity(self.allocator, 1);
+        self.states.appendSliceAssumeCapacity(candidate);
+        self.scores.appendAssumeCapacity(result);
+        return result;
+    }
+
+    pub fn best(self: SolutionCache) core.errors.Error!struct { states: []const u32, score: f32 } {
+        if (self.count() == 0) return error.InvalidMapping;
+        var best_index: usize = 0;
+        for (1..self.count()) |index| {
+            const score_value = self.scores.items[index];
+            if (score_value < self.scores.items[best_index] or
+                (score_value == self.scores.items[best_index] and lexicographicLess(self.solution(index), self.solution(best_index))))
+            {
+                best_index = index;
+            }
+        }
+        return .{ .states = self.solution(best_index), .score = self.scores.items[best_index] };
+    }
+
+    fn solution(self: SolutionCache, index: usize) []const u32 {
+        return self.states.items[index * self.state_count ..][0..self.state_count];
+    }
+};
+
+pub const ExhaustiveResult = struct {
+    score: f32,
+    clean_pose: bool,
+};
+
+pub fn exhaustiveSearch(
+    allocator: std.mem.Allocator,
+    dofs: []core.dof.Dof,
+    selected: []const usize,
+    cache: *SolutionCache,
+    initial_score: f32,
+) !ExhaustiveResult {
+    if (cache.state_count != dofs.len) return error.InvalidMapping;
+    for (selected) |index| if (index >= dofs.len) return error.InvalidMapping;
+    const states = allocator.alloc(u32, dofs.len) catch return error.OutOfMemory;
+    defer allocator.free(states);
+    var context = ExhaustiveContext{
+        .dofs = dofs,
+        .selected = selected,
+        .cache = cache,
+        .states = states,
+        .best_score = initial_score,
+    };
+    try context.visit(0);
+    for (selected) |index| dofs[index].state.restoreOptimal();
+    return .{ .score = context.best_score, .clean_pose = context.best_score < clash_energy_threshold };
+}
+
+const ExhaustiveContext = struct {
+    dofs: []core.dof.Dof,
+    selected: []const usize,
+    cache: *SolutionCache,
+    states: []u32,
+    best_score: f32,
+    abort: bool = false,
+
+    fn visit(self: *ExhaustiveContext, depth: usize) !void {
+        if (self.abort) return;
+        if (depth == self.selected.len) {
+            for (self.dofs, self.states) |dof, *state| state.* = dof.state.current;
+            const result = try self.cache.score(self.states);
+            if (result < clash_energy_threshold) {
+                for (self.selected) |index| self.dofs[index].state.storeOptimal();
+                self.best_score = result;
+                self.abort = true;
+            } else if (result < self.best_score - sketcher_epsilon) {
+                self.best_score = result;
+                for (self.selected) |index| self.dofs[index].state.storeOptimal();
+            }
+            return;
+        }
+        const index = self.selected[depth];
+        const count = self.dofs[index].state.count;
+        for (0..count) |_| {
+            try self.visit(depth + 1);
+            self.dofs[index].state.advance();
+        }
+    }
+};
+
+pub const Tuples = struct {
+    allocator: std.mem.Allocator,
+    width: usize,
+    items: []usize,
+
+    pub fn deinit(self: *Tuples) void {
+        self.allocator.free(self.items);
+        self.* = undefined;
+    }
+
+    pub fn count(self: Tuples) usize {
+        return if (self.width == 0) 0 else self.items.len / self.width;
+    }
+
+    pub fn tuple(self: Tuples, index: usize) []const usize {
+        return self.items[index * self.width ..][0..self.width];
+    }
+};
+
+pub fn buildTuples(allocator: std.mem.Allocator, dof_count: usize, order: usize) core.errors.Error!Tuples {
+    if (order == 0 or order > dof_count) return .{ .allocator = allocator, .width = order, .items = try allocator.alloc(usize, 0) };
+    var output: std.ArrayList(usize) = .empty;
+    defer output.deinit(allocator);
+    const working = allocator.alloc(usize, order) catch return error.OutOfMemory;
+    defer allocator.free(working);
+    try appendTuples(allocator, &output, working, 0, 0, dof_count);
+    return .{ .allocator = allocator, .width = order, .items = output.toOwnedSlice(allocator) catch return error.OutOfMemory };
+}
+
+fn appendTuples(allocator: std.mem.Allocator, output: *std.ArrayList(usize), working: []usize, depth: usize, start: usize, count: usize) core.errors.Error!void {
+    if (depth == working.len) {
+        output.appendSlice(allocator, working) catch return error.OutOfMemory;
+        return;
+    }
+    const remaining = working.len - depth;
+    for (start..count - remaining + 1) |index| {
+        working[depth] = index;
+        try appendTuples(allocator, output, working, depth + 1, index + 1, count);
+    }
+}
+
+fn lexicographicLess(left: []const u32, right: []const u32) bool {
+    for (left, right) |left_value, right_value| {
+        if (left_value != right_value) return left_value < right_value;
+    }
+    return false;
+}
+
 pub fn affectedAtoms(collection: core.dof.Collection, dof: core.dof.Dof) core.errors.Error![]const core.ids.AtomId {
     const start = dof.affected_atoms.start;
     const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
@@ -180,4 +367,79 @@ test "DOF penalties preserve state levels and flip context" {
         .pivot_b = core.ids.AtomId.fromIndex(1),
         .penalty_multiplier = 3,
     } }, 1, 2), 0, .{}));
+}
+
+const ScoreContext = struct {
+    calls: usize = 0,
+};
+
+fn targetScore(raw_context: ?*anyopaque, states: []const u32) !f32 {
+    const context: *ScoreContext = @ptrCast(@alignCast(raw_context.?));
+    context.calls += 1;
+    var score_value: f32 = 0;
+    for (states) |state| score_value += @as(f32, @floatFromInt(1 -| state)) * 20;
+    return score_value;
+}
+
+test "solution cache is deterministic, bounded, and chooses lexicographic ties" {
+    var context = ScoreContext{};
+    var cache = try SolutionCache.init(std.testing.allocator, 2, 1, .{ .context = &context, .scoreFn = targetScore });
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(f32, 40), try cache.score(&.{ 0, 0 }));
+    try std.testing.expectEqual(@as(f32, 40), try cache.score(&.{ 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 1), context.calls);
+    try std.testing.expectEqual(@as(f32, 20), try cache.score(&.{ 1, 0 }));
+    try std.testing.expectEqual(@as(f32, 20), try cache.score(&.{ 0, 1 }));
+    const best = try cache.best();
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, best.states);
+
+    var bounded_context = ScoreContext{};
+    var bounded = try SolutionCache.init(std.testing.allocator, 1, 1, .{ .context = &bounded_context, .scoreFn = targetScore });
+    defer bounded.deinit();
+    bounded.max_solutions = 0;
+    _ = try bounded.score(&.{0});
+    try std.testing.expectEqual(rejected_solution_score, try bounded.score(&.{1}));
+    try std.testing.expectEqual(@as(usize, 1), bounded_context.calls);
+}
+
+test "exhaustive search stores the first clean solution as optimal" {
+    var context = ScoreContext{};
+    var cache = try SolutionCache.init(std.testing.allocator, 2, 1, .{ .context = &context, .scoreFn = targetScore });
+    defer cache.deinit();
+    var dofs = [_]core.dof.Dof{
+        testDof(.{ .flip_fragment = .{} }, 0, 2),
+        testDof(.{ .invert_bond = .{ .pivot = core.ids.AtomId.fromIndex(0), .bound = core.ids.AtomId.fromIndex(1) } }, 0, 2),
+    };
+    dofs[1].id = core.ids.DofId.fromIndex(1);
+    const result = try exhaustiveSearch(std.testing.allocator, &dofs, &.{ 0, 1 }, &cache, 100);
+    try std.testing.expect(result.clean_pose);
+    try std.testing.expectEqual(@as(f32, 0), result.score);
+    try std.testing.expectEqual(@as(u32, 1), dofs[0].state.current);
+    try std.testing.expectEqual(@as(u32, 1), dofs[1].state.current);
+    try std.testing.expectEqual(@as(usize, 4), context.calls);
+}
+
+test "tuple construction retains pinned ascending combination order" {
+    var tuples = try buildTuples(std.testing.allocator, 4, 2);
+    defer tuples.deinit();
+    try std.testing.expectEqual(@as(usize, 6), tuples.count());
+    const expected = [_][2]usize{ .{ 0, 1 }, .{ 0, 2 }, .{ 0, 3 }, .{ 1, 2 }, .{ 1, 3 }, .{ 2, 3 } };
+    for (expected, 0..) |tuple, index| try std.testing.expectEqualSlices(usize, &tuple, tuples.tuple(index));
+}
+
+fn allocateSearchState(allocator: std.mem.Allocator) !void {
+    var context = ScoreContext{};
+    var cache = try SolutionCache.init(allocator, 2, 1, .{ .context = &context, .scoreFn = targetScore });
+    defer cache.deinit();
+    var dofs = [_]core.dof.Dof{
+        testDof(.{ .flip_fragment = .{} }, 0, 2),
+        testDof(.{ .flip_fragment = .{} }, 0, 2),
+    };
+    _ = try exhaustiveSearch(allocator, &dofs, &.{ 0, 1 }, &cache, 100);
+    var tuples = try buildTuples(allocator, 5, 3);
+    defer tuples.deinit();
+}
+
+test "solution bookkeeping and tuple construction clean every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateSearchState, .{});
 }
