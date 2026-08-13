@@ -128,7 +128,13 @@ pub fn run(
             var selected: [2]u32 = undefined;
             var count: usize = 0;
             for (candidates) |candidate| if (candidate) |point| {
-                if (count < selected.len) selected[count] = point;
+                if (count == 0) {
+                    selected[0] = point;
+                } else {
+                    // Upstream repeatedly overwrites p2, so malformed or
+                    // boundary three-crossing cells connect first to last.
+                    selected[1] = point;
+                }
                 count += 1;
             };
             if (count >= 2) try appendEdge(allocator, &edges, selected[0], selected[1]);
@@ -197,15 +203,21 @@ test "marching squares has deterministic point creation and checkerboard topolog
     try std.testing.expectEqualSlices(Contour.Edge, first.edges, second.edges);
     try std.testing.expectEqualSlices(Contour.Edge, &.{
         .{ .start = 1, .end = 0 },
-        .{ .start = 3, .end = 2 },
-        .{ .start = 5, .end = 4 },
+        .{ .start = 3, .end = 0 },
+        .{ .start = 5, .end = 1 },
         .{ .start = 7, .end = 6 },
         .{ .start = 3, .end = 4 },
     }, first.edges);
 
     var ordered = try first.orderedCoordinates(std.testing.allocator);
     defer ordered.deinit();
-    try std.testing.expect(ordered.count() > 0);
+    try std.testing.expectEqual(@as(usize, 4), ordered.count());
+    try std.testing.expectEqualSlices(core.math.Vec2, &.{
+        .{ .x = 10, .y = 10 },
+        .{ .x = 5, .y = 20 },
+        .{ .x = 5, .y = 40 },
+    }, ordered.contour(0));
+    try std.testing.expectEqualSlices(core.math.Vec2, &.{.{ .x = 20, .y = 10 }}, ordered.contour(1));
     var exhausted = try first.orderedCoordinates(std.testing.allocator);
     defer exhausted.deinit();
     try std.testing.expectEqual(@as(usize, 0), exhausted.count());

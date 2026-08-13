@@ -55,6 +55,32 @@ pub const ConstructionOptions = struct {
     bond_in_non_macrocycle_ring: []const bool = &.{},
 };
 
+pub const BendRingContext = union(enum) {
+    non_ring,
+    small_ring: u32,
+    macrocycle_ring,
+};
+
+pub const BendCandidate = struct {
+    atom_a: core.ids.AtomId,
+    atom_b: core.ids.AtomId,
+    initial_rest_degrees: f32 = 120,
+    ring: BendRingContext = .non_ring,
+};
+
+pub const BendGroup = struct {
+    center: core.ids.AtomId,
+    /// Adjacent neighbor pairs in clockwise order.
+    candidates: []const BendCandidate,
+    cross_layout: bool = false,
+    inverted_macrocycle_bond: bool = false,
+};
+
+pub const BendConstructionOptions = struct {
+    even_angles: bool = false,
+    rigid_atoms: []const bool = &.{},
+};
+
 /// Construct the clash-then-stretch prefix of addInteractionsOfMolecule in
 /// upstream insertion order. Bend and E/Z construction depend on ordered ring
 /// context and are appended by their owning layout/macrocycle phases.
@@ -128,6 +154,176 @@ pub fn buildBaseInteractions(
     };
 }
 
+/// Construct bends after topology has supplied clockwise adjacent-neighbor
+/// pairs and ring classification. This keeps optimize independent of topology
+/// while retaining upstream's group-wide target redistribution and ordering.
+pub fn buildBendInteractions(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    groups: []const BendGroup,
+    options: BendConstructionOptions,
+) core.errors.Error!core.interaction.Collection {
+    if (options.rigid_atoms.len != 0 and options.rigid_atoms.len != atoms.len) return error.InvalidMapping;
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+    var bends: std.ArrayList(core.interaction.Bend) = .empty;
+    defer bends.deinit(allocator);
+    var ring_flags: std.ArrayList(bool) = .empty;
+    defer ring_flags.deinit(allocator);
+
+    for (groups) |group| {
+        if (!group.center.isValid() or group.center.index() >= atoms.len) return error.InvalidAtomIndex;
+        bends.clearRetainingCapacity();
+        ring_flags.clearRetainingCapacity();
+        var ring_count: usize = 0;
+        var non_ring_count: usize = 0;
+        var ring_total: f32 = 0;
+
+        for (group.candidates) |candidate| {
+            if (!candidate.atom_a.isValid() or candidate.atom_a.index() >= atoms.len or
+                !candidate.atom_b.isValid() or candidate.atom_b.index() >= atoms.len or
+                candidate.atom_a == group.center or candidate.atom_b == group.center or candidate.atom_a == candidate.atom_b)
+            {
+                return error.InvalidAtomIndex;
+            }
+            if (!std.math.isFinite(candidate.initial_rest_degrees)) return error.InvalidOption;
+            var bend = core.interaction.Bend{
+                .atom_a = candidate.atom_a,
+                .center = group.center,
+                .atom_b = candidate.atom_b,
+                .rest_degrees = candidate.initial_rest_degrees,
+            };
+            const ring_target = switch (candidate.ring) {
+                .non_ring => false,
+                .macrocycle_ring => true,
+                .small_ring => |effective_size| target: {
+                    if (effective_size == 0) return error.InvalidMapping;
+                    bend.is_ring = true;
+                    bend.force_constant *= 100;
+                    bend.rest_degrees = 180 - 360 / @as(f32, @floatFromInt(effective_size));
+                    break :target true;
+                },
+            };
+            if (isRigidBend(options, candidate.atom_a.index()) and
+                isRigidBend(options, group.center.index()) and
+                isRigidBend(options, candidate.atom_b.index()))
+            {
+                bend.rest_degrees = geometry.unsignedAngle(
+                    atoms[candidate.atom_a.index()].coordinates,
+                    atoms[group.center.index()].coordinates,
+                    atoms[candidate.atom_b.index()].coordinates,
+                );
+            }
+            bends.append(allocator, bend) catch return error.OutOfMemory;
+            ring_flags.append(allocator, ring_target) catch return error.OutOfMemory;
+            if (ring_target) {
+                ring_count += 1;
+                ring_total += bend.rest_degrees;
+            } else {
+                non_ring_count += 1;
+            }
+        }
+
+        const inverted = group.inverted_macrocycle_bond and ring_count == 1 and non_ring_count == 2;
+        if (ring_count != 0) {
+            if (inverted) ring_total = 360 - ring_total;
+            for (bends.items, ring_flags.items) |*bend, is_ring_target| {
+                if (!is_ring_target) bend.rest_degrees = (360 - ring_total) / @as(f32, @floatFromInt(non_ring_count));
+            }
+        } else if (non_ring_count == 4) {
+            if (group.cross_layout or options.even_angles) {
+                for (bends.items) |*bend| bend.rest_degrees = 90;
+            } else {
+                var biggest_index: usize = 0;
+                var biggest_angle: f32 = 0;
+                for (bends.items, 0..) |bend, index| {
+                    const angle = geometry.unsignedAngle(
+                        atoms[bend.atom_a.index()].coordinates,
+                        atoms[bend.center.index()].coordinates,
+                        atoms[bend.atom_b.index()].coordinates,
+                    );
+                    if (angle > biggest_angle) {
+                        biggest_angle = angle;
+                        biggest_index = index;
+                    }
+                }
+                bends.items[biggest_index].rest_degrees = 120;
+                bends.items[(biggest_index + 1) % 4].rest_degrees = 90;
+                bends.items[(biggest_index + 2) % 4].rest_degrees = 60;
+                bends.items[(biggest_index + 3) % 4].rest_degrees = 90;
+            }
+        } else if (non_ring_count > 4) {
+            const target = 360 / @as(f32, @floatFromInt(non_ring_count));
+            for (bends.items) |*bend| bend.rest_degrees = target;
+        }
+
+        for (bends.items) |bend| {
+            if (atoms[bend.atom_a.index()].fixed and atoms[bend.center.index()].fixed and atoms[bend.atom_b.index()].fixed) continue;
+            try appendInteraction(allocator, &interactions, .{ .bend = bend });
+        }
+    }
+
+    return .{
+        .allocator = allocator,
+        .items = interactions.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
+}
+
+pub fn buildConstraintInteractions(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+) core.errors.Error!core.interaction.Collection {
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+    for (atoms) |atom| {
+        if (!atom.constrained) continue;
+        try appendInteraction(allocator, &interactions, .{ .constraint = .{
+            .atom = atom.id,
+            .origin = atom.template_coordinates orelse return error.InvalidMapping,
+        } });
+    }
+    return .{
+        .allocator = allocator,
+        .items = interactions.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
+}
+
+/// Materialize E/Z constraints prepared by peptide or macrocycle topology.
+pub fn buildEzInteractions(
+    allocator: std.mem.Allocator,
+    constraints: []const core.interaction.EzConstraint,
+) core.errors.Error!core.interaction.Collection {
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+    for (constraints) |constraint| try appendInteraction(allocator, &interactions, .{ .ez_constraint = constraint });
+    return .{
+        .allocator = allocator,
+        .items = interactions.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
+}
+
+/// Join independently constructed phases and assign final insertion-order IDs.
+pub fn combineInteractions(
+    allocator: std.mem.Allocator,
+    collections: []const []const core.interaction.Interaction,
+) core.errors.Error!core.interaction.Collection {
+    var count: usize = 0;
+    for (collections) |collection| {
+        count = std.math.add(usize, count, collection.len) catch return error.TooManyItems;
+    }
+    if (count > std.math.maxInt(u32)) return error.TooManyItems;
+    const items = allocator.alloc(core.interaction.Interaction, count) catch return error.OutOfMemory;
+    var index: usize = 0;
+    for (collections) |collection| {
+        for (collection) |interaction| {
+            items[index] = interaction;
+            items[index].id = core.ids.InteractionId.fromIndex(@intCast(index));
+            index += 1;
+        }
+    }
+    return .{ .allocator = allocator, .items = items };
+}
+
 fn appendInteraction(
     allocator: std.mem.Allocator,
     interactions: *std.ArrayList(core.interaction.Interaction),
@@ -149,6 +345,10 @@ fn validateBond(bond: model.Bond, atom_count: usize) core.errors.Error!void {
 }
 
 fn isRigid(options: ConstructionOptions, index: usize) bool {
+    return options.rigid_atoms.len != 0 and options.rigid_atoms[index];
+}
+
+fn isRigidBend(options: BendConstructionOptions, index: usize) bool {
     return options.rigid_atoms.len != 0 and options.rigid_atoms[index];
 }
 
@@ -496,6 +696,62 @@ fn baseInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 
 test "base interaction construction preserves clash-stretch order and cleans allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
+}
+
+fn bendInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
+    const atoms = [_]model.Atom{
+        .{ .id = core.ids.AtomId.fromIndex(0), .input_index = 0, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(1), .input_index = 1, .atomic_number = .carbon, .coordinates = .{ .x = 1 } },
+        .{ .id = core.ids.AtomId.fromIndex(2), .input_index = 2, .atomic_number = .carbon, .coordinates = .{ .y = 1 } },
+        .{ .id = core.ids.AtomId.fromIndex(3), .input_index = 3, .atomic_number = .carbon, .coordinates = .{ .x = -1 } },
+    };
+    const candidates = [_]BendCandidate{
+        .{ .atom_a = atoms[1].id, .atom_b = atoms[2].id, .ring = .{ .small_ring = 4 } },
+        .{ .atom_a = atoms[2].id, .atom_b = atoms[3].id },
+        .{ .atom_a = atoms[3].id, .atom_b = atoms[1].id },
+    };
+    var interactions = try buildBendInteractions(allocator, &atoms, &.{.{
+        .center = atoms[0].id,
+        .candidates = &candidates,
+    }}, .{});
+    defer interactions.deinit();
+    try std.testing.expectEqual(@as(usize, 3), interactions.items.len);
+    try std.testing.expectEqual(@as(f32, 100), interactions.items[0].payload.bend.force_constant);
+    try std.testing.expectEqual(@as(f32, 90), interactions.items[0].payload.bend.rest_degrees);
+    try std.testing.expectEqual(@as(f32, 135), interactions.items[1].payload.bend.rest_degrees);
+    try std.testing.expectEqual(@as(f32, 135), interactions.items[2].payload.bend.rest_degrees);
+}
+
+test "bend construction redistributes ring angles and cleans allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, bendInteractionsAndDiscard, .{});
+}
+
+fn remainingInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
+    const atoms = [_]model.Atom{.{
+        .id = core.ids.AtomId.fromIndex(0),
+        .input_index = 0,
+        .atomic_number = .carbon,
+        .constrained = true,
+        .template_coordinates = .{ .x = 2, .y = 3 },
+    }};
+    var constraints = try buildConstraintInteractions(allocator, &atoms);
+    defer constraints.deinit();
+    var ez = try buildEzInteractions(allocator, &.{.{
+        .side_a = core.ids.AtomId.fromIndex(0),
+        .double_a = core.ids.AtomId.fromIndex(1),
+        .double_b = core.ids.AtomId.fromIndex(2),
+        .side_b = core.ids.AtomId.fromIndex(3),
+        .is_z = true,
+    }});
+    defer ez.deinit();
+    var combined = try combineInteractions(allocator, &.{ constraints.items, ez.items });
+    defer combined.deinit();
+    try std.testing.expectEqual(@as(usize, 2), combined.items.len);
+    try std.testing.expectEqual(core.ids.InteractionId.fromIndex(1), combined.items[1].id);
+}
+
+test "constraint and E/Z construction combine with complete allocation cleanup" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, remainingInteractionsAndDiscard, .{});
 }
 
 test "force application caps movement, clears movable force, and retains fixed force" {
