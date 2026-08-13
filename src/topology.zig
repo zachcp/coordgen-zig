@@ -4,6 +4,8 @@ const model = @import("model");
 
 pub const canonical = @import("topology/canonical.zig");
 pub const prepare = @import("topology/prepare.zig");
+pub const rings = @import("topology/rings.zig");
+pub const stereo = @import("topology/stereo.zig");
 
 pub const AtomId = core.ids.AtomId;
 pub const BondId = core.ids.BondId;
@@ -12,6 +14,8 @@ pub const MoleculeId = core.ids.MoleculeId;
 test {
     _ = canonical;
     _ = prepare;
+    _ = rings;
+    _ = stereo;
 }
 
 /// Allocator-owned graph indexing after upstream's skip/zero-order/hidden
@@ -246,13 +250,13 @@ pub fn prepareInput(allocator: std.mem.Allocator, input: anytype) core.errors.Er
     errdefer normalized.deinit();
     var graph = try Graph.init(allocator, normalized.working.atoms, normalized.working.bonds);
     errdefer graph.deinit();
-    var rings = try RingMembership.init(allocator, graph, normalized.working.bonds);
-    errdefer rings.deinit();
+    var ring_membership = try RingMembership.init(allocator, graph, normalized.working.bonds);
+    errdefer ring_membership.deinit();
     const component_morgan_scores = try componentMorganScores(allocator, graph, normalized.working.bonds);
     return .{
         .working = normalized.working,
         .graph = graph,
-        .rings = rings,
+        .rings = ring_membership,
         .component_morgan_scores = component_morgan_scores,
     };
 }
@@ -348,21 +352,21 @@ pub const RingMembership = struct {
             ring.atom_count = @intCast(ring_atom_list.items.len - ring.atom_start);
         }
 
-        const rings = ring_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
-        errdefer allocator.free(rings);
+        const ring_records = ring_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer allocator.free(ring_records);
         const ring_bonds = ring_bond_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
         errdefer allocator.free(ring_bonds);
         const ring_atoms = ring_atom_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
         errdefer allocator.free(ring_atoms);
-        const atom_membership = try buildMembership(allocator, graph.component_of.len, rings, ring_atoms, true);
+        const atom_membership = try buildMembership(allocator, graph.component_of.len, ring_records, ring_atoms, true);
         errdefer {
             allocator.free(atom_membership.ids);
             allocator.free(atom_membership.offsets);
         }
-        const bond_membership = try buildMembership(allocator, bonds.len, rings, ring_bonds, false);
+        const bond_membership = try buildMembership(allocator, bonds.len, ring_records, ring_bonds, false);
         return .{
             .allocator = allocator,
-            .rings = rings,
+            .rings = ring_records,
             .ring_atoms = ring_atoms,
             .ring_bonds = ring_bonds,
             .atom_ring_offsets = atom_membership.offsets,
@@ -407,14 +411,14 @@ const Membership = struct { offsets: []u32, ids: []core.ids.RingId };
 fn buildMembership(
     allocator: std.mem.Allocator,
     item_count: usize,
-    rings: []const model.Ring,
+    ring_records: []const model.Ring,
     members: anytype,
     comptime atoms: bool,
 ) core.errors.Error!Membership {
     const offsets = allocator.alloc(u32, item_count + 1) catch return error.OutOfMemory;
     errdefer allocator.free(offsets);
     @memset(offsets, 0);
-    for (rings) |ring| {
+    for (ring_records) |ring| {
         const start = if (atoms) ring.atom_start else ring.bond_start;
         const count = if (atoms) ring.atom_count else ring.bond_count;
         for (members[start..][0..count]) |member| offsets[member.index() + 1] += 1;
@@ -424,7 +428,7 @@ fn buildMembership(
     errdefer allocator.free(ids);
     const cursors = allocator.dupe(u32, offsets[0..item_count]) catch return error.OutOfMemory;
     defer allocator.free(cursors);
-    for (rings) |ring| {
+    for (ring_records) |ring| {
         const start = if (atoms) ring.atom_start else ring.bond_start;
         const count = if (atoms) ring.atom_count else ring.bond_count;
         for (members[start..][0..count]) |member| {
@@ -435,8 +439,8 @@ fn buildMembership(
     return .{ .offsets = offsets, .ids = ids };
 }
 
-fn containsRing(rings: []const model.Ring, ring_bonds: []const BondId, candidate: []const BondId) bool {
-    for (rings) |ring| {
+fn containsRing(ring_records: []const model.Ring, ring_bonds: []const BondId, candidate: []const BondId) bool {
+    for (ring_records) |ring| {
         if (ring.bond_count != candidate.len) continue;
         const existing = ring_bonds[ring.bond_start..][0..ring.bond_count];
         var same = true;
@@ -733,12 +737,94 @@ test "ring perception matches pinned oracle cycle and fused probes" {
     try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(2), AtomId.fromIndex(4) }, fused.rings.atoms(core.ids.RingId.fromIndex(0)));
     try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(3), AtomId.fromIndex(5) }, fused.rings.atoms(core.ids.RingId.fromIndex(1)));
     try std.testing.expectEqual(@as(usize, 2), fused.rings.atomRings(AtomId.fromIndex(0)).len);
+    var fusion = try rings.Analysis.init(std.testing.allocator, fused.rings, fused.working.atoms, fused.working.bonds);
+    defer fusion.deinit();
+    try std.testing.expectEqual(@as(usize, 1), fusion.fusedWith(core.ids.RingId.fromIndex(0)).len);
+    try std.testing.expectEqualSlices(
+        AtomId,
+        &.{ AtomId.fromIndex(0), AtomId.fromIndex(1) },
+        fusion.fusionAtoms(fusion.fusedWith(core.ids.RingId.fromIndex(0))[0]),
+    );
+    try std.testing.expect(!fusion.flags[0].aromatic);
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         prepareAndDiscard,
         .{ &fused_atoms, &fused_bonds },
     );
+}
+
+test "benzene ring chemistry matches pinned upstream heuristics" {
+    const atoms = [_]prepare.TestAtom{ .{}, .{}, .{}, .{}, .{}, .{} };
+    const bonds = [_]prepare.TestBond{
+        .{ .start = 0, .end = 1, .order = .double },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3, .order = .double },
+        .{ .start = 3, .end = 4 },
+        .{ .start = 4, .end = 5, .order = .double },
+        .{ .start = 5, .end = 0 },
+    };
+    var prepared = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &atoms, .bonds = &bonds });
+    defer prepared.deinit();
+    var analysis = try rings.Analysis.init(std.testing.allocator, prepared.rings, prepared.working.atoms, prepared.working.bonds);
+    defer analysis.deinit();
+    try std.testing.expectEqual(@as(usize, 1), analysis.flags.len);
+    try std.testing.expect(analysis.flags[0].benzene);
+    try std.testing.expect(analysis.flags[0].aromatic);
+    try std.testing.expect(!analysis.flags[0].macrocycle);
+}
+
+test "CIP branch order and relative double-bond stereo produce absolute Z/E" {
+    const atoms = [_]prepare.TestAtom{
+        .{},
+        .{},
+        .{ .atomic_number = .oxygen },
+        .{},
+        .{ .atomic_number = .nitrogen },
+        .{},
+    };
+    const bonds = [_]prepare.TestBond{
+        .{ .start = 0, .end = 1, .order = .double, .stereo = .{ .value = .cis, .atom_a = 2, .atom_b = 4 } },
+        .{ .start = 0, .end = 2 },
+        .{ .start = 0, .end = 3 },
+        .{ .start = 1, .end = 4 },
+        .{ .start = 1, .end = 5 },
+    };
+    var prepared = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &atoms, .bonds = &bonds });
+    defer prepared.deinit();
+    var double_bond: BondId = .invalid;
+    for (prepared.working.bonds) |bond| if (bond.input_index == 0) {
+        double_bond = bond.id;
+        break;
+    };
+    try std.testing.expect(double_bond.isValid());
+    const bond = prepared.working.bonds[double_bond.index()];
+    const start_neighbor = (try stereo.firstNeighbor(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        bond.start,
+        bond.end,
+    )).?;
+    const end_neighbor = (try stereo.firstNeighbor(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        bond.end,
+        bond.start,
+    )).?;
+    try std.testing.expectEqual(prepared.working.order.input_to_internal[2], start_neighbor.index());
+    try std.testing.expectEqual(prepared.working.order.input_to_internal[4], end_neighbor.index());
+    try std.testing.expectEqual(.z, try stereo.absoluteBondStereo(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        double_bond,
+    ));
 }
 
 test "adjacency and component invariants hold across path and cycle families" {
