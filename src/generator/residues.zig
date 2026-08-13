@@ -1,6 +1,142 @@
 const std = @import("std");
 const core = @import("core");
 const model = @import("model");
+const optimize = @import("optimize");
+
+const crown_grid_interval: f32 = 20;
+const first_crown_distance: f32 = 60;
+const crown_spacing: f32 = 60;
+const pocket_border_allowance: f32 = 10;
+
+/// Build upstream's `crown_index`-th ordered contour around the ligand. The
+/// returned largest contour is allocator-owned. Pocket-distance metadata is
+/// not part of the stable Zig input yet, so callers supply one value per atom;
+/// zeroes reproduce ordinary ligand behavior.
+pub fn shapeAroundLigand(
+    allocator: std.mem.Allocator,
+    atoms: []const core.math.Vec2,
+    bonds: []const LigandBond,
+    pocket_distances: []const f32,
+    crown_index: u32,
+) core.errors.Error![]core.math.Vec2 {
+    if (atoms.len == 0 or atoms.len != pocket_distances.len) return error.InvalidMapping;
+
+    var min = atoms[0];
+    var max = atoms[0];
+    var max_pocket_distance: f32 = 0;
+    for (atoms, pocket_distances) |atom, pocket_distance| {
+        if (!atom.isFinite() or !std.math.isFinite(pocket_distance) or pocket_distance < 0) {
+            return error.InvalidCoordinate;
+        }
+        min.x = @min(min.x, atom.x);
+        min.y = @min(min.y, atom.y);
+        max.x = @max(max.x, atom.x);
+        max.y = @max(max.y, atom.y);
+        max_pocket_distance = @max(max_pocket_distance, pocket_distance);
+    }
+    for (bonds) |bond| {
+        if (bond.start >= atoms.len or bond.end >= atoms.len) return error.InvalidMapping;
+    }
+
+    const border = crown_spacing * @as(f32, @floatFromInt(crown_index)) + first_crown_distance;
+    if (!std.math.isFinite(border)) return error.TooManyItems;
+    const padding = border + max_pocket_distance + pocket_border_allowance;
+    const origin = core.math.Vec2{ .x = min.x - padding, .y = min.y - padding };
+    const upper = core.math.Vec2{ .x = max.x + padding, .y = max.y + padding };
+    if (!origin.isFinite() or !upper.isFinite()) return error.InvalidCoordinate;
+
+    const width = try gridDimension(upper.x - origin.x);
+    const height = try gridDimension(upper.y - origin.y);
+    const value_count = std.math.mul(usize, width, height) catch return error.TooManyItems;
+    const values = allocator.alloc(f32, value_count) catch return error.OutOfMemory;
+    defer allocator.free(values);
+
+    for (0..height) |y| {
+        for (0..width) |x| {
+            const point = core.math.Vec2{
+                .x = origin.x + @as(f32, @floatFromInt(x)) * crown_grid_interval,
+                .y = origin.y + @as(f32, @floatFromInt(y)) * crown_grid_interval,
+            };
+            var shortest = std.math.inf(f32);
+            for (atoms, pocket_distances) |atom, pocket_distance| {
+                shortest = @min(shortest, distance(atom, point) - pocket_distance - border);
+            }
+            for (bonds) |bond| {
+                const segment = pointSegmentDistance(point, atoms[bond.start], atoms[bond.end]);
+                const interpolated_pocket_distance = pocket_distances[bond.start] * (1 - segment.parameter) +
+                    pocket_distances[bond.end] * segment.parameter;
+                shortest = @min(shortest, segment.distance - interpolated_pocket_distance - border);
+            }
+            values[x + y * width] = shortest;
+        }
+    }
+
+    var contour = try optimize.marching_squares.run(
+        allocator,
+        values,
+        width,
+        height,
+        origin,
+        .{ .x = crown_grid_interval, .y = crown_grid_interval },
+        0,
+    );
+    defer contour.deinit();
+    var ordered = try contour.orderedCoordinates(allocator);
+    defer ordered.deinit();
+    if (ordered.count() == 0) return allocator.alloc(core.math.Vec2, 0) catch return error.OutOfMemory;
+
+    var largest_index: usize = 0;
+    for (1..ordered.count()) |index| {
+        if (ordered.contour(index).len > ordered.contour(largest_index).len) largest_index = index;
+    }
+    return allocator.dupe(core.math.Vec2, ordered.contour(largest_index)) catch return error.OutOfMemory;
+}
+
+pub const LigandBond = struct {
+    start: u32,
+    end: u32,
+};
+
+fn gridDimension(extent: f32) core.errors.Error!usize {
+    if (!std.math.isFinite(extent) or extent <= 0) return error.InvalidCoordinate;
+    const cells = @floor(extent / crown_grid_interval);
+    if (cells > @as(f32, @floatFromInt(std.math.maxInt(usize) - 2))) return error.TooManyItems;
+    return @as(usize, @intFromFloat(cells)) + 2;
+}
+
+fn distance(first: core.math.Vec2, second: core.math.Vec2) f32 {
+    return @sqrt(distanceSquared(first, second));
+}
+
+fn distanceSquared(first: core.math.Vec2, second: core.math.Vec2) f32 {
+    const dx = second.x - first.x;
+    const dy = second.y - first.y;
+    return dx * dx + dy * dy;
+}
+
+const SegmentDistance = struct { distance: f32, parameter: f32 };
+
+fn pointSegmentDistance(point: core.math.Vec2, start: core.math.Vec2, end: core.math.Vec2) SegmentDistance {
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    const length_squared = dx * dx + dy * dy;
+    const parameter = if (length_squared == 0)
+        @as(f32, 0)
+    else
+        std.math.clamp(((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared, 0, 1);
+    const nearest = core.math.Vec2{ .x = start.x + dx * parameter, .y = start.y + dy * parameter };
+    return .{ .distance = distance(point, nearest), .parameter = parameter };
+}
+
+fn shapeAndDiscard(
+    allocator: std.mem.Allocator,
+    atoms: []const core.math.Vec2,
+    bonds: []const LigandBond,
+    pockets: []const f32,
+) !void {
+    const shape = try shapeAroundLigand(allocator, atoms, bonds, pockets, 0);
+    allocator.free(shape);
+}
 
 /// Allocator-owned translation of upstream's `groupResiduesInSSEs` result.
 /// Groups and members retain chain-lexicographic/residue-number order.
@@ -121,4 +257,31 @@ test "secondary structures follow chain order, residue gaps, and blank-chain spl
     try std.testing.expectEqualSlices(core.ids.ResidueId, &.{core.ids.ResidueId.fromIndex(4)}, groups.members(3));
     try std.testing.expectEqualSlices(core.ids.ResidueId, &.{core.ids.ResidueId.fromIndex(1)}, groups.members(4));
     try std.testing.expectEqualSlices(core.ids.ResidueId, &.{core.ids.ResidueId.fromIndex(0)}, groups.members(5));
+}
+
+test "ligand crowns are deterministic ordered contours at successive distances" {
+    const atoms = [_]core.math.Vec2{.{}};
+    const pockets = [_]f32{0};
+    const first = try shapeAroundLigand(std.testing.allocator, &atoms, &.{}, &pockets, 0);
+    defer std.testing.allocator.free(first);
+    const repeated = try shapeAroundLigand(std.testing.allocator, &atoms, &.{}, &pockets, 0);
+    defer std.testing.allocator.free(repeated);
+    const second = try shapeAroundLigand(std.testing.allocator, &atoms, &.{}, &pockets, 1);
+    defer std.testing.allocator.free(second);
+
+    try std.testing.expect(first.len > 8);
+    try std.testing.expectEqualSlices(core.math.Vec2, first, repeated);
+    for (first) |point| try std.testing.expectApproxEqAbs(@as(f32, 60), distance(.{}, point), 1);
+    for (second) |point| try std.testing.expectApproxEqAbs(@as(f32, 120), distance(.{}, point), 1);
+}
+
+test "ligand crowns include bonds and clean allocation failures" {
+    const atoms = [_]core.math.Vec2{ .{ .x = -50 }, .{ .x = 50 } };
+    const bonds = [_]LigandBond{.{ .start = 0, .end = 1 }};
+    const pockets = [_]f32{ 0, 0 };
+    const shape = try shapeAroundLigand(std.testing.allocator, &atoms, &bonds, &pockets, 0);
+    defer std.testing.allocator.free(shape);
+    try std.testing.expect(shape.len > 8);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, shapeAndDiscard, .{ &atoms, &bonds, &pockets });
+    try std.testing.expectError(error.InvalidMapping, shapeAroundLigand(std.testing.allocator, &atoms, &.{.{ .start = 0, .end = 2 }}, &pockets, 0));
 }
