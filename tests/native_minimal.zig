@@ -262,7 +262,33 @@ test "minimal native generation uses general placement for a small proximity pai
     for (result.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
     const dx = result.coordinates[1].x - result.coordinates[2].x;
     const dy = result.coordinates[1].y - result.coordinates[2].y;
-    try std.testing.expect(@sqrt(dx * dx + dy * dy) >= api.bond_length);
+    try std.testing.expect(@sqrt(dx * dx + dy * dy) >= api.bond_length - 0.001);
+}
+
+test "minimal native generation lays out acyclic and cyclic proximity meta graphs" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{} };
+    const path_bonds = [_]api.BondInput{
+        .{ .start = 0, .end = 1, .order = .zero },
+        .{ .start = 1, .end = 2, .order = .zero },
+    };
+    var path = try generate(std.testing.allocator, .{ .atoms = &atoms, .bonds = &path_bonds });
+    defer path.deinit();
+    for (path.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.expect(!std.meta.eql(path.coordinates[0], path.coordinates[2]));
+
+    const cycle_bonds = [_]api.BondInput{
+        path_bonds[0],
+        path_bonds[1],
+        .{ .start = 2, .end = 0, .order = .zero },
+    };
+    var cycle = try generate(std.testing.allocator, .{ .atoms = &atoms, .bonds = &cycle_bonds });
+    defer cycle.deinit();
+    for (cycle.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    for (cycle_bonds) |bond| {
+        const dx = cycle.coordinates[bond.start].x - cycle.coordinates[bond.end].x;
+        const dy = cycle.coordinates[bond.start].y - cycle.coordinates[bond.end].y;
+        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(dx * dx + dy * dy), 0.001);
+    }
 }
 
 test "minimal native validation rejects malformed input before generation" {

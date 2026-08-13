@@ -3,6 +3,7 @@ const core = @import("core");
 const model = @import("model");
 const geometry = @import("geometry");
 const topology = @import("topology");
+const layout = @import("layout");
 
 const Vec2 = core.math.Vec2;
 const Bounds = struct { min: Vec2, max: Vec2 };
@@ -359,12 +360,9 @@ pub fn arrangeProximityComponents(
     }
     var related_count: usize = 0;
     for (related) |value| related_count += @intFromBool(value);
-    if (related_count != graph.component_count or unique_edges >= related_count) return false;
-    if (graph.componentMembers(central).len < 8) {
-        return if (related_count == 2 and unique_edges == 1)
-            try arrangeGeneralProximityPair(atoms, graph, rings, relations)
-        else
-            false;
+    if (related_count != graph.component_count) return false;
+    if (unique_edges >= related_count or graph.componentMembers(central).len < 8) {
+        return try arrangeGeneralProximityComponents(allocator, atoms, graph, rings, relations, unique_edges);
     }
 
     const placed = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
@@ -403,32 +401,22 @@ pub fn arrangeProximityComponents(
     return true;
 }
 
-/// General meta-graph placement for the exact two-component case. Upstream's
-/// recursively generated two-atom meta molecule is horizontal with centers
-/// at (0,0) and (50,0); each real component is aligned to its incident site,
-/// translated to that template, then expanded until 25-unit clashes clear.
-fn arrangeGeneralProximityPair(
+/// General meta-graph placement. Upstream recursively lays out one carbon-like
+/// meta atom per component, aligns each real component's incident sites to its
+/// meta neighbors, then expands that template until 25-unit clashes clear.
+fn arrangeGeneralProximityComponents(
+    allocator: std.mem.Allocator,
     atoms: []model.Atom,
     graph: topology.Graph,
     rings: topology.RingMembership,
     relations: []const ProximityRelation,
+    unique_edge_count: usize,
 ) core.errors.Error!bool {
-    if (graph.component_count != 2) return false;
-    const templates = [_]Vec2{ .{}, .{ .x = core.math.bond_length } };
-    for (0..2) |raw_component| {
+    const templates = (try generateMetaCoordinates(allocator, graph, relations, unique_edge_count)) orelse return false;
+    defer allocator.free(templates);
+    for (0..graph.component_count) |raw_component| {
         const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
-        const site = try proximitySite(atoms, graph, rings, relations, component);
-        if (site.count == 0) return false;
-        const other_template = templates[1 - raw_component];
-        const direction = geometry.subtract(templates[raw_component], other_template);
-        const radians_per_degree: f32 = -std.math.pi / 180.0;
-        const angle = geometry.signedAngle(geometry.scale(site.addition, -1), .{}, direction) * radians_per_degree;
-        const sine = std.math.sin(angle);
-        const cosine = std.math.cos(angle);
-        for (graph.componentMembers(component)) |atom| {
-            const relative = geometry.subtract(atoms[atom.index()].coordinates, site.center);
-            atoms[atom.index()].coordinates = geometry.add(site.center, geometry.rotate(relative, sine, cosine));
-        }
+        if (!try rotateGeneralComponent(allocator, atoms, graph, rings, relations, templates, component)) return false;
     }
 
     var counter: u32 = 1;
@@ -436,7 +424,7 @@ fn arrangeGeneralProximityPair(
     while (true) {
         clever = !clever;
         if (!clever) counter += 1;
-        for (0..2) |raw_component| {
+        for (0..graph.component_count) |raw_component| {
             const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
             const site = try proximitySite(atoms, graph, rings, relations, component);
             const target = geometry.scale(templates[raw_component], @floatFromInt(counter));
@@ -451,11 +439,147 @@ fn arrangeGeneralProximityPair(
     return true;
 }
 
+fn generateMetaCoordinates(
+    allocator: std.mem.Allocator,
+    graph: topology.Graph,
+    relations: []const ProximityRelation,
+    unique_edge_count: usize,
+) core.errors.Error!?[]Vec2 {
+    const meta_atoms = allocator.alloc(model.Atom, graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(meta_atoms);
+    for (meta_atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    const meta_bonds = allocator.alloc(model.Bond, unique_edge_count) catch return error.OutOfMemory;
+    defer allocator.free(meta_bonds);
+    var bond_count: usize = 0;
+    for (relations) |relation| {
+        const start = graph.component(relation.start) orelse return error.InvalidMapping;
+        const end = graph.component(relation.end) orelse return error.InvalidMapping;
+        if (start == end) continue;
+        var duplicate = false;
+        for (meta_bonds[0..bond_count]) |bond| {
+            duplicate = duplicate or (bond.start == core.ids.AtomId.fromIndex(start.index()) and bond.end == core.ids.AtomId.fromIndex(end.index())) or
+                (bond.start == core.ids.AtomId.fromIndex(end.index()) and bond.end == core.ids.AtomId.fromIndex(start.index()));
+        }
+        if (duplicate) continue;
+        meta_bonds[bond_count] = .{
+            .id = core.ids.BondId.fromIndex(@intCast(bond_count)),
+            .input_index = @intCast(bond_count),
+            .start = core.ids.AtomId.fromIndex(start.index()),
+            .end = core.ids.AtomId.fromIndex(end.index()),
+            .input_order = .single,
+            .effective_order = .single,
+        };
+        bond_count += 1;
+    }
+    if (bond_count != unique_edge_count) return error.InvalidMapping;
+
+    var meta_graph = try topology.Graph.init(allocator, meta_atoms, meta_bonds);
+    defer meta_graph.deinit();
+    if (meta_graph.component_count != 1) return null;
+    var meta_rings = try topology.RingMembership.init(allocator, meta_graph, meta_bonds);
+    defer meta_rings.deinit();
+    var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
+    defer fragmentation.deinit();
+    try layout.initializeCoordinates(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, fragmentation);
+    try orientAcyclicComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
+
+    const coordinates = allocator.alloc(Vec2, meta_atoms.len) catch return error.OutOfMemory;
+    for (meta_atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+    return coordinates;
+}
+
+fn rotateGeneralComponent(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+    templates: []const Vec2,
+    component: core.ids.MoleculeId,
+) core.errors.Error!bool {
+    const members = graph.componentMembers(component);
+    if (members.len < 2) return true;
+    const neighbors = allocator.alloc(core.ids.MoleculeId, graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(neighbors);
+    var neighbor_count: usize = 0;
+    for (relations) |relation| {
+        const local = localEndpoint(graph, relation, component) orelse continue;
+        const other_atom = if (local == relation.start) relation.end else relation.start;
+        const other = graph.component(other_atom) orelse return error.InvalidMapping;
+        if (other == component or std.mem.indexOfScalar(core.ids.MoleculeId, neighbors[0..neighbor_count], other) != null) continue;
+        neighbors[neighbor_count] = other;
+        neighbor_count += 1;
+    }
+    if (neighbor_count == 0) return false;
+    if (neighbor_count == 1) {
+        const site = try proximitySiteToward(atoms, graph, rings, relations, component, neighbors[0]);
+        if (site.count == 0) return false;
+        const direction = geometry.subtract(templates[component.index()], templates[neighbors[0].index()]);
+        const angle = geometry.signedAngle(geometry.scale(site.addition, -1), .{}, direction) * (-std.math.pi / 180.0);
+        const sine = std.math.sin(angle);
+        const cosine = std.math.cos(angle);
+        for (members) |atom| {
+            const relative = geometry.subtract(atoms[atom.index()].coordinates, site.center);
+            atoms[atom.index()].coordinates = geometry.add(site.center, geometry.rotate(relative, sine, cosine));
+        }
+        return true;
+    }
+
+    const template_vectors = allocator.alloc(Vec2, neighbor_count) catch return error.OutOfMemory;
+    defer allocator.free(template_vectors);
+    const addition_vectors = allocator.alloc(Vec2, neighbor_count) catch return error.OutOfMemory;
+    defer allocator.free(addition_vectors);
+    for (neighbors[0..neighbor_count], template_vectors, addition_vectors) |neighbor, *template, *addition| {
+        template.* = geometry.subtract(templates[neighbor.index()], templates[component.index()]);
+        const site = try proximitySiteToward(atoms, graph, rings, relations, component, neighbor);
+        if (site.count == 0) return false;
+        addition.* = site.addition;
+    }
+    const matrix = try layout.templates.alignmentMatrix(template_vectors, addition_vectors);
+    var center: Vec2 = .{};
+    for (members) |atom| center = geometry.add(center, atoms[atom.index()].coordinates);
+    center = geometry.scale(center, 1 / @as(f32, @floatFromInt(members.len)));
+    for (members) |atom| {
+        const relative = geometry.subtract(atoms[atom.index()].coordinates, center);
+        atoms[atom.index()].coordinates = geometry.add(center, .{
+            .x = relative.x * matrix[0] + relative.y * matrix[1],
+            .y = relative.x * matrix[2] + relative.y * matrix[3],
+        });
+    }
+    return true;
+}
+
 const ProximitySite = struct {
     center: Vec2,
     addition: Vec2,
     count: u32,
 };
+
+fn proximitySiteToward(
+    atoms: []const model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+    component: core.ids.MoleculeId,
+    neighbor: core.ids.MoleculeId,
+) core.errors.Error!ProximitySite {
+    var result = ProximitySite{ .center = .{}, .addition = .{}, .count = 0 };
+    for (relations) |relation| {
+        const local = localEndpoint(graph, relation, component) orelse continue;
+        const other = if (local == relation.start) relation.end else relation.start;
+        if (graph.component(other) != neighbor) continue;
+        result.center = geometry.add(result.center, atoms[local.index()].coordinates);
+        result.addition = geometry.add(result.addition, singleAdditionVector(atoms, graph, rings, local));
+        result.count += 1;
+    }
+    if (result.count != 0) result.center = geometry.scale(result.center, 1 / @as(f32, @floatFromInt(result.count)));
+    result.addition = geometry.normalize(result.addition);
+    return result;
+}
 
 fn proximitySite(
     atoms: []const model.Atom,
@@ -486,10 +610,10 @@ fn replaceTerminalSingletons(
     relations: []const ProximityRelation,
     counter: u32,
 ) core.errors.Error!void {
-    for (0..2) |raw_component| {
+    for (0..graph.component_count) |raw_component| {
         const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
         const members = graph.componentMembers(component);
-        if (members.len != 1) continue;
+        if (members.len != 1 or try componentNeighborCount(graph, relations, component) != 1) continue;
         var coordinates: Vec2 = .{};
         var count: u32 = 0;
         var fallback: ?Vec2 = null;
@@ -511,16 +635,41 @@ fn replaceTerminalSingletons(
     }
 }
 
+fn componentNeighborCount(
+    graph: topology.Graph,
+    relations: []const ProximityRelation,
+    component: core.ids.MoleculeId,
+) core.errors.Error!usize {
+    var count: usize = 0;
+    for (0..graph.component_count) |raw_other| {
+        const other = core.ids.MoleculeId.fromIndex(@intCast(raw_other));
+        if (other == component) continue;
+        for (relations) |relation| {
+            const start = graph.component(relation.start) orelse return error.InvalidMapping;
+            const end = graph.component(relation.end) orelse return error.InvalidMapping;
+            if ((start == component and end == other) or (end == component and start == other)) {
+                count += 1;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
 fn componentsClash(atoms: []const model.Atom, graph: topology.Graph, distance: f32) bool {
-    const first = graph.componentMembers(core.ids.MoleculeId.fromIndex(0));
-    const second = graph.componentMembers(core.ids.MoleculeId.fromIndex(1));
     const squared_distance = distance * distance;
-    for (first) |first_atom| {
-        for (second) |second_atom| {
-            if (geometry.squaredLength(geometry.subtract(
-                atoms[first_atom.index()].coordinates,
-                atoms[second_atom.index()].coordinates,
-            )) < squared_distance) return true;
+    for (0..graph.component_count) |raw_first| {
+        const first = graph.componentMembers(core.ids.MoleculeId.fromIndex(@intCast(raw_first)));
+        for (raw_first + 1..graph.component_count) |raw_second| {
+            const second = graph.componentMembers(core.ids.MoleculeId.fromIndex(@intCast(raw_second)));
+            for (first) |first_atom| {
+                for (second) |second_atom| {
+                    if (geometry.squaredLength(geometry.subtract(
+                        atoms[first_atom.index()].coordinates,
+                        atoms[second_atom.index()].coordinates,
+                    )) < squared_distance) return true;
+                }
+            }
         }
     }
     return false;
