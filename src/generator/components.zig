@@ -17,17 +17,47 @@ pub fn collectProximityRelations(
     allocator: std.mem.Allocator,
     working: model.WorkingGraph,
 ) core.errors.Error![]ProximityRelation {
-    const output = allocator.alloc(ProximityRelation, working.proximity_relations.len) catch return error.OutOfMemory;
-    errdefer allocator.free(output);
-    for (working.proximity_relations, output) |relation, *destination| {
-        destination.* = try proximityEndpoints(
+    var count: usize = 0;
+    for (working.proximity_relations) |relation| {
+        const endpoints = try proximityEndpoints(
             working.bonds,
             working.extra_bonds,
             working.residue_interactions,
             relation,
         );
+        count += @intFromBool(!isResidueRelation(working.residues, relation, endpoints));
+    }
+    const output = allocator.alloc(ProximityRelation, count) catch return error.OutOfMemory;
+    errdefer allocator.free(output);
+    var output_index: usize = 0;
+    for (working.proximity_relations) |relation| {
+        const endpoints = try proximityEndpoints(
+            working.bonds,
+            working.extra_bonds,
+            working.residue_interactions,
+            relation,
+        );
+        if (isResidueRelation(working.residues, relation, endpoints)) continue;
+        output[output_index] = endpoints;
+        output_index += 1;
     }
     return output;
+}
+
+/// Upstream keeps residue interactions out of molecule-proximity placement
+/// whenever either endpoint is a residue; the dedicated residue phase owns
+/// them. Ordinary zero-order bonds remain proximity relations even if callers
+/// also attach residue metadata to an endpoint.
+fn isResidueRelation(
+    residues: []const model.Residue,
+    relation: model.ProximityRelation,
+    endpoints: ProximityRelation,
+) bool {
+    if (relation != .residue_interaction) return false;
+    for (residues) |residue| {
+        if (residue.atom == endpoints.start or residue.atom == endpoints.end) return true;
+    }
+    return false;
 }
 
 fn proximityEndpoints(
@@ -971,6 +1001,23 @@ test "proximity center uses relation count then size with first-wins ties" {
         .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(0) },
     };
     try std.testing.expectEqual(core.ids.MoleculeId.fromIndex(1), try selectProximityCenter(graph, &more_relations));
+}
+
+test "residue interactions are reserved for residue placement" {
+    const residues = [_]model.Residue{.{
+        .id = core.ids.ResidueId.fromIndex(0),
+        .atom = core.ids.AtomId.fromIndex(2),
+        .chain_start = 0,
+        .chain_len = 1,
+        .residue_number = 7,
+    }};
+    const endpoints = ProximityRelation{
+        .start = core.ids.AtomId.fromIndex(1),
+        .end = core.ids.AtomId.fromIndex(2),
+    };
+    try std.testing.expect(isResidueRelation(&residues, .{ .residue_interaction = 0 }, endpoints));
+    try std.testing.expect(!isResidueRelation(&residues, .{ .bond = core.ids.BondId.fromIndex(0) }, endpoints));
+    try std.testing.expect(!isResidueRelation(&.{}, .{ .residue_interaction = 0 }, endpoints));
 }
 
 test "isolated acyclic bond rotates to the upstream horizontal preference" {
