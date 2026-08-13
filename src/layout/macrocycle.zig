@@ -1,6 +1,8 @@
 const std = @import("std");
 const core = @import("core");
 const geometry = @import("geometry");
+const model = @import("model");
+const topology = @import("topology");
 
 pub const max_macrocycles: usize = 40;
 pub const path_failed: i32 = -1000;
@@ -510,6 +512,247 @@ pub const ShapeMatch = struct {
     score: i32,
 };
 
+pub const PathData = struct {
+    allocator: std.mem.Allocator,
+    ordered_atoms: []core.ids.AtomId,
+    double_bonds: []DoubleBondConstraint,
+    rings: []RingConstraint,
+    hetero_atoms: []usize,
+    substituted_atoms: []SubstitutedAtom,
+
+    pub fn deinit(self: *PathData) void {
+        self.allocator.free(self.substituted_atoms);
+        self.allocator.free(self.hetero_atoms);
+        self.allocator.free(self.rings);
+        self.allocator.free(self.double_bonds);
+        self.allocator.free(self.ordered_atoms);
+        self.* = undefined;
+    }
+
+    pub fn constraints(self: PathData) PathConstraints {
+        return .{ .double_bonds = self.double_bonds, .rings = self.rings };
+    }
+
+    pub fn restraints(self: PathData) PathRestraints {
+        return .{ .hetero_atoms = self.hetero_atoms, .substituted_atoms = self.substituted_atoms };
+    }
+};
+
+pub const GenerateResult = enum {
+    matched,
+    no_shape,
+};
+
+/// Extract the ordered path and every hard/soft macrocycle condition from the
+/// native topology. The owned result keeps no pointers into temporary search
+/// state and can be reused across equivalent-shape rounds.
+pub fn collectPathData(
+    allocator: std.mem.Allocator,
+    ring: core.ids.RingId,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+) core.errors.Error!PathData {
+    const ordered = try orderRing(allocator, ring, graph, membership);
+    errdefer allocator.free(ordered);
+    const positions = allocator.alloc(usize, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(positions);
+    @memset(positions, std.math.maxInt(usize));
+    for (ordered, 0..) |atom, index| positions[atom.index()] = index;
+
+    var double_bonds: std.ArrayList(DoubleBondConstraint) = .empty;
+    defer double_bonds.deinit(allocator);
+    var ring_constraints: std.ArrayList(RingConstraint) = .empty;
+    defer ring_constraints.deinit(allocator);
+    var hetero_atoms: std.ArrayList(usize) = .empty;
+    defer hetero_atoms.deinit(allocator);
+    var substituted_atoms: std.ArrayList(SubstitutedAtom) = .empty;
+    defer substituted_atoms.deinit(allocator);
+
+    for (ordered, 0..) |atom_id, index| {
+        if (atoms[atom_id.index()].atomic_number != .carbon) {
+            hetero_atoms.append(allocator, index) catch return error.OutOfMemory;
+        }
+        if (graph.degree(atom_id) != 2) {
+            var subtree_size: usize = 0;
+            const previous = ordered[(index + ordered.len - 1) % ordered.len];
+            const following = ordered[(index + 1) % ordered.len];
+            for (graph.neighbors(atom_id)) |neighbor| {
+                if (neighbor == previous or neighbor == following) continue;
+                const subtree = try graph.reachableExcluding(allocator, neighbor, atom_id);
+                defer allocator.free(subtree);
+                subtree_size = std.math.add(usize, subtree_size, subtree.len) catch return error.TooManyItems;
+            }
+            substituted_atoms.append(allocator, .{ .atom = index, .subtree_size = subtree_size }) catch return error.OutOfMemory;
+        }
+
+        if (membership.atomRings(atom_id).len > 1) {
+            for (membership.atomRings(atom_id)) |other_ring| {
+                if (membership.atoms(other_ring).len >= topology.rings.macrocycle_size) continue;
+                var force_outside = false;
+                for (graph.neighbors(atom_id)) |neighbor| {
+                    if (positions[neighbor.index()] != std.math.maxInt(usize)) continue;
+                    force_outside = std.mem.indexOfScalar(core.ids.AtomId, membership.atoms(other_ring), neighbor) != null;
+                    break;
+                }
+                ring_constraints.append(allocator, .{
+                    .ring = other_ring,
+                    .atom = index,
+                    .force_outside = force_outside,
+                }) catch return error.OutOfMemory;
+            }
+        }
+
+        const next_index = (index + 1) % ordered.len;
+        const bond_id = bondBetween(atom_id, ordered[next_index], graph) orelse return error.InvalidMapping;
+        const bond = bonds[bond_id.index()];
+        if (bond.effective_order != .double) continue;
+        var small_ring_bond = false;
+        if (membership.bondRings(bond_id).len > 1) for (membership.bondRings(bond_id)) |bond_ring| {
+            if (membership.atoms(bond_ring).len < topology.rings.macrocycle_size) {
+                small_ring_bond = true;
+                break;
+            }
+        };
+        if (small_ring_bond) continue;
+        const absolute = try topology.stereo.absoluteBondStereo(allocator, atoms, bonds, graph, membership, bond_id);
+        if (absolute != .z and absolute != .e) continue;
+        var previous_index = (index + ordered.len - 1) % ordered.len;
+        var following_index = (index + 2) % ordered.len;
+        var atom_a = index;
+        var atom_b = next_index;
+        if (bond.start != atom_id) {
+            std.mem.swap(usize, &previous_index, &following_index);
+            atom_a = next_index;
+            atom_b = index;
+        }
+        var trans = absolute == .e;
+        const start_first = (try topology.stereo.firstNeighbor(allocator, atoms, bonds, graph, bond.start, bond.end)) orelse continue;
+        const end_first = (try topology.stereo.firstNeighbor(allocator, atoms, bonds, graph, bond.end, bond.start)) orelse continue;
+        if (start_first != ordered[previous_index]) trans = !trans;
+        if (end_first != ordered[following_index]) trans = !trans;
+        double_bonds.append(allocator, .{
+            .trans = trans,
+            .previous_atom = previous_index,
+            .atom_a = atom_a,
+            .atom_b = atom_b,
+            .following_atom = following_index,
+        }) catch return error.OutOfMemory;
+    }
+
+    const owned_double_bonds = double_bonds.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(owned_double_bonds);
+    const owned_rings = ring_constraints.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(owned_rings);
+    const owned_hetero_atoms = hetero_atoms.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(owned_hetero_atoms);
+    const owned_substituted_atoms = substituted_atoms.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{
+        .allocator = allocator,
+        .ordered_atoms = ordered,
+        .double_bonds = owned_double_bonds,
+        .rings = owned_rings,
+        .hetero_atoms = owned_hetero_atoms,
+        .substituted_atoms = owned_substituted_atoms,
+    };
+}
+
+/// Run the pinned round/squared/equivalent search and write the best valid
+/// lattice path. `no_shape` deliberately leaves all coordinates untouched so
+/// the caller can choose the open-cycle or regular-ring fallback.
+pub fn generateShape(
+    allocator: std.mem.Allocator,
+    data: PathData,
+    coordinates: []core.math.Vec2,
+    coordinates_set: []const bool,
+    force_open_macrocycles: bool,
+) core.errors.Error!GenerateResult {
+    if (coordinates.len != data.ordered_atoms.len or coordinates_set.len != coordinates.len) return error.InvalidMapping;
+    var shapes = ShapeCollection.init(allocator);
+    defer shapes.deinit();
+    var round = Polyomino.init(allocator);
+    errdefer round.deinit();
+    try round.buildWithVertices(data.ordered_atoms.len);
+    shapes.items.append(allocator, round) catch return error.OutOfMemory;
+    round = Polyomino.init(allocator);
+    var squared = try buildSquaredShapes(allocator, data.ordered_atoms.len);
+    defer squared.deinit();
+    while (squared.items.items.len != 0) {
+        var shape = squared.items.orderedRemove(0);
+        errdefer shape.deinit();
+        shapes.items.append(allocator, shape) catch return error.OutOfMemory;
+        shape = Polyomino.init(allocator);
+    }
+    try shapes.removeDuplicates();
+    if (force_open_macrocycles) return .no_shape;
+
+    var checked: usize = 0;
+    var chosen: ?Polyomino = null;
+    defer {
+        if (chosen) |*shape| shape.deinit();
+    }
+    var chosen_start: usize = 0;
+    var chosen_score: i32 = path_failed;
+    if (coordinates.len > @as(usize, @intCast(std.math.maxInt(i32) / 5))) return error.TooManyItems;
+    const acceptable_score: i32 = if (coordinates.len < 10) 0 else -@as(i32, @intCast(coordinates.len * 5));
+    while (shapes.items.items.len != 0) {
+        if (try matchShapes(allocator, shapes, data.constraints(), data.restraints(), &checked)) |matched| {
+            if (matched.score > chosen_score) {
+                if (chosen) |*shape| shape.deinit();
+                chosen = try shapes.items.items[matched.shape].clone(allocator);
+                chosen_start = matched.start;
+                chosen_score = matched.score;
+                if (matched.score > acceptable_score) break;
+            }
+        }
+        if (checked > max_macrocycles) break;
+        var equivalents = try shapes.equivalents();
+        errdefer equivalents.deinit();
+        try equivalents.removeDuplicates();
+        shapes.deinit();
+        shapes = equivalents;
+        equivalents = ShapeCollection.init(allocator);
+    }
+    if (chosen) |shape| {
+        try writeCoordinates(shape, chosen_start, coordinates, coordinates_set);
+        return .matched;
+    }
+    return .no_shape;
+}
+
+/// Topology-facing shape entry point used by the fragment layout layer. Atom
+/// storage remains canonical; the temporary coordinate vectors follow the
+/// ring path and are mapped back only after a successful match.
+pub fn generateRingShape(
+    allocator: std.mem.Allocator,
+    ring: core.ids.RingId,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    coordinates_set: []bool,
+    force_open_macrocycles: bool,
+) core.errors.Error!GenerateResult {
+    if (coordinates_set.len != atoms.len) return error.InvalidMapping;
+    var data = try collectPathData(allocator, ring, atoms, bonds, graph, membership);
+    defer data.deinit();
+    const coordinates = allocator.alloc(core.math.Vec2, data.ordered_atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(coordinates);
+    const path_set = allocator.alloc(bool, data.ordered_atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(path_set);
+    for (data.ordered_atoms, coordinates, path_set) |atom, *coordinate, *is_set| {
+        coordinate.* = atoms[atom.index()].coordinates;
+        is_set.* = coordinates_set[atom.index()];
+    }
+    const result = try generateShape(allocator, data, coordinates, path_set, force_open_macrocycles);
+    if (result == .matched) for (data.ordered_atoms, coordinates) |atom, coordinate| {
+        atoms[atom.index()].coordinates = coordinate;
+        coordinates_set[atom.index()] = true;
+    };
+    return result;
+}
+
 pub fn lowestPeriod(neighbors: []const u8) usize {
     for (1..neighbors.len) |period| {
         var different = false;
@@ -691,6 +934,45 @@ fn containsVertex(items: []const VertexCoords, target: VertexCoords) bool {
     return false;
 }
 
+fn bondBetween(left: core.ids.AtomId, right: core.ids.AtomId, graph: topology.Graph) ?core.ids.BondId {
+    for (graph.neighbors(left), graph.incidentBonds(left)) |neighbor, bond| {
+        if (neighbor == right) return bond;
+    }
+    return null;
+}
+
+fn orderRing(
+    allocator: std.mem.Allocator,
+    ring: core.ids.RingId,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+) core.errors.Error![]core.ids.AtomId {
+    if (!ring.isValid() or ring.index() >= membership.rings.len) return error.InvalidMapping;
+    const members = membership.atoms(ring);
+    if (members.len < 3) return error.InvalidMapping;
+    const ordered = allocator.alloc(core.ids.AtomId, members.len) catch return error.OutOfMemory;
+    errdefer allocator.free(ordered);
+    ordered[0] = members[0];
+    var previous = core.ids.AtomId.invalid;
+    var current = members[0];
+    for (1..members.len) |index| {
+        var next: ?core.ids.AtomId = null;
+        for (graph.neighbors(current), graph.incidentBonds(current)) |neighbor, bond_id| {
+            if (neighbor == previous or std.mem.indexOfScalar(core.ids.RingId, membership.bondRings(bond_id), ring) == null) continue;
+            next = neighbor;
+            break;
+        }
+        const selected = next orelse return error.InvalidMapping;
+        if (selected == ordered[0] or std.mem.indexOfScalar(core.ids.AtomId, ordered[0..index], selected) != null) return error.InvalidMapping;
+        ordered[index] = selected;
+        previous = current;
+        current = selected;
+    }
+    const closing_bond = bondBetween(current, ordered[0], graph) orelse return error.InvalidMapping;
+    if (std.mem.indexOfScalar(core.ids.RingId, membership.bondRings(closing_bond), ring) == null) return error.InvalidMapping;
+    return ordered;
+}
+
 fn makePolyomino(allocator: std.mem.Allocator, coordinates: []const HexCoords) !Polyomino {
     var result = Polyomino.init(allocator);
     errdefer result.deinit();
@@ -825,4 +1107,83 @@ test "invalid hard constraints reject every rotational start" {
         .following_atom = 2,
     }};
     try std.testing.expect((try matchPolyomino(std.testing.allocator, shape, .{ .double_bonds = &invalid }, .{})) == null);
+}
+
+fn collectAndGenerateFixture(allocator: std.mem.Allocator) !void {
+    const ring_size = 13;
+    var atoms: [ring_size + 2]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = if (index == 4) .nitrogen else .carbon,
+    };
+    var bonds: [ring_size + 2]model.Bond = undefined;
+    for (0..ring_size) |index| bonds[index] = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(@intCast(index)),
+        .end = core.ids.AtomId.fromIndex(@intCast((index + 1) % ring_size)),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    bonds[0].input_order = .double;
+    bonds[0].effective_order = .double;
+    bonds[0].stereo = .z;
+    bonds[0].stereo_atom_a = core.ids.AtomId.fromIndex(ring_size - 1);
+    bonds[0].stereo_atom_b = core.ids.AtomId.fromIndex(2);
+    bonds[ring_size] = .{
+        .id = core.ids.BondId.fromIndex(ring_size),
+        .input_index = ring_size,
+        .start = core.ids.AtomId.fromIndex(2),
+        .end = core.ids.AtomId.fromIndex(ring_size),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    bonds[ring_size + 1] = .{
+        .id = core.ids.BondId.fromIndex(ring_size + 1),
+        .input_index = ring_size + 1,
+        .start = core.ids.AtomId.fromIndex(ring_size),
+        .end = core.ids.AtomId.fromIndex(ring_size + 1),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var membership = try topology.RingMembership.init(allocator, graph, &bonds);
+    defer membership.deinit();
+    try std.testing.expectEqual(@as(usize, 1), membership.rings.len);
+    var data = try collectPathData(allocator, core.ids.RingId.fromIndex(0), &atoms, &bonds, graph, membership);
+    defer data.deinit();
+    try std.testing.expectEqual(@as(usize, ring_size), data.ordered_atoms.len);
+    try std.testing.expectEqualSlices(usize, &.{4}, data.hetero_atoms);
+    try std.testing.expectEqual(@as(usize, 1), data.substituted_atoms.len);
+    try std.testing.expectEqual(@as(usize, 2), data.substituted_atoms[0].subtree_size);
+    try std.testing.expectEqual(@as(usize, 1), data.double_bonds.len);
+    try std.testing.expect(!data.double_bonds[0].trans);
+
+    const coordinates = try allocator.alloc(core.math.Vec2, ring_size);
+    defer allocator.free(coordinates);
+    @memset(coordinates, .{});
+    const coordinates_set = try allocator.alloc(bool, ring_size);
+    defer allocator.free(coordinates_set);
+    @memset(coordinates_set, false);
+    try std.testing.expectEqual(GenerateResult.matched, try generateShape(allocator, data, coordinates, coordinates_set, false));
+    for (coordinates, 0..) |coordinate, index| {
+        const following = coordinates[(index + 1) % coordinates.len];
+        const dx = coordinate.x - following.x;
+        const dy = coordinate.y - following.y;
+        // Hex contour edges are √3 * BONDLENGTH. An odd ring omits one
+        // contour vertex to model a pentagon, producing two BONDLENGTH edges.
+        const length = @sqrt(dx * dx + dy * dy);
+        const hex_edge = core.math.bond_length * @sqrt(@as(f32, 3));
+        try std.testing.expect(@abs(length - core.math.bond_length) < 0.001 or @abs(length - hex_edge) < 0.001);
+    }
+    const before = try allocator.dupe(core.math.Vec2, coordinates);
+    defer allocator.free(before);
+    try std.testing.expectEqual(GenerateResult.no_shape, try generateShape(allocator, data, coordinates, coordinates_set, true));
+    try std.testing.expectEqualSlices(core.math.Vec2, before, coordinates);
+}
+
+test "topology path extraction and bounded shape orchestration clean every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, collectAndGenerateFixture, .{});
 }

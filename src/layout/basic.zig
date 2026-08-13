@@ -3,6 +3,7 @@ const core = @import("core");
 const model = @import("model");
 const topology = @import("topology");
 const fragments = @import("fragments.zig");
+const macrocycle = @import("macrocycle.zig");
 
 pub const bond_length: f32 = 50;
 const pi: f32 = std.math.pi;
@@ -25,7 +26,7 @@ pub fn initializeCoordinates(
     defer allocator.free(queue);
 
     for (fragmentation.fragments) |fragment| {
-        try placeFragmentRings(allocator, atoms, bonds, membership, fragmentation, fragment, placed);
+        try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed);
 
         const members = fragmentation.members(fragment.id);
         var head: usize = 0;
@@ -78,6 +79,7 @@ fn placeFragmentRings(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
     bonds: []const model.Bond,
+    graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
     fragment: fragments.Fragment,
@@ -90,7 +92,7 @@ fn placeFragmentRings(
         var selected_score: usize = 0;
         for (membership.rings) |ring| {
             const ring_atoms = membership.atoms(ring.id);
-            if (ring_atoms.len == 0 or ring_atoms.len >= 9 or
+            if (ring_atoms.len == 0 or
                 fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
             var already_complete = true;
             var shared: usize = 0;
@@ -107,6 +109,21 @@ fn placeFragmentRings(
             }
         }
         const ring = selected orelse break;
+        if (membership.atoms(ring.id).len >= topology.rings.macrocycle_size) {
+            if (try macrocycle.generateRingShape(
+                allocator,
+                ring.id,
+                atoms,
+                bonds,
+                graph,
+                membership,
+                placed,
+                false,
+            ) == .matched) {
+                remaining -= 1;
+                continue;
+            }
+        }
         const ordered = try orderRing(allocator, ring, bonds, membership);
         defer allocator.free(ordered);
         const local = try regularRingCoordinates(allocator, ordered.len);
@@ -438,6 +455,35 @@ test "regular ring coordinate walk preserves the upstream bond length" {
         const b = atoms[bond.end.index()].coordinates;
         try std.testing.expectApproxEqAbs(bond_length, @sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y)), 0.001);
     }
+}
+
+test "macrocycles dispatch through native polyomino placement" {
+    const ring_size = 13;
+    var atoms: [ring_size]model.Atom = undefined;
+    var bonds: [ring_size]model.Bond = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    for (&bonds, 0..) |*bond, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(@intCast(index)),
+        .end = core.ids.AtomId.fromIndex(@intCast((index + 1) % ring_size)),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+    try initializeCoordinates(std.testing.allocator, &atoms, &bonds, graph, rings, split);
+
+    var hex_edges: usize = 0;
+    for (bonds) |bond| {
+        const edge_length = distance(atoms[bond.start.index()].coordinates, atoms[bond.end.index()].coordinates);
+        hex_edges += @intFromBool(@abs(edge_length - bond_length * @sqrt(@as(f32, 3))) < 0.001);
+    }
+    try std.testing.expect(hex_edges > 0);
 }
 
 fn layoutFixture(atoms: []model.Atom, bonds: []const model.Bond) !void {
