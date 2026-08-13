@@ -316,6 +316,111 @@ fn coordinateCenter(coordinates: []const core.math.Vec2) core.math.Vec2 {
     return scale(center, 1 / @as(f32, @floatFromInt(coordinates.len)));
 }
 
+/// Capture the assembled pose in the fragment-local representation consumed
+/// by discrete optimization. Child anchors are deliberately duplicated in
+/// their own frame and in their parent's attachment coordinates.
+pub fn captureFragmentFrames(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    fragmentation: fragments.Fragmentation,
+) core.errors.Error!core.dof.FrameCollection {
+    const frame_count = fragmentation.fragments.len;
+    const frames = allocator.alloc(core.dof.FragmentFrame, frame_count) catch return error.OutOfMemory;
+    errdefer allocator.free(frames);
+    const rebuild_order = allocator.alloc(core.ids.FragmentId, frame_count) catch return error.OutOfMemory;
+    errdefer allocator.free(rebuild_order);
+    const fragment_atoms = allocator.dupe(core.ids.AtomId, fragmentation.atoms) catch return error.OutOfMemory;
+    errdefer allocator.free(fragment_atoms);
+    const atom_coordinates = allocator.alloc(core.math.Vec2, fragment_atoms.len) catch return error.OutOfMemory;
+    errdefer allocator.free(atom_coordinates);
+    const attachment_count = if (frame_count == 0) 0 else frame_count - fragmentation.main_fragments.len;
+    const child_attachments = allocator.alloc(core.dof.ChildAttachment, attachment_count) catch return error.OutOfMemory;
+    errdefer allocator.free(child_attachments);
+    const attachment_coordinates = allocator.alloc(core.math.Vec2, attachment_count) catch return error.OutOfMemory;
+    errdefer allocator.free(attachment_coordinates);
+
+    var attachment_offset: u32 = 0;
+    for (fragmentation.fragments) |fragment| {
+        var child_count: u32 = 0;
+        for (fragmentation.fragments) |candidate| child_count += @intFromBool(candidate.parent == fragment.id);
+        const frame = &frames[fragment.id.index()];
+        frame.* = .{
+            .id = fragment.id,
+            .parent = fragment.parent,
+            .atoms = .{ .start = fragment.atom_start, .len = fragment.atom_count },
+            .attachments = .{ .start = attachment_offset, .len = child_count },
+        };
+        if (fragment.parent.isValid()) {
+            if (!fragment.bond_to_parent.isValid() or fragment.bond_to_parent.index() >= bonds.len) return error.InvalidMapping;
+            const bond = bonds[fragment.bond_to_parent.index()];
+            if (fragmentation.atom_fragment[bond.start.index()] == fragment.id) {
+                frame.anchor_atom = bond.start;
+                frame.parent_atom = bond.end;
+            } else if (fragmentation.atom_fragment[bond.end.index()] == fragment.id) {
+                frame.anchor_atom = bond.end;
+                frame.parent_atom = bond.start;
+            } else return error.InvalidMapping;
+        }
+        attachment_offset += child_count;
+    }
+    if (attachment_offset != attachment_count) return error.InvalidMapping;
+
+    var order_index: usize = 0;
+    for (0..frame_count) |depth| for (fragmentation.fragments) |fragment| {
+        if (fragmentDepth(fragmentation.fragments, fragment.id) != depth) continue;
+        rebuild_order[order_index] = fragment.id;
+        order_index += 1;
+    };
+    if (order_index != frame_count) return error.InvalidMapping;
+
+    for (frames) |frame| {
+        const origin, const angle = frameOriginAndAngle(frame, fragmentation.fragments[frame.id.index()], fragment_atoms, atoms);
+        const sine = @sin(-angle);
+        const cosine = @cos(-angle);
+        for (fragment_atoms[frame.atoms.start..][0..frame.atoms.len], frame.atoms.start..) |atom, coordinate_index| {
+            atom_coordinates[coordinate_index] = rotateScreen(subtract(atoms[atom.index()].coordinates, origin), sine, cosine);
+        }
+        var child_index: usize = frame.attachments.start;
+        for (frames) |child| {
+            if (child.parent != frame.id) continue;
+            child_attachments[child_index] = .{ .child = child.id, .atom = child.anchor_atom };
+            attachment_coordinates[child_index] = rotateScreen(subtract(atoms[child.anchor_atom.index()].coordinates, origin), sine, cosine);
+            child_index += 1;
+        }
+    }
+    return .{
+        .allocator = allocator,
+        .frames = frames,
+        .rebuild_order = rebuild_order,
+        .fragment_atoms = fragment_atoms,
+        .child_attachments = child_attachments,
+        .atom_coordinates = atom_coordinates,
+        .attachment_coordinates = attachment_coordinates,
+    };
+}
+
+fn frameOriginAndAngle(
+    frame: core.dof.FragmentFrame,
+    fragment: fragments.Fragment,
+    fragment_atoms: []const core.ids.AtomId,
+    atoms: []const model.Atom,
+) struct { core.math.Vec2, f32 } {
+    if (!frame.parent.isValid()) {
+        if (!fragment.flags.constrained and !fragment.flags.fixed and frame.atoms.len != 0) {
+            return .{ atoms[fragment_atoms[frame.atoms.start].index()].coordinates, 0 };
+        }
+        return .{ .{}, 0 };
+    }
+    const origin = atoms[frame.anchor_atom.index()].coordinates;
+    const parent = atoms[frame.parent_atom.index()].coordinates;
+    return .{ origin, std.math.atan2(parent.y - origin.y, -parent.x + origin.x) };
+}
+
+fn rotateScreen(value: core.math.Vec2, sine: f32, cosine: f32) core.math.Vec2 {
+    return .{ .x = value.x * cosine + value.y * sine, .y = -value.x * sine + value.y * cosine };
+}
+
 fn assembleFragments(atoms: []model.Atom, bonds: []const model.Bond, graph: topology.Graph, fragmentation: fragments.Fragmentation) core.errors.Error!void {
     for (1..fragmentation.fragments.len) |depth| {
         for (fragmentation.fragments) |fragment| {
@@ -616,6 +721,16 @@ fn layoutWithOptionsAndDiscard(
     try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, force_open_macrocycles);
 }
 
+fn captureFramesAndDiscard(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    split: fragments.Fragmentation,
+) !void {
+    var frames = try captureFragmentFrames(allocator, atoms, bonds, split);
+    defer frames.deinit();
+}
+
 fn expectBondLengths(atoms: []const model.Atom, bonds: []const model.Bond) !void {
     for (bonds) |bond| {
         try std.testing.expectApproxEqAbs(
@@ -701,6 +816,30 @@ test "fragment assembly preserves every acyclic parent bond length" {
         const cosine = (left.x * right.x + left.y * right.y) / (length(left) * length(right));
         try std.testing.expectApproxEqAbs(@as(f32, -0.5), cosine, 0.001);
     }
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+    var frames = try captureFragmentFrames(std.testing.allocator, &atoms, &bonds, split);
+    defer frames.deinit();
+    try std.testing.expectEqual(split.fragments.len, frames.frames.len);
+    try std.testing.expectEqual(split.fragments.len - 1, frames.child_attachments.len);
+    for (frames.frames) |frame| {
+        if (!frame.parent.isValid()) continue;
+        const parent_frame = frames.frames[frame.parent.index()];
+        var found = false;
+        for (frames.child_attachments[parent_frame.attachments.start..][0..parent_frame.attachments.len]) |attachment| {
+            found = found or (attachment.child == frame.id and attachment.atom == frame.anchor_atom);
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        captureFramesAndDiscard,
+        .{ &atoms, &bonds, split },
+    );
     const first = atoms;
     try layoutFixture(&atoms, &bonds);
     for (first, atoms) |left, right| try std.testing.expectEqual(left.coordinates, right.coordinates);

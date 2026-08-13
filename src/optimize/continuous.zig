@@ -4,6 +4,7 @@ const geometry = @import("geometry");
 const model = @import("model");
 
 pub const marching_squares = @import("marching_squares.zig");
+pub const discrete = @import("discrete.zig");
 
 pub const State = struct {
     coordinates: []core.math.Vec2,

@@ -1,5 +1,6 @@
 const std = @import("std");
 const ids = @import("ids.zig");
+const math = @import("math.zig");
 
 pub const DofKind = enum(u32) {
     flip_fragment = 0,
@@ -104,6 +105,42 @@ pub const Collection = struct {
     pub fn deinit(self: *Collection) void {
         self.allocator.free(self.affected_atoms);
         self.allocator.free(self.items);
+        self.* = undefined;
+    }
+};
+
+pub const ChildAttachment = struct {
+    child: ids.FragmentId,
+    atom: ids.AtomId,
+};
+
+pub const FragmentFrame = struct {
+    id: ids.FragmentId,
+    parent: ids.FragmentId = .invalid,
+    parent_atom: ids.AtomId = .invalid,
+    anchor_atom: ids.AtomId = .invalid,
+    atoms: AtomRange = .{},
+    attachments: AtomRange = .{},
+};
+
+/// Neutral layout/optimization boundary preserving upstream's duplicate local
+/// coordinate for each child anchor in both its own and its parent's frame.
+pub const FrameCollection = struct {
+    allocator: std.mem.Allocator,
+    frames: []FragmentFrame,
+    rebuild_order: []ids.FragmentId,
+    fragment_atoms: []ids.AtomId,
+    child_attachments: []ChildAttachment,
+    atom_coordinates: []math.Vec2,
+    attachment_coordinates: []math.Vec2,
+
+    pub fn deinit(self: *FrameCollection) void {
+        self.allocator.free(self.attachment_coordinates);
+        self.allocator.free(self.atom_coordinates);
+        self.allocator.free(self.child_attachments);
+        self.allocator.free(self.fragment_atoms);
+        self.allocator.free(self.rebuild_order);
+        self.allocator.free(self.frames);
         self.* = undefined;
     }
 };

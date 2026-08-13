@@ -823,15 +823,15 @@ pub fn collectDofs(
         if (blocked_by_stereo) continue;
         for (graph.neighbors(atom)) |neighbor| {
             if (shareRing(atom, neighbor, membership)) continue;
-            const affected = try graph.reachableExcluding(allocator, neighbor, atom);
-            defer allocator.free(affected);
-            if (affected_atoms.items.len > std.math.maxInt(u32) or affected.len > std.math.maxInt(u32) or dofs.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+            // Upstream's constructor adds exactly the bound atom. It does not
+            // propagate through the substituent or across fragment frames.
+            if (affected_atoms.items.len > std.math.maxInt(u32) or dofs.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
             const affected_start: u32 = @intCast(affected_atoms.items.len);
-            affected_atoms.appendSlice(allocator, affected) catch return error.OutOfMemory;
+            affected_atoms.append(allocator, neighbor) catch return error.OutOfMemory;
             dofs.append(allocator, .{
                 .id = core.ids.DofId.fromIndex(@intCast(dofs.items.len)),
                 .fragment = fragment,
-                .affected_atoms = .{ .start = affected_start, .len = @intCast(affected.len) },
+                .affected_atoms = .{ .start = affected_start, .len = 1 },
                 .state = .{ .count = 2, .tier = core.dof.Tier.invert_bond },
                 .payload = .{ .invert_bond = .{ .pivot = atom, .bound = neighbor } },
             }) catch return error.OutOfMemory;
@@ -1265,7 +1265,6 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
         try std.testing.expectEqual(core.ids.AtomId.fromIndex(ring_size), dofs.items[0].payload.invert_bond.bound);
         try std.testing.expectEqualSlices(core.ids.AtomId, &.{
             core.ids.AtomId.fromIndex(ring_size),
-            core.ids.AtomId.fromIndex(ring_size + 1),
         }, dofs.affected_atoms);
         try std.testing.checkAllAllocationFailures(
             std.testing.allocator,
@@ -1320,6 +1319,6 @@ test "topology path extraction and bounded shape orchestration clean every alloc
     try std.testing.checkAllAllocationFailures(std.testing.allocator, collectAndGenerateFixture, .{false});
 }
 
-test "macrocycle substituents emit invert-bond DOFs with their bound subtree" {
+test "macrocycle substituents emit invert-bond DOFs for exactly the bound atom" {
     try collectAndGenerateFixture(std.testing.allocator, true);
 }

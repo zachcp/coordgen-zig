@@ -18,7 +18,7 @@ pub const ring_bond_crossing_multiplier: f32 = 2;
 
 pub const Evaluator = struct {
     context: ?*anyopaque = null,
-    scoreFn: *const fn (?*anyopaque, []const u32) anyerror!f32,
+    scoreFn: *const fn (?*anyopaque, []const u32) core.errors.Error!f32,
 
     fn score(self: Evaluator, states: []const u32) !f32 {
         return self.scoreFn(self.context, states);
@@ -32,9 +32,9 @@ pub const PoseEvaluator = struct {
     local_coordinates: []core.math.Vec2,
     global_coordinates: []core.math.Vec2,
     rebuild_context: ?*anyopaque = null,
-    rebuildFn: *const fn (?*anyopaque, []const core.math.Vec2, []core.math.Vec2) anyerror!void,
+    rebuildFn: *const fn (?*anyopaque, []const core.math.Vec2, []core.math.Vec2) core.errors.Error!void,
     score_context: ?*anyopaque = null,
-    scorePoseFn: *const fn (?*anyopaque, []const core.math.Vec2, []const core.dof.Dof) anyerror!f32,
+    scorePoseFn: *const fn (?*anyopaque, []const core.math.Vec2, []const core.dof.Dof) core.errors.Error!f32,
 
     pub fn evaluator(self: *PoseEvaluator) Evaluator {
         return .{ .context = self, .scoreFn = evaluateOpaque };
@@ -45,7 +45,7 @@ pub const PoseEvaluator = struct {
         return self.evaluate(states);
     }
 
-    pub fn evaluate(self: *PoseEvaluator, states: []const u32) !f32 {
+    pub fn evaluate(self: *PoseEvaluator, states: []const u32) core.errors.Error!f32 {
         if (states.len != self.dofs.len or
             self.base_local_coordinates.len != self.local_coordinates.len or
             self.local_coordinates.len != self.global_coordinates.len)
@@ -54,15 +54,127 @@ pub const PoseEvaluator = struct {
         }
         @memcpy(self.local_coordinates, self.base_local_coordinates);
         for (self.dofs, states) |*dof, state| {
-            if (state >= dof.state.count) return error.InvalidDofState;
+            if (state >= dof.state.count) return error.InvalidMapping;
             dof.state.current = state;
             const start = dof.affected_atoms.start;
             const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
             if (end > self.affected_atoms.len) return error.InvalidMapping;
-            try apply(dof.*, self.affected_atoms[start..end], self.local_coordinates);
+            apply(dof.*, self.affected_atoms[start..end], self.local_coordinates) catch |err| switch (err) {
+                error.InvalidDofState => return error.InvalidMapping,
+                else => return err,
+            };
         }
         try self.rebuildFn(self.rebuild_context, self.local_coordinates, self.global_coordinates);
         return self.scorePoseFn(self.score_context, self.global_coordinates, self.dofs);
+    }
+};
+
+pub const FramePose = struct {
+    frames: []const core.dof.FragmentFrame,
+    rebuild_order: []const core.ids.FragmentId,
+    fragment_atoms: []const core.ids.AtomId,
+    child_attachments: []const core.dof.ChildAttachment,
+    atom_coordinates: []core.math.Vec2,
+    attachment_coordinates: []core.math.Vec2,
+    global_coordinates: []core.math.Vec2,
+
+    pub fn validate(self: FramePose) core.errors.Error!void {
+        if (self.atom_coordinates.len != self.fragment_atoms.len or
+            self.attachment_coordinates.len != self.child_attachments.len or
+            self.rebuild_order.len != self.frames.len)
+        {
+            return error.InvalidMapping;
+        }
+        for (self.frames, 0..) |frame, index| {
+            if (frame.id.index() != index or
+                rangeEnd(frame.atoms) > self.fragment_atoms.len or
+                rangeEnd(frame.attachments) > self.child_attachments.len)
+            {
+                return error.InvalidMapping;
+            }
+        }
+    }
+
+    pub fn rebuild(self: FramePose) core.errors.Error!void {
+        try self.validate();
+        for (self.rebuild_order) |fragment_id| {
+            if (!fragment_id.isValid() or fragment_id.index() >= self.frames.len) return error.InvalidMapping;
+            const frame = self.frames[fragment_id.index()];
+            var position: core.math.Vec2 = .{};
+            var angle: f32 = 0;
+            if (frame.parent.isValid()) {
+                const parent_position = try scoreCoordinate(self.global_coordinates, frame.parent_atom);
+                position = try scoreCoordinate(self.global_coordinates, frame.anchor_atom);
+                const direction = subtract(position, parent_position);
+                angle = std.math.atan2(-direction.y, direction.x);
+            }
+            const sine = @sin(angle);
+            const cosine = @cos(angle);
+            for (self.fragment_atoms[frame.atoms.start..][0..frame.atoms.len], self.atom_coordinates[frame.atoms.start..][0..frame.atoms.len]) |atom, local| {
+                if (!atom.isValid() or atom.index() >= self.global_coordinates.len) return error.InvalidAtomIndex;
+                self.global_coordinates[atom.index()] = add(geometry.rotate(local, sine, cosine), position);
+            }
+            for (self.child_attachments[frame.attachments.start..][0..frame.attachments.len], self.attachment_coordinates[frame.attachments.start..][0..frame.attachments.len]) |attachment, local| {
+                if (!attachment.atom.isValid() or attachment.atom.index() >= self.global_coordinates.len) return error.InvalidAtomIndex;
+                self.global_coordinates[attachment.atom.index()] = add(geometry.rotate(local, sine, cosine), position);
+            }
+        }
+    }
+
+    fn coordinate(self: FramePose, fragment: core.ids.FragmentId, atom: core.ids.AtomId) core.errors.Error!*core.math.Vec2 {
+        if (!fragment.isValid() or fragment.index() >= self.frames.len or !atom.isValid()) return error.InvalidMapping;
+        const frame = self.frames[fragment.index()];
+        for (self.fragment_atoms[frame.atoms.start..][0..frame.atoms.len], frame.atoms.start..) |candidate, index| {
+            if (candidate == atom) return &self.atom_coordinates[index];
+        }
+        for (self.child_attachments[frame.attachments.start..][0..frame.attachments.len], frame.attachments.start..) |attachment, index| {
+            if (attachment.atom == atom) return &self.attachment_coordinates[index];
+        }
+        return error.InvalidMapping;
+    }
+};
+
+fn rangeEnd(range: core.dof.AtomRange) usize {
+    return @as(usize, range.start) + @as(usize, range.len);
+}
+
+pub const FramePoseEvaluator = struct {
+    dofs: []core.dof.Dof,
+    affected_atoms: []const core.ids.AtomId,
+    pose: FramePose,
+    base_atom_coordinates: []const core.math.Vec2,
+    base_attachment_coordinates: []const core.math.Vec2,
+    score_context: ?*anyopaque = null,
+    scorePoseFn: *const fn (?*anyopaque, []const core.math.Vec2, []const core.dof.Dof) core.errors.Error!f32,
+
+    pub fn evaluator(self: *FramePoseEvaluator) Evaluator {
+        return .{ .context = self, .scoreFn = evaluateOpaque };
+    }
+
+    fn evaluateOpaque(raw_context: ?*anyopaque, states: []const u32) !f32 {
+        const self: *FramePoseEvaluator = @ptrCast(@alignCast(raw_context orelse return error.InvalidMapping));
+        return self.evaluate(states);
+    }
+
+    pub fn evaluate(self: *FramePoseEvaluator, states: []const u32) core.errors.Error!f32 {
+        if (states.len != self.dofs.len or
+            self.base_atom_coordinates.len != self.pose.atom_coordinates.len or
+            self.base_attachment_coordinates.len != self.pose.attachment_coordinates.len)
+        {
+            return error.InvalidMapping;
+        }
+        @memcpy(self.pose.atom_coordinates, self.base_atom_coordinates);
+        @memcpy(self.pose.attachment_coordinates, self.base_attachment_coordinates);
+        for (self.dofs, states) |*dof, state| {
+            if (state >= dof.state.count) return error.InvalidMapping;
+            dof.state.current = state;
+            const start = dof.affected_atoms.start;
+            const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
+            if (end > self.affected_atoms.len) return error.InvalidMapping;
+            try applyToFrame(dof.*, self.affected_atoms[start..end], self.pose);
+        }
+        try self.pose.rebuild();
+        return self.scorePoseFn(self.score_context, self.pose.global_coordinates, self.dofs);
     }
 };
 
@@ -151,9 +263,9 @@ pub fn tieredSearch(
     cache: *SolutionCache,
     precision: f32,
     initial_tier: u32,
-) !SearchResult {
+) core.errors.Error!SearchResult {
     if (cache.state_count != dofs.len or !std.math.isFinite(precision) or precision <= 0) return error.InvalidOption;
-    for (dofs) |dof| try dof.state.validate();
+    for (dofs) |dof| dof.state.validate() catch return error.InvalidMapping;
     const scaled_width = @as(f64, 6) * @as(f64, precision);
     if (scaled_width > @as(f64, @floatFromInt(std.math.maxInt(usize)))) return error.TooManyItems;
     const max_width = @max(@as(usize, 1), @as(usize, @intFromFloat(scaled_width)));
@@ -174,6 +286,9 @@ pub fn tieredSearch(
     }
     const best = try cache.best();
     loadStates(dofs, best.states);
+    // Materialize the selected pose; the final scored candidate is not
+    // necessarily the best cached solution.
+    _ = try cache.evaluator.score(best.states);
     return .{ .score = best.score, .clean_pose = best.score < clash_energy_threshold, .iterations = iterations };
 }
 
@@ -739,6 +854,80 @@ pub fn apply(
     }
 }
 
+pub fn applyToFrame(dof: core.dof.Dof, affected: []const core.ids.AtomId, pose: FramePose) core.errors.Error!void {
+    dof.state.validate() catch return error.InvalidMapping;
+    try pose.validate();
+    if (dof.state.current == 0) return;
+    switch (dof.payload) {
+        .flip_fragment => try transformWholeFrame(pose, dof.fragment, .flip_y),
+        .change_parent_bond_length => {
+            const factor = stateFactor(1.6, dof.state.current);
+            try transformWholeFrame(pose, dof.fragment, .{ .translate_x = core.math.bond_length * (factor - 1) });
+        },
+        .rotate_fragment => {
+            var angle = @as(f32, std.math.pi) / 180 * 15 * @as(f32, @floatFromInt((dof.state.current + 1) / 2));
+            if (dof.state.current % 2 == 0) angle = -angle;
+            try transformWholeFrame(pose, dof.fragment, .{ .rotate = .{
+                .origin = .{ .x = -core.math.bond_length },
+                .sine = @sin(angle),
+                .cosine = @cos(angle),
+            } });
+        },
+        .scale_atoms => |payload| {
+            const pivot = (try pose.coordinate(dof.fragment, payload.pivot)).*;
+            for (affected) |atom| {
+                const coordinate_value = try pose.coordinate(dof.fragment, atom);
+                coordinate_value.* = add(pivot, scale(subtract(coordinate_value.*, pivot), 0.4));
+            }
+        },
+        .scale_fragment => try transformWholeFrame(pose, dof.fragment, .{ .scale = stateFactor(1.4, dof.state.current) }),
+        .invert_bond => |payload| {
+            const pivot = (try pose.coordinate(dof.fragment, payload.pivot)).*;
+            const bond = subtract((try pose.coordinate(dof.fragment, payload.bound)).*, pivot);
+            const line_a = add(pivot, .{ .x = bond.y, .y = -bond.x });
+            const line_b = subtract(pivot, .{ .x = bond.y, .y = -bond.x });
+            for (affected) |atom| {
+                const coordinate_value = try pose.coordinate(dof.fragment, atom);
+                coordinate_value.* = reflect(coordinate_value.*, line_a, line_b);
+            }
+        },
+        .flip_ring => |payload| {
+            const line_a = (try pose.coordinate(dof.fragment, payload.pivot_a)).*;
+            const line_b = (try pose.coordinate(dof.fragment, payload.pivot_b)).*;
+            for (affected) |atom| {
+                const coordinate_value = try pose.coordinate(dof.fragment, atom);
+                coordinate_value.* = reflect(coordinate_value.*, line_a, line_b);
+            }
+        },
+    }
+}
+
+const FrameTransform = union(enum) {
+    flip_y,
+    translate_x: f32,
+    rotate: struct { origin: core.math.Vec2, sine: f32, cosine: f32 },
+    scale: f32,
+};
+
+fn transformWholeFrame(pose: FramePose, fragment: core.ids.FragmentId, transform: FrameTransform) core.errors.Error!void {
+    if (!fragment.isValid() or fragment.index() >= pose.frames.len) return error.InvalidMapping;
+    const frame = pose.frames[fragment.index()];
+    for (pose.atom_coordinates[frame.atoms.start..][0..frame.atoms.len]) |*coordinate_value| applyFrameTransform(coordinate_value, transform);
+    for (pose.attachment_coordinates[frame.attachments.start..][0..frame.attachments.len]) |*coordinate_value| applyFrameTransform(coordinate_value, transform);
+}
+
+fn applyFrameTransform(coordinate_value: *core.math.Vec2, transform: FrameTransform) void {
+    switch (transform) {
+        .flip_y => coordinate_value.y = -coordinate_value.y,
+        .translate_x => |amount| coordinate_value.x += amount,
+        .rotate => |rotation| coordinate_value.* = add(
+            geometry.rotate(subtract(coordinate_value.*, rotation.origin), rotation.sine, rotation.cosine),
+            rotation.origin,
+        ),
+        .scale => |factor| coordinate_value.* = scale(coordinate_value.*, factor),
+    }
+}
+
 pub fn penalty(dof: core.dof.Dof, affected_count: usize, context: PenaltyContext) !f32 {
     try dof.state.validate();
     const state_level = @as(f32, @floatFromInt((dof.state.current + 1) / 2));
@@ -832,6 +1021,57 @@ test "all seven DOF applications preserve pinned local transforms" {
         .penalty_multiplier = 3,
     } }, 1, 2), &affected, &coordinates);
     try std.testing.expectEqual(core.math.Vec2{ .x = 2, .y = -3 }, coordinates[2]);
+}
+
+test "frame rebuild preserves duplicate child anchors and parent DOFs move the child" {
+    const frames = [_]core.dof.FragmentFrame{
+        .{
+            .id = core.ids.FragmentId.fromIndex(0),
+            .atoms = .{ .start = 0, .len = 1 },
+            .attachments = .{ .start = 0, .len = 1 },
+        },
+        .{
+            .id = core.ids.FragmentId.fromIndex(1),
+            .parent = core.ids.FragmentId.fromIndex(0),
+            .parent_atom = core.ids.AtomId.fromIndex(0),
+            .anchor_atom = core.ids.AtomId.fromIndex(1),
+            .atoms = .{ .start = 1, .len = 2 },
+            .attachments = .{ .start = 1, .len = 0 },
+        },
+    };
+    const order = [_]core.ids.FragmentId{ core.ids.FragmentId.fromIndex(0), core.ids.FragmentId.fromIndex(1) };
+    const fragment_atoms = [_]core.ids.AtomId{
+        core.ids.AtomId.fromIndex(0),
+        core.ids.AtomId.fromIndex(1),
+        core.ids.AtomId.fromIndex(2),
+    };
+    const attachments = [_]core.dof.ChildAttachment{.{
+        .child = core.ids.FragmentId.fromIndex(1),
+        .atom = core.ids.AtomId.fromIndex(1),
+    }};
+    var local_atoms = [_]core.math.Vec2{ .{}, .{}, .{ .x = 50 } };
+    var local_attachments = [_]core.math.Vec2{.{ .x = 50, .y = 20 }};
+    var global: [3]core.math.Vec2 = undefined;
+    const pose = FramePose{
+        .frames = &frames,
+        .rebuild_order = &order,
+        .fragment_atoms = &fragment_atoms,
+        .child_attachments = &attachments,
+        .atom_coordinates = &local_atoms,
+        .attachment_coordinates = &local_attachments,
+        .global_coordinates = &global,
+    };
+    try pose.rebuild();
+    try std.testing.expectApproxEqAbs(@as(f32, 50), global[1].x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), global[1].y, 0.0001);
+
+    try applyToFrame(testDof(.{ .flip_fragment = .{} }, 1, 2), &.{}, pose);
+    try pose.rebuild();
+    try std.testing.expectEqual(core.math.Vec2{}, local_atoms[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), global[1].x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -20), global[1].y, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 96.423836), global[2].x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -38.569534), global[2].y, 0.0001);
 }
 
 test "DOF penalties preserve state levels and flip context" {

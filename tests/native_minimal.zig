@@ -178,6 +178,32 @@ test "minimal native generation reaches macrocycle lattice and forced-open fallb
     }});
 }
 
+test "minimal native generation runs discrete search for macrocycle substituents" {
+    const ring_size = 13;
+    var atoms: [ring_size + 2]api.AtomInput = undefined;
+    @memset(&atoms, .{});
+    var bonds: [ring_size + 2]api.BondInput = undefined;
+    for (bonds[0..ring_size], 0..) |*bond, index| bond.* = .{
+        .start = @intCast(index),
+        .end = @intCast((index + 1) % ring_size),
+    };
+    bonds[ring_size] = .{ .start = 2, .end = ring_size };
+    bonds[ring_size + 1] = .{ .start = ring_size, .end = ring_size + 1 };
+    const input = api.Input{ .atoms = &atoms, .bonds = &bonds };
+    var first = try generate(std.testing.allocator, input);
+    defer first.deinit();
+    var second = try generate(std.testing.allocator, input);
+    defer second.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, second.coordinates);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    for (bonds[ring_size..]) |bond| {
+        const dx = first.coordinates[bond.start].x - first.coordinates[bond.end].x;
+        const dy = first.coordinates[bond.start].y - first.coordinates[bond.end].y;
+        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(dx * dx + dy * dy), 0.01);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+}
+
 test "minimal native validation rejects malformed input before generation" {
     const atoms = [_]api.AtomInput{ .{}, .{} };
     try std.testing.expectError(error.InvalidAtomIndex, generate(std.testing.allocator, .{
