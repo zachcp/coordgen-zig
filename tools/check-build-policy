@@ -34,6 +34,8 @@ grep -F '"enable-oracle"' "$repo_root/build.zig" >/dev/null \
     || fail "oracle has no explicit opt-in boundary"
 grep -F 'library.installHeader(b.path("include/coordgen_abi.h"), "coordgen_abi.h")' \
     "$repo_root/build.zig" >/dev/null || fail "public C header is not installed"
+grep -F 'b.installFile("packaging/coordgen.pc", "lib/pkgconfig/coordgen.pc")' \
+    "$repo_root/build.zig" >/dev/null || fail "pkg-config metadata is not installed"
 if grep -E 'install(Header|File).*coordgen_probe|install(Header|File).*conformance' \
     "$repo_root/build.zig" >/dev/null; then
     fail "conformance probe header must never be installed"
@@ -59,4 +61,4 @@ python3 "$repo_root/tools/check-gate-strength" --self-test
 #     and compiles a consumer against it (wired into package-check);
 #   - that the pinned oracle archive is really the reviewed commit is
 #     tools/verify-upstream, which recomputes hashes rather than reading them.
-echo "verified std-only production package, and - as declared in build.zig's text - public-header install, non-installed probe, and lazy oracle policy"
+echo "verified std-only production package, and - as declared in build.zig's text - public-header/pkg-config install, non-installed probe, and lazy oracle policy"

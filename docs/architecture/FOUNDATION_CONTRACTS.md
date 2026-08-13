@@ -238,8 +238,8 @@ enumerated here with the distinction each one turns on.
 | Gate | Proves |
 |---|---|
 | `tools/verify-upstream` | The pinned archive's SHA-256, byte count, Git tree hash, LICENSE hash, and Zig package hash, all recomputed with the pinned toolchain. The strongest gate in the tree. |
-| `tools/check-install-isolation` | Builds into a scratch prefix created empty and destroyed after, then compiles and runs `tests/install_consumer.c` against `$prefix` alone. An archive without the ABI fails to link. Wired into `package-check`. |
-| `abi-check` | Links `tests/abi_layout.c` against the real library, so a name or signature drift from `include/coordgen_abi.h` is a link error. |
+| `tools/check-install-isolation` | Builds into a scratch prefix created empty and destroyed after, then compiles and runs `examples/install_consumer.c` both with direct prefix flags and through the installed `coordgen.pc`. An archive or package descriptor without the ABI fails to link. Wired into `package-check`. |
+| `abi-check` | Freezes every public POD's size, alignment, and field offsets in both C and Zig, then links `tests/abi_layout.c` against the real library so a name or signature drift from `include/coordgen_abi.h` is a link error. |
 | `assertNoFalseGreenSteps` (build.zig) | Asks the constructed graph whether each public step has dependencies. Runs at configure time on every invocation. |
 | `tools/check-gate-strength` | Every one of build.zig's C/C++ compile sites uses an approved strict flag set, with a narrow enumerated exemption for upstream-owned sources. Universality, not presence. |
 | `tools/check-module-imports` | No relative import crosses a layer; no bare import lacks an approved edge; `c_abi_exports` has exactly one importer. |
@@ -257,3 +257,14 @@ Both checkers with a `--self-test` mode (`check-module-imports`,
 plus a compliant control, so a gate cannot decay into one that passes
 everything. New gates follow the same rule: state what is asserted, and if the
 name implies content, assert content.
+
+## Non-Zig package discovery
+
+The stable surface is a C ABI, so the installed non-Zig discovery contract is
+pkg-config: `lib/pkgconfig/coordgen.pc` is relocatable from its own install
+location and names only the installed header and static archive. CMake package
+metadata is deliberately not shipped yet. There is no public C++ facade or
+released CMake consumer contract to model, and adding an unexercised imported
+target would create another existence-only gate. If a C++ facade is added, its
+own implementation Bead must add and execute a scratch CMake consumer before a
+`coordgen-config.cmake` becomes part of the install contract.

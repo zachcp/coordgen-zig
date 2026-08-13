@@ -39,16 +39,16 @@ zig_dto	zig.ResidueInteractionInput	src/api.zig	ResidueInteractionInput	5	src/c_
 zig_dto	zig.Options	src/api.zig	Options	11	src/api.zig::test "complete option table has pinned defaults"	executable	-
 zig_dto	zig.Input	src/api.zig	Input	6	src/api.zig::test "caller-controlled invalid states return errors"	executable	-
 zig_dto	zig.Result	src/api.zig	Result	8	src/api.zig::test "result allocation has explicit leak-free ownership"	executable	-
-c_dto	c.StringView	src/c_abi_types.zig	StringView	3	tests/abi_layout.c::string view layout	executable	-
-c_dto	c.IndexSpan	src/c_abi_types.zig	IndexSpan	3	src/c_abi_types.zig::pub const IndexSpan	executable	-
-c_dto	c.AtomInput	src/c_abi_types.zig	AtomInput	10	tests/abi_layout.c::atom input layout	executable	-
-c_dto	c.BondInput	src/c_abi_types.zig	BondInput	10	tests/abi_layout.c::bond input layout	executable	-
-c_dto	c.ResidueInput	src/c_abi_types.zig	ResidueInput	5	tests/abi_layout.c::residue input layout	executable	-
-c_dto	c.ResidueInteractionInput	src/c_abi_types.zig	ResidueInteractionInput	6	tests/abi_layout.c::residue interaction layout	executable	-
-c_dto	c.Options	src/c_abi_types.zig	Options	11	tests/abi_layout.c::options layout	executable	-
-c_dto	c.Input	src/c_abi_types.zig	Input	6	tests/abi_layout.c::input layout	executable	-
-c_dto	c.Result	src/c_abi_types.zig	Result	9	tests/abi_layout.c::result layout	executable	-
-c_span_dto	c.spans	src/c_abi_types.zig	generated spans	18	tests/abi_layout.c::result layout	executable	-
+c_dto	c.StringView	src/c_abi_types.zig	StringView	3	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_string_view_t	executable	-
+c_dto	c.IndexSpan	src/c_abi_types.zig	IndexSpan	3	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_index_span_t	executable	-
+c_dto	c.AtomInput	src/c_abi_types.zig	AtomInput	10	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_atom_input_t	executable	-
+c_dto	c.BondInput	src/c_abi_types.zig	BondInput	10	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_bond_input_t	executable	-
+c_dto	c.ResidueInput	src/c_abi_types.zig	ResidueInput	5	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_residue_input_t	executable	-
+c_dto	c.ResidueInteractionInput	src/c_abi_types.zig	ResidueInteractionInput	6	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_residue_interaction_input_t	executable	-
+c_dto	c.Options	src/c_abi_types.zig	Options	11	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_options_t	executable	-
+c_dto	c.Input	src/c_abi_types.zig	Input	6	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_input_t	executable	-
+c_dto	c.Result	src/c_abi_types.zig	Result	9	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_result_t	executable	-
+c_span_dto	c.spans	src/c_abi_types.zig	generated spans	18	tests/abi_layout.c::ASSERT_SPAN(coordgen_atom_span_t	executable	-
 error	error.EmptyGraph	src/core/errors.zig	EmptyGraph	1	src/c_abi/exports.zig::rejects an empty graph and leaves result zeroed	executable	-
 error	error.TooManyItems	src/core/errors.zig	TooManyItems	1	src/api.zig::error.TooManyItems	executable	-
 error	error.InvalidAtomicNumber	src/core/errors.zig	InvalidAtomicNumber	1	src/c_abi/exports.zig::.invalid_atomic_number	executable	-

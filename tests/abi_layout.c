@@ -2,28 +2,119 @@
 
 #include <stddef.h>
 
+#define ASSERT_LAYOUT(type, expected_size, expected_align)                    \
+    _Static_assert(sizeof(type) == (expected_size), #type " size");          \
+    _Static_assert(_Alignof(type) == (expected_align), #type " alignment")
+#define ASSERT_OFFSET(type, field, expected_offset)                           \
+    _Static_assert(offsetof(type, field) == (expected_offset),                \
+                   #type "." #field " offset")
+
 _Static_assert(sizeof(float) == 4, "CoordGen requires IEEE-width f32");
 _Static_assert(sizeof(void *) == 8, "initial ABI targets are 64-bit");
-_Static_assert(sizeof(coordgen_vec2_t) == 8, "coordgen_vec2_t layout");
-_Static_assert(sizeof(coordgen_vec3_t) == 12, "coordgen_vec3_t layout");
-_Static_assert(sizeof(coordgen_string_view_t) == 16, "string view layout");
-_Static_assert(sizeof(coordgen_atom_input_t) == 52, "atom input layout");
-_Static_assert(_Alignof(coordgen_atom_input_t) == 4, "atom input alignment");
-_Static_assert(offsetof(coordgen_atom_input_t, template_coordinates) == 28,
-               "atom template coordinate offset");
-_Static_assert(offsetof(coordgen_atom_input_t, reserved) == 48,
-               "atom reserved offset");
-_Static_assert(sizeof(coordgen_bond_input_t) == 40, "bond input layout");
-_Static_assert(sizeof(coordgen_residue_input_t) == 32, "residue input layout");
-_Static_assert(sizeof(coordgen_residue_interaction_input_t) == 56,
-               "residue interaction layout");
-_Static_assert(sizeof(coordgen_options_t) == 56, "options layout");
-_Static_assert(offsetof(coordgen_options_t, template_directory) == 40,
-               "template directory offset");
-_Static_assert(sizeof(coordgen_input_t) == 136, "input layout");
-_Static_assert(_Alignof(coordgen_input_t) == 8, "input alignment");
-_Static_assert(sizeof(coordgen_result_t) == 112, "result layout");
-_Static_assert(offsetof(coordgen_result_t, owner) == 104, "result owner offset");
+
+ASSERT_LAYOUT(coordgen_vec2_t, 8, 4);
+ASSERT_OFFSET(coordgen_vec2_t, x, 0);
+ASSERT_OFFSET(coordgen_vec2_t, y, 4);
+ASSERT_LAYOUT(coordgen_vec3_t, 12, 4);
+ASSERT_OFFSET(coordgen_vec3_t, x, 0);
+ASSERT_OFFSET(coordgen_vec3_t, y, 4);
+ASSERT_OFFSET(coordgen_vec3_t, z, 8);
+
+ASSERT_LAYOUT(coordgen_string_view_t, 16, 8);
+ASSERT_OFFSET(coordgen_string_view_t, ptr, 0);
+ASSERT_OFFSET(coordgen_string_view_t, len, 8);
+ASSERT_OFFSET(coordgen_string_view_t, reserved, 12);
+ASSERT_LAYOUT(coordgen_index_span_t, 16, 8);
+ASSERT_OFFSET(coordgen_index_span_t, ptr, 0);
+ASSERT_OFFSET(coordgen_index_span_t, len, 8);
+ASSERT_OFFSET(coordgen_index_span_t, reserved, 12);
+
+ASSERT_LAYOUT(coordgen_atom_input_t, 52, 4);
+ASSERT_OFFSET(coordgen_atom_input_t, atomic_number, 0);
+ASSERT_OFFSET(coordgen_atom_input_t, formal_charge, 4);
+ASSERT_OFFSET(coordgen_atom_input_t, flags, 8);
+ASSERT_OFFSET(coordgen_atom_input_t, stereo, 12);
+ASSERT_OFFSET(coordgen_atom_input_t, stereo_looking_from, 16);
+ASSERT_OFFSET(coordgen_atom_input_t, stereo_atom_a, 20);
+ASSERT_OFFSET(coordgen_atom_input_t, stereo_atom_b, 24);
+ASSERT_OFFSET(coordgen_atom_input_t, template_coordinates, 28);
+ASSERT_OFFSET(coordgen_atom_input_t, coordinates_3d, 36);
+ASSERT_OFFSET(coordgen_atom_input_t, reserved, 48);
+
+ASSERT_LAYOUT(coordgen_bond_input_t, 40, 4);
+ASSERT_OFFSET(coordgen_bond_input_t, start, 0);
+ASSERT_OFFSET(coordgen_bond_input_t, end, 4);
+ASSERT_OFFSET(coordgen_bond_input_t, order, 8);
+ASSERT_OFFSET(coordgen_bond_input_t, flags, 12);
+ASSERT_OFFSET(coordgen_bond_input_t, stereo, 16);
+ASSERT_OFFSET(coordgen_bond_input_t, stereo_atom_a, 20);
+ASSERT_OFFSET(coordgen_bond_input_t, stereo_atom_b, 24);
+ASSERT_OFFSET(coordgen_bond_input_t, display, 28);
+ASSERT_OFFSET(coordgen_bond_input_t, crossing_penalty_multiplier, 32);
+ASSERT_OFFSET(coordgen_bond_input_t, reserved, 36);
+
+ASSERT_LAYOUT(coordgen_residue_input_t, 32, 8);
+ASSERT_OFFSET(coordgen_residue_input_t, atom, 0);
+ASSERT_OFFSET(coordgen_residue_input_t, residue_number, 4);
+ASSERT_OFFSET(coordgen_residue_input_t, closest_ligand_atom, 8);
+ASSERT_OFFSET(coordgen_residue_input_t, reserved, 12);
+ASSERT_OFFSET(coordgen_residue_input_t, chain, 16);
+
+ASSERT_LAYOUT(coordgen_residue_interaction_input_t, 56, 8);
+ASSERT_OFFSET(coordgen_residue_interaction_input_t, start, 0);
+ASSERT_OFFSET(coordgen_residue_interaction_input_t, end, 4);
+ASSERT_OFFSET(coordgen_residue_interaction_input_t, other_start_atoms, 8);
+ASSERT_OFFSET(coordgen_residue_interaction_input_t, other_end_atoms, 24);
+ASSERT_OFFSET(coordgen_residue_interaction_input_t, crossing_penalty_multiplier, 40);
+ASSERT_OFFSET(coordgen_residue_interaction_input_t, reserved, 44);
+
+#define ASSERT_SPAN(type)                                                     \
+    ASSERT_LAYOUT(type, 16, 8);                                               \
+    ASSERT_OFFSET(type, ptr, 0);                                              \
+    ASSERT_OFFSET(type, len, 8);                                              \
+    ASSERT_OFFSET(type, reserved, 12)
+ASSERT_SPAN(coordgen_atom_span_t);
+ASSERT_SPAN(coordgen_bond_span_t);
+ASSERT_SPAN(coordgen_residue_span_t);
+ASSERT_SPAN(coordgen_residue_interaction_span_t);
+ASSERT_SPAN(coordgen_vec2_span_t);
+ASSERT_SPAN(coordgen_u32_span_t);
+#undef ASSERT_SPAN
+
+ASSERT_LAYOUT(coordgen_options_t, 56, 8);
+ASSERT_OFFSET(coordgen_options_t, precision, 0);
+ASSERT_OFFSET(coordgen_options_t, score_residue_interactions, 4);
+ASSERT_OFFSET(coordgen_options_t, treat_nonterminal_bonds_to_metal_as_zero_order, 8);
+ASSERT_OFFSET(coordgen_options_t, even_angles, 12);
+ASSERT_OFFSET(coordgen_options_t, skip_minimization, 16);
+ASSERT_OFFSET(coordgen_options_t, force_open_macrocycles, 20);
+ASSERT_OFFSET(coordgen_options_t, constrain_all_atoms, 24);
+ASSERT_OFFSET(coordgen_options_t, build_from_fragments, 28);
+ASSERT_OFFSET(coordgen_options_t, debug_coordinates, 32);
+ASSERT_OFFSET(coordgen_options_t, load_templates, 36);
+ASSERT_OFFSET(coordgen_options_t, template_directory, 40);
+
+ASSERT_LAYOUT(coordgen_input_t, 136, 8);
+ASSERT_OFFSET(coordgen_input_t, options, 0);
+ASSERT_OFFSET(coordgen_input_t, atoms, 56);
+ASSERT_OFFSET(coordgen_input_t, bonds, 72);
+ASSERT_OFFSET(coordgen_input_t, residues, 88);
+ASSERT_OFFSET(coordgen_input_t, residue_interactions, 104);
+ASSERT_OFFSET(coordgen_input_t, extra_bonds, 120);
+
+ASSERT_LAYOUT(coordgen_result_t, 112, 8);
+ASSERT_OFFSET(coordgen_result_t, coordinates, 0);
+ASSERT_OFFSET(coordgen_result_t, input_to_internal, 16);
+ASSERT_OFFSET(coordgen_result_t, internal_to_input, 32);
+ASSERT_OFFSET(coordgen_result_t, effective_bond_orders, 48);
+ASSERT_OFFSET(coordgen_result_t, bond_displays, 64);
+ASSERT_OFFSET(coordgen_result_t, atom_stereo, 80);
+ASSERT_OFFSET(coordgen_result_t, clean_pose, 96);
+ASSERT_OFFSET(coordgen_result_t, reserved, 100);
+ASSERT_OFFSET(coordgen_result_t, owner, 104);
+
+#undef ASSERT_OFFSET
+#undef ASSERT_LAYOUT
 _Static_assert(COORDGEN_BOND_ZERO == 0, "zero-order bond value");
 _Static_assert((int)COORDGEN_BOND_LENGTH == 50, "public bond length");
 

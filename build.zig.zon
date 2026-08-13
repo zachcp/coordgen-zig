@@ -19,6 +19,7 @@
         "conformance",
         "tests",
         "examples",
+        "packaging",
         "LICENSES",
         "README.md",
         "docs",

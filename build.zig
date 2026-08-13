@@ -370,6 +370,7 @@ pub fn build(b: *std.Build) !void {
     });
     library.installHeader(b.path("include/coordgen_abi.h"), "coordgen_abi.h");
     b.installArtifact(library);
+    b.installFile("packaging/coordgen.pc", "lib/pkgconfig/coordgen.pc");
 
     const module_tests = b.addTest(.{ .root_module = coordgen });
     const run_module_tests = b.addRunArtifact(module_tests);

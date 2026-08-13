@@ -1,0 +1,9 @@
+prefix=${pcfiledir}/../..
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: coordgen
+Description: Native Zig CoordGen library with a stable C ABI
+Version: 0.0.0
+Libs: -L${libdir} -lcoordgen
+Cflags: -I${includedir}
