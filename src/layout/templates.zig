@@ -10,6 +10,11 @@ pub const Edge = struct {
     start: u8,
     end: u8,
     order: core.chemistry.BondOrder = .single,
+    /// Absolute Z/E requirement. Callers leave this unspecified for ordinary
+    /// and small-ring double bonds, matching upstream's ignore-Z/E rule.
+    stereo: core.chemistry.BondStereo = .unspecified,
+    start_neighbor: ?u8 = null,
+    end_neighbor: ?u8 = null,
 };
 
 /// One immutable-database match. `mapping[candidate_atom]` is the template
@@ -76,7 +81,7 @@ pub fn findGraph(
     }
     for (data.templates, 0..) |template, template_index| {
         if (template.atom_len != atom_count) continue;
-        if (try compare(allocator, atom_count, bonds, templateEdges(template_index))) |mapping| {
+        if (try compare(allocator, atom_count, bonds, template_index)) |mapping| {
             return .{
                 .allocator = allocator,
                 .template_index = @intCast(template_index),
@@ -307,8 +312,9 @@ fn compare(
     allocator: std.mem.Allocator,
     atom_count: usize,
     molecule_bonds: []const Edge,
-    template_bonds: []const data.Bond,
+    template_index: usize,
 ) core.errors.Error!?[]u8 {
+    const template_bonds = templateEdges(template_index);
     const molecule_scores = allocator.alloc(u32, atom_count) catch return error.OutOfMemory;
     defer allocator.free(molecule_scores);
     const template_scores = allocator.alloc(u32, atom_count) catch return error.OutOfMemory;
@@ -319,8 +325,8 @@ fn compare(
     const matrix = allocator.alloc(bool, atom_count * atom_count) catch return error.OutOfMemory;
     defer allocator.free(matrix);
     for (molecule_scores, 0..) |molecule_score, molecule_index| {
-        for (template_scores, 0..) |template_score, template_index| {
-            matrix[molecule_index * atom_count + template_index] = molecule_score == template_score;
+        for (template_scores, 0..) |template_score, template_atom| {
+            matrix[molecule_index * atom_count + template_atom] = molecule_score == template_score;
         }
     }
     const mapping = allocator.alloc(u8, atom_count) catch return error.OutOfMemory;
@@ -328,7 +334,7 @@ fn compare(
     const used = allocator.alloc(bool, atom_count) catch return error.OutOfMemory;
     defer allocator.free(used);
     @memset(used, false);
-    if (!searchIdentity(0, mapping, used, matrix, atom_count, molecule_bonds, template_bonds)) {
+    if (!searchIdentity(0, mapping, used, matrix, atom_count, molecule_bonds, template_index)) {
         allocator.free(mapping);
         return null;
     }
@@ -387,9 +393,10 @@ fn searchIdentity(
     matrix: []const bool,
     atom_count: usize,
     molecule_bonds: []const Edge,
-    template_bonds: []const data.Bond,
+    template_index: usize,
 ) bool {
-    if (depth == atom_count) return true;
+    const template_bonds = templateEdges(template_index);
+    if (depth == atom_count) return stereoMappingMatches(mapping, molecule_bonds, template_index);
     for (0..atom_count) |template_atom| {
         if (!matrix[depth * atom_count + template_atom] or used[template_atom]) continue;
         var compatible = true;
@@ -405,10 +412,33 @@ fn searchIdentity(
         if (!compatible) continue;
         mapping[depth] = @intCast(template_atom);
         used[template_atom] = true;
-        if (searchIdentity(depth + 1, mapping, used, matrix, atom_count, molecule_bonds, template_bonds)) return true;
+        if (searchIdentity(depth + 1, mapping, used, matrix, atom_count, molecule_bonds, template_index)) return true;
         used[template_atom] = false;
     }
     return false;
+}
+
+fn stereoMappingMatches(mapping: []const u8, bonds: []const Edge, template_index: usize) bool {
+    for (bonds) |bond| {
+        const expected_z = switch (bond.stereo) {
+            .cis, .z => true,
+            .trans, .e => false,
+            .unspecified => continue,
+        };
+        const start_neighbor = bond.start_neighbor orelse continue;
+        const end_neighbor = bond.end_neighbor orelse continue;
+        if (start_neighbor >= mapping.len or end_neighbor >= mapping.len) return false;
+        const p1 = templateCoordinates(template_index, mapping[start_neighbor]);
+        const p2 = templateCoordinates(template_index, mapping[bond.start]);
+        const p3 = templateCoordinates(template_index, mapping[bond.end]);
+        const p4 = templateCoordinates(template_index, mapping[end_neighbor]);
+        const line_x = p3.x - p2.x;
+        const line_y = p3.y - p2.y;
+        const side1 = line_x * (p1.y - p2.y) - line_y * (p1.x - p2.x);
+        const side4 = line_x * (p4.y - p2.y) - line_y * (p4.x - p2.x);
+        if ((side1 * side4 > 0) != expected_z) return false;
+    }
+    return true;
 }
 
 fn hasTemplateBond(bonds: []const data.Bond, left: u8, right: u8) bool {
@@ -468,6 +498,54 @@ test "template matching rejects nonmatching and malformed graphs" {
 test "template matching cleans every injected allocation failure" {
     const edges = comptime fixtureEdges(80);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, findAndDiscard, .{&edges});
+}
+
+test "all 82 immutable templates are structurally matchable" {
+    var edge_buffer: [64]Edge = undefined;
+    for (data.templates, 0..) |template, template_index| {
+        const source_edges = templateEdges(template_index);
+        try std.testing.expect(source_edges.len <= edge_buffer.len);
+        for (source_edges, edge_buffer[0..source_edges.len]) |source, *destination| {
+            destination.* = .{
+                .start = source.from,
+                .end = source.to,
+                .order = core.chemistry.BondOrder.fromInt(source.order).?,
+            };
+        }
+        var match = (try findGraph(std.testing.allocator, template.atom_len, edge_buffer[0..source_edges.len])).?;
+        defer match.deinit();
+        // Earlier entries intentionally win when the database contains an
+        // isomorphic graph, exactly as in upstream's linear search.
+        try std.testing.expect(match.template_index <= template_index);
+        var seen: [256]bool = @splat(false);
+        for (match.mapping) |template_atom| {
+            try std.testing.expect(template_atom < data.templates[match.template_index].atom_len);
+            try std.testing.expect(!seen[template_atom]);
+            seen[template_atom] = true;
+        }
+        for (edge_buffer[0..source_edges.len]) |edge| {
+            try std.testing.expect(hasTemplateBond(
+                templateEdges(match.template_index),
+                match.mapping[edge.start],
+                match.mapping[edge.end],
+            ));
+        }
+    }
+}
+
+test "template identity enforces absolute double-bond geometry" {
+    const mapping = [_]u8{ 0, 1, 2, 3, 4 };
+    var edge = Edge{
+        .start = 0,
+        .end = 1,
+        .order = .double,
+        .stereo = .z,
+        .start_neighbor = 3,
+        .end_neighbor = 2,
+    };
+    const identity_is_z = stereoMappingMatches(&mapping, &.{edge}, 80);
+    edge.stereo = .e;
+    try std.testing.expect(identity_is_z != stereoMappingMatches(&mapping, &.{edge}, 80));
 }
 
 fn fixtureAtom(index: u32) model.Atom {
