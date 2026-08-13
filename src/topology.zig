@@ -2,9 +2,17 @@ const std = @import("std");
 const core = @import("core");
 const model = @import("model");
 
+pub const canonical = @import("topology/canonical.zig");
+pub const prepare = @import("topology/prepare.zig");
+
 pub const AtomId = core.ids.AtomId;
 pub const BondId = core.ids.BondId;
 pub const MoleculeId = core.ids.MoleculeId;
+
+test {
+    _ = canonical;
+    _ = prepare;
+}
 
 /// Allocator-owned graph indexing after upstream's skip/zero-order/hidden
 /// filtering. Neighbor and incident-bond slices are parallel and retain bond
@@ -212,6 +220,303 @@ pub const Graph = struct {
     }
 };
 
+/// Complete preparation seam consumed by the generator: canonical owned model
+/// storage plus structural adjacency and connected components built from that
+/// exact storage. Deinitialization is the reverse construction order.
+pub const PreparedGraph = struct {
+    working: model.WorkingGraph,
+    graph: Graph,
+    rings: RingMembership,
+    /// Probe-compatible scores concatenated in component order. Upstream's
+    /// morganScores returns no vector for singleton components, so neither do
+    /// we; this is deliberately not one value per active atom.
+    component_morgan_scores: []u32,
+
+    pub fn deinit(self: *PreparedGraph) void {
+        self.working.allocator.free(self.component_morgan_scores);
+        self.rings.deinit();
+        self.graph.deinit();
+        self.working.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn prepareInput(allocator: std.mem.Allocator, input: anytype) core.errors.Error!PreparedGraph {
+    var normalized = try prepare.init(allocator, input);
+    errdefer normalized.deinit();
+    var graph = try Graph.init(allocator, normalized.working.atoms, normalized.working.bonds);
+    errdefer graph.deinit();
+    var rings = try RingMembership.init(allocator, graph, normalized.working.bonds);
+    errdefer rings.deinit();
+    const component_morgan_scores = try componentMorganScores(allocator, graph, normalized.working.bonds);
+    return .{
+        .working = normalized.working,
+        .graph = graph,
+        .rings = rings,
+        .component_morgan_scores = component_morgan_scores,
+    };
+}
+
+pub const RingMembership = struct {
+    allocator: std.mem.Allocator,
+    rings: []model.Ring,
+    ring_atoms: []AtomId,
+    ring_bonds: []BondId,
+    atom_ring_offsets: []u32,
+    atom_rings: []core.ids.RingId,
+    bond_ring_offsets: []u32,
+    bond_rings: []core.ids.RingId,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        graph: Graph,
+        bonds: []const model.Bond,
+    ) core.errors.Error!RingMembership {
+        var ring_list: std.ArrayList(model.Ring) = .empty;
+        defer ring_list.deinit(allocator);
+        var ring_bond_list: std.ArrayList(BondId) = .empty;
+        defer ring_bond_list.deinit(allocator);
+        const visited = allocator.alloc(bool, bonds.len) catch return error.OutOfMemory;
+        defer allocator.free(visited);
+        const parent = allocator.alloc(BondId, bonds.len) catch return error.OutOfMemory;
+        defer allocator.free(parent);
+        const parent_at_start = allocator.alloc(bool, bonds.len) catch return error.OutOfMemory;
+        defer allocator.free(parent_at_start);
+        const queue = allocator.alloc(BondId, graph.structural_bonds.len) catch return error.OutOfMemory;
+        defer allocator.free(queue);
+        const candidate = allocator.alloc(BondId, graph.structural_bonds.len) catch return error.OutOfMemory;
+        defer allocator.free(candidate);
+
+        for (graph.structuralBonds()) |root| {
+            @memset(visited, false);
+            @memset(parent, .invalid);
+            @memset(parent_at_start, true);
+            visited[root.index()] = true;
+            queue[0] = root;
+            var head: usize = 0;
+            var tail: usize = 1;
+            var closed = false;
+            while (head < tail and !closed) : (head += 1) {
+                const last = queue[head];
+                const last_bond = bonds[last.index()];
+                const pivot = if (parent_at_start[last.index()]) last_bond.end else last_bond.start;
+                for (graph.incidentBonds(pivot)) |next| {
+                    if (next == last) continue;
+                    if (visited[next.index()]) {
+                        if (next == root) {
+                            var candidate_count: usize = 0;
+                            var cursor = last;
+                            while (cursor != .invalid) {
+                                candidate[candidate_count] = cursor;
+                                candidate_count += 1;
+                                cursor = parent[cursor.index()];
+                            }
+                            if (!containsRing(ring_list.items, ring_bond_list.items, candidate[0..candidate_count])) {
+                                const ring_id = core.ids.RingId.fromIndex(@intCast(ring_list.items.len));
+                                ring_list.append(allocator, .{
+                                    .id = ring_id,
+                                    .atom_start = 0,
+                                    .atom_count = 0,
+                                    .bond_start = @intCast(ring_bond_list.items.len),
+                                    .bond_count = @intCast(candidate_count),
+                                }) catch return error.OutOfMemory;
+                                ring_bond_list.appendSlice(allocator, candidate[0..candidate_count]) catch return error.OutOfMemory;
+                            }
+                            closed = true;
+                        }
+                    } else {
+                        if (bonds[next.index()].end == pivot) parent_at_start[next.index()] = false;
+                        parent[next.index()] = last;
+                        visited[next.index()] = true;
+                        queue[tail] = next;
+                        tail += 1;
+                    }
+                }
+            }
+        }
+
+        var ring_atom_list: std.ArrayList(AtomId) = .empty;
+        defer ring_atom_list.deinit(allocator);
+        for (ring_list.items) |*ring| {
+            ring.atom_start = @intCast(ring_atom_list.items.len);
+            const member_bonds = ring_bond_list.items[ring.bond_start..][0..ring.bond_count];
+            for (0..graph.component_of.len) |atom_index| {
+                const atom = AtomId.fromIndex(@intCast(atom_index));
+                if (graph.component(atom) == null or !ringContainsAtom(member_bonds, bonds, atom)) continue;
+                ring_atom_list.append(allocator, atom) catch return error.OutOfMemory;
+            }
+            ring.atom_count = @intCast(ring_atom_list.items.len - ring.atom_start);
+        }
+
+        const rings = ring_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer allocator.free(rings);
+        const ring_bonds = ring_bond_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer allocator.free(ring_bonds);
+        const ring_atoms = ring_atom_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer allocator.free(ring_atoms);
+        const atom_membership = try buildMembership(allocator, graph.component_of.len, rings, ring_atoms, true);
+        errdefer {
+            allocator.free(atom_membership.ids);
+            allocator.free(atom_membership.offsets);
+        }
+        const bond_membership = try buildMembership(allocator, bonds.len, rings, ring_bonds, false);
+        return .{
+            .allocator = allocator,
+            .rings = rings,
+            .ring_atoms = ring_atoms,
+            .ring_bonds = ring_bonds,
+            .atom_ring_offsets = atom_membership.offsets,
+            .atom_rings = atom_membership.ids,
+            .bond_ring_offsets = bond_membership.offsets,
+            .bond_rings = bond_membership.ids,
+        };
+    }
+
+    pub fn deinit(self: *RingMembership) void {
+        self.allocator.free(self.bond_rings);
+        self.allocator.free(self.bond_ring_offsets);
+        self.allocator.free(self.atom_rings);
+        self.allocator.free(self.atom_ring_offsets);
+        self.allocator.free(self.ring_bonds);
+        self.allocator.free(self.ring_atoms);
+        self.allocator.free(self.rings);
+        self.* = undefined;
+    }
+
+    pub fn atoms(self: RingMembership, ring: core.ids.RingId) []const AtomId {
+        const record = self.rings[ring.index()];
+        return self.ring_atoms[record.atom_start..][0..record.atom_count];
+    }
+
+    pub fn ringBonds(self: RingMembership, ring: core.ids.RingId) []const BondId {
+        const record = self.rings[ring.index()];
+        return self.ring_bonds[record.bond_start..][0..record.bond_count];
+    }
+
+    pub fn atomRings(self: RingMembership, atom: AtomId) []const core.ids.RingId {
+        return self.atom_rings[self.atom_ring_offsets[atom.index()]..self.atom_ring_offsets[atom.index() + 1]];
+    }
+
+    pub fn bondRings(self: RingMembership, bond: BondId) []const core.ids.RingId {
+        return self.bond_rings[self.bond_ring_offsets[bond.index()]..self.bond_ring_offsets[bond.index() + 1]];
+    }
+};
+
+const Membership = struct { offsets: []u32, ids: []core.ids.RingId };
+
+fn buildMembership(
+    allocator: std.mem.Allocator,
+    item_count: usize,
+    rings: []const model.Ring,
+    members: anytype,
+    comptime atoms: bool,
+) core.errors.Error!Membership {
+    const offsets = allocator.alloc(u32, item_count + 1) catch return error.OutOfMemory;
+    errdefer allocator.free(offsets);
+    @memset(offsets, 0);
+    for (rings) |ring| {
+        const start = if (atoms) ring.atom_start else ring.bond_start;
+        const count = if (atoms) ring.atom_count else ring.bond_count;
+        for (members[start..][0..count]) |member| offsets[member.index() + 1] += 1;
+    }
+    for (offsets[1..], offsets[0 .. offsets.len - 1]) |*value, previous| value.* += previous;
+    const ids = allocator.alloc(core.ids.RingId, offsets[item_count]) catch return error.OutOfMemory;
+    errdefer allocator.free(ids);
+    const cursors = allocator.dupe(u32, offsets[0..item_count]) catch return error.OutOfMemory;
+    defer allocator.free(cursors);
+    for (rings) |ring| {
+        const start = if (atoms) ring.atom_start else ring.bond_start;
+        const count = if (atoms) ring.atom_count else ring.bond_count;
+        for (members[start..][0..count]) |member| {
+            ids[cursors[member.index()]] = ring.id;
+            cursors[member.index()] += 1;
+        }
+    }
+    return .{ .offsets = offsets, .ids = ids };
+}
+
+fn containsRing(rings: []const model.Ring, ring_bonds: []const BondId, candidate: []const BondId) bool {
+    for (rings) |ring| {
+        if (ring.bond_count != candidate.len) continue;
+        const existing = ring_bonds[ring.bond_start..][0..ring.bond_count];
+        var same = true;
+        for (candidate) |bond| {
+            if (std.mem.indexOfScalar(BondId, existing, bond) == null) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return true;
+    }
+    return false;
+}
+
+fn ringContainsAtom(ring_bonds: []const BondId, bonds: []const model.Bond, atom: AtomId) bool {
+    for (ring_bonds) |bond_id| {
+        const bond = bonds[bond_id.index()];
+        if (bond.start == atom or bond.end == atom) return true;
+    }
+    return false;
+}
+
+fn componentMorganScores(
+    allocator: std.mem.Allocator,
+    graph: Graph,
+    bonds: []const model.Bond,
+) core.errors.Error![]u32 {
+    var score_count: usize = 0;
+    var largest_component: usize = 0;
+    for (0..graph.component_count) |component_index| {
+        const members = graph.componentMembers(MoleculeId.fromIndex(@intCast(component_index)));
+        if (members.len >= 2) score_count += members.len;
+        largest_component = @max(largest_component, members.len);
+    }
+    const scores = allocator.alloc(u32, score_count) catch return error.OutOfMemory;
+    errdefer allocator.free(scores);
+    if (score_count == 0) return scores;
+    const cumulative = allocator.alloc(u32, largest_component) catch return error.OutOfMemory;
+    defer allocator.free(cumulative);
+    const ordered = allocator.alloc(u32, largest_component) catch return error.OutOfMemory;
+    defer allocator.free(ordered);
+
+    var score_offset: usize = 0;
+    for (0..graph.component_count) |component_index| {
+        const component_id = MoleculeId.fromIndex(@intCast(component_index));
+        const members = graph.componentMembers(component_id);
+        if (members.len < 2) continue;
+        const current = scores[score_offset..][0..members.len];
+        @memset(current, 1);
+        @memset(cumulative[0..members.len], 0);
+        var old_ties = members.len;
+        while (true) {
+            for (graph.structuralBonds()) |bond_id| {
+                const bond = bonds[bond_id.index()];
+                if (graph.component(bond.start).? != component_id) continue;
+                const start = memberIndex(members, bond.start);
+                const end = memberIndex(members, bond.end);
+                cumulative[start] +%= current[end];
+                cumulative[end] +%= current[start];
+            }
+            @memcpy(ordered[0..members.len], cumulative[0..members.len]);
+            std.mem.sort(u32, ordered[0..members.len], {}, std.sort.asc(u32));
+            var new_ties: usize = 0;
+            for (ordered[1..members.len], ordered[0 .. members.len - 1]) |score, previous| {
+                new_ties += @intFromBool(score == previous);
+            }
+            if (new_ties >= old_ties) break;
+            old_ties = new_ties;
+            @memcpy(current, cumulative[0..members.len]);
+        }
+        score_offset += members.len;
+    }
+    return scores;
+}
+
+fn memberIndex(members: []const AtomId, atom: AtomId) usize {
+    for (members, 0..) |member, index| if (member == atom) return index;
+    unreachable;
+}
+
 fn isStructuralBond(atoms: []const model.Atom, bond: model.Bond) bool {
     return !bond.skip and
         bond.effective_order != .zero and
@@ -329,6 +634,111 @@ test "cyclic and disconnected components repeat in stable traversal order" {
     try std.testing.expectEqualSlices(BondId, first.structural_bonds, second.structural_bonds);
     try std.testing.expectEqualSlices(MoleculeId, first.component_of, second.component_of);
     try std.testing.expectEqualSlices(AtomId, first.component_atoms, second.component_atoms);
+}
+
+test "component Morgan scores match probe semantics including singleton omission" {
+    const atoms = [_]model.Atom{ makeAtom(0), makeAtom(1), makeAtom(2), makeAtom(3) };
+    const input_bonds = [_]model.Bond{ makeBond(0, 0, 1), makeBond(1, 0, 2) };
+    var graph = try Graph.init(std.testing.allocator, &atoms, &input_bonds);
+    defer graph.deinit();
+    const scores = try componentMorganScores(std.testing.allocator, graph, &input_bonds);
+    defer std.testing.allocator.free(scores);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 1 }, scores);
+}
+
+fn scoreAndDiscard(allocator: std.mem.Allocator, graph: Graph, bonds: []const model.Bond) !void {
+    const scores = try componentMorganScores(allocator, graph, bonds);
+    allocator.free(scores);
+}
+
+test "component Morgan scoring reports and cleans every allocation failure" {
+    const atoms = [_]model.Atom{ makeAtom(0), makeAtom(1), makeAtom(2), makeAtom(3) };
+    const input_bonds = [_]model.Bond{ makeBond(0, 0, 1), makeBond(1, 0, 2) };
+    var graph = try Graph.init(std.testing.allocator, &atoms, &input_bonds);
+    defer graph.deinit();
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        scoreAndDiscard,
+        .{ graph, &input_bonds },
+    );
+}
+
+fn prepareAndDiscard(
+    allocator: std.mem.Allocator,
+    atoms: []const prepare.TestAtom,
+    bonds: []const prepare.TestBond,
+) !void {
+    var prepared = try prepareInput(allocator, prepare.TestInput{ .atoms = atoms, .bonds = bonds });
+    prepared.deinit();
+}
+
+test "complete preparation seam matches pinned oracle maps, components, and Morgan ranks" {
+    const atoms = [_]prepare.TestAtom{
+        .{ .atomic_number = .iron },
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .oxygen },
+        .{ .atomic_number = .phosphorus },
+        .{ .atomic_number = .carbon, .hidden = true },
+    };
+    const bonds = [_]prepare.TestBond{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 0, .end = 2 },
+        .{ .start = 1, .end = 3 },
+        .{ .start = 3, .end = 4 },
+    };
+    var prepared = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &atoms, .bonds = &bonds });
+    defer prepared.deinit();
+
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 3, 1 }, prepared.working.order.activeInternalToInput(4));
+    try std.testing.expectEqual(@as(u32, 2), prepared.graph.component_count);
+    try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1) }, prepared.graph.componentMembers(MoleculeId.fromIndex(0)));
+    try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(2), AtomId.fromIndex(3) }, prepared.graph.componentMembers(MoleculeId.fromIndex(1)));
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1 }, prepared.component_morgan_scores);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        prepareAndDiscard,
+        .{ &atoms, &bonds },
+    );
+}
+
+test "ring perception matches pinned oracle cycle and fused probes" {
+    const cycle_atoms = [_]prepare.TestAtom{ .{}, .{ .atomic_number = .nitrogen }, .{ .atomic_number = .oxygen }, .{} };
+    const cycle_bonds = [_]prepare.TestBond{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 0 },
+    };
+    var cycle = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &cycle_atoms, .bonds = &cycle_bonds });
+    defer cycle.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cycle.rings.rings.len);
+    try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(2), AtomId.fromIndex(3) }, cycle.rings.atoms(core.ids.RingId.fromIndex(0)));
+    try std.testing.expectEqualSlices(core.ids.RingId, &.{core.ids.RingId.fromIndex(0)}, cycle.rings.atomRings(AtomId.fromIndex(0)));
+
+    const fused_atoms = [_]prepare.TestAtom{ .{}, .{}, .{}, .{}, .{}, .{} };
+    const fused_bonds = [_]prepare.TestBond{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 0 },
+        .{ .start = 2, .end = 5 },
+        .{ .start = 5, .end = 4 },
+        .{ .start = 4, .end = 3 },
+    };
+    var fused = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &fused_atoms, .bonds = &fused_bonds });
+    defer fused.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 2, 3, 1, 5, 0, 4 }, fused.working.order.activeInternalToInput(6));
+    try std.testing.expectEqual(@as(usize, 2), fused.rings.rings.len);
+    try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(2), AtomId.fromIndex(4) }, fused.rings.atoms(core.ids.RingId.fromIndex(0)));
+    try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(3), AtomId.fromIndex(5) }, fused.rings.atoms(core.ids.RingId.fromIndex(1)));
+    try std.testing.expectEqual(@as(usize, 2), fused.rings.atomRings(AtomId.fromIndex(0)).len);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        prepareAndDiscard,
+        .{ &fused_atoms, &fused_bonds },
+    );
 }
 
 test "adjacency and component invariants hold across path and cycle families" {
