@@ -191,6 +191,37 @@ pub fn placeAroundLigand(
         if (remaining >= before) return error.InvalidMapping;
         crown_index = std.math.add(u32, crown_index, 1) catch return error.TooManyItems;
     }
+    try minimizeResidueClashes(allocator, atoms, residues);
+}
+
+/// Upstream's residue-only minimization consists of one point-clash
+/// interaction per residue pair at a 1.5-bond-length rest distance.
+pub fn minimizeResidueClashes(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    residues: []const model.Residue,
+) core.errors.Error!void {
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+    for (residues, 0..) |residue, index| {
+        if (residue.atom.index() >= atoms.len) return error.InvalidMapping;
+        for (residues[0..index]) |other| {
+            if (other.atom.index() >= atoms.len) return error.InvalidMapping;
+            if (interactions.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+            interactions.append(allocator, .{
+                .id = core.ids.InteractionId.fromIndex(@intCast(interactions.items.len)),
+                .payload = .{ .clash = .{
+                    .segment_start = residue.atom,
+                    .point = other.atom,
+                    .segment_end = residue.atom,
+                    .rest_squared_distance = (core.math.bond_length * 1.5) * (core.math.bond_length * 1.5),
+                } },
+            }) catch return error.OutOfMemory;
+        }
+    }
+    if (interactions.items.len != 0) {
+        _ = try optimize.minimizeMolecule(allocator, atoms, interactions.items, .{}, null);
+    }
 }
 
 const GroupPriorityContext = struct {
@@ -740,4 +771,17 @@ test "residue crown placement is deterministic and allocation-clean" {
         "A",
         &interactions,
     });
+}
+
+test "residue-only minimization separates close representatives" {
+    var atoms = [_]model.Atom{
+        testAtom(0, .{ .x = -10 }),
+        testAtom(1, .{ .x = 10 }),
+    };
+    const residue_input = [_]model.Residue{
+        .{ .id = core.ids.ResidueId.fromIndex(0), .atom = core.ids.AtomId.fromIndex(0), .chain_start = 0, .chain_len = 1, .residue_number = 1 },
+        .{ .id = core.ids.ResidueId.fromIndex(1), .atom = core.ids.AtomId.fromIndex(1), .chain_start = 0, .chain_len = 1, .residue_number = 2 },
+    };
+    try minimizeResidueClashes(std.testing.allocator, &atoms, &residue_input);
+    try std.testing.expect(distance(atoms[0].coordinates, atoms[1].coordinates) > 20);
 }
