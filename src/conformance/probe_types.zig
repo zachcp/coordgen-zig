@@ -72,6 +72,7 @@ pub const ProbeResult = extern struct {
     fragment_atoms: c_abi.U32Span = .{},
     fragment_rings: c_abi.U32Span = .{},
     component_atoms: c_abi.U32Span = .{},
+    dof_affected_atoms: c_abi.U32Span = .{},
     template_mapping: ?[*]const TemplateMappingProbe = null,
     template_mapping_count: u32 = 0,
     template_mapping_reserved: u32 = 0,
@@ -181,13 +182,13 @@ test "probe result mirrors coordgen_probe_result_t exactly" {
     // tests/probe_layout.c freezes the same numbers on the C side; a
     // conformance run reads oracle memory through this declaration, so a
     // silent divergence here would be read as data.
-    try std.testing.expectEqual(@as(usize, 208), @sizeOf(ProbeResult));
+    try std.testing.expectEqual(@as(usize, 224), @sizeOf(ProbeResult));
     try std.testing.expectEqual(@as(usize, 8), @alignOf(ProbeResult));
-    try std.testing.expectEqual(@as(usize, 112), @offsetOf(ProbeResult, "template_mapping"));
-    try std.testing.expectEqual(@as(usize, 128), @offsetOf(ProbeResult, "rings"));
-    try std.testing.expectEqual(@as(usize, 144), @offsetOf(ProbeResult, "fragments"));
-    try std.testing.expectEqual(@as(usize, 160), @offsetOf(ProbeResult, "dofs"));
-    try std.testing.expectEqual(@as(usize, 176), @offsetOf(ProbeResult, "components"));
-    try std.testing.expectEqual(@as(usize, 188), @offsetOf(ProbeResult, "clean_pose"));
-    try std.testing.expectEqual(@as(usize, 200), @offsetOf(ProbeResult, "owner"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(ProbeResult, "template_mapping"));
+    try std.testing.expectEqual(@as(usize, 144), @offsetOf(ProbeResult, "rings"));
+    try std.testing.expectEqual(@as(usize, 160), @offsetOf(ProbeResult, "fragments"));
+    try std.testing.expectEqual(@as(usize, 176), @offsetOf(ProbeResult, "dofs"));
+    try std.testing.expectEqual(@as(usize, 192), @offsetOf(ProbeResult, "components"));
+    try std.testing.expectEqual(@as(usize, 204), @offsetOf(ProbeResult, "clean_pose"));
+    try std.testing.expectEqual(@as(usize, 216), @offsetOf(ProbeResult, "owner"));
 }

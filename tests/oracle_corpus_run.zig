@@ -207,6 +207,7 @@ fn emitProbe(
     const fragment_atoms = spanValues(probe.fragment_atoms);
     const fragment_rings = spanValues(probe.fragment_rings);
     const component_atoms = spanValues(probe.component_atoms);
+    const dof_affected_atoms = spanValues(probe.dof_affected_atoms);
 
     var rings: std.ArrayList([]const u8) = .empty;
     defer freeRecords(gpa, &rings);
@@ -246,7 +247,7 @@ fn emitProbe(
     for (probe.dofSlice()) |dof| {
         try dofs.append(gpa, try std.fmt.allocPrint(
             gpa,
-            "[kind={d} fragment={d} state={d}/{d}/{d} tier={d} affected={d} atoms={d},{d} ring={d} multiplier={d}]",
+            "[kind={d} fragment={d} state={d}/{d}/{d} tier={d} affected={f} atoms={d},{d} ring={d} multiplier={d}]",
             .{
                 @backingInt(dof.kind),
                 dof.fragment,
@@ -254,7 +255,7 @@ fn emitProbe(
                 dof.optimal_state,
                 dof.state_count,
                 dof.tier,
-                dof.affected_count,
+                U32List{ .values = slice(dof_affected_atoms, dof.affected_start, dof.affected_count) },
                 dof.atom_a,
                 dof.atom_b,
                 dof.ring,

@@ -8,7 +8,7 @@ extern "C" {
 #endif
 
 /* Conformance-only. Never install this header or promise version stability. */
-#define COORDGEN_PROBE_VERSION UINT32_C(1)
+#define COORDGEN_PROBE_VERSION UINT32_C(2)
 
 typedef uint32_t coordgen_probe_dof_kind_t;
 enum {
@@ -102,6 +102,7 @@ typedef struct coordgen_probe_result {
     coordgen_u32_span_t fragment_atoms;
     coordgen_u32_span_t fragment_rings;
     coordgen_u32_span_t component_atoms;
+    coordgen_u32_span_t dof_affected_atoms;
     coordgen_probe_template_mapping_t *template_mapping;
     uint32_t template_mapping_count;
     uint32_t template_mapping_reserved;

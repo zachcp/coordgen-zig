@@ -152,6 +152,18 @@ static int fragment_parent_probe_smoke(void) {
     coordgen_input_t input = {0};
     coordgen_probe_result_t probe = {0};
     uint32_t index;
+    static const uint32_t kinds[13] = {0, 1, 2, 3, 3, 0, 1, 2, 0, 1, 2, 3, 3};
+    static const uint32_t fragments[13] = {0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2};
+    static const uint32_t counts[13] = {1, 7, 1, 2, 2, 2, 7, 5, 2, 7, 5, 2, 2};
+    static const uint32_t tiers[13] = {0, 2, 3, 4, 4, 0, 2, 3, 0, 2, 3, 4, 4};
+    static const uint32_t affected[13] = {0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1};
+    static const uint32_t affected_starts[13] = {0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 3};
+    static const uint32_t affected_atoms[4] = {0, 1, 4, 3};
+    static const uint32_t pivots[13] = {
+        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 1, 0,
+        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX,
+        COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 3, 4
+    };
 
     for (index = 0; index < 5; ++index) {
         atoms[index].atomic_number = 6;
@@ -178,8 +190,31 @@ static int fragment_parent_probe_smoke(void) {
         coordgen_probe_result_free(&probe);
         return 25;
     }
+    if (probe.dof_count != 13 || probe.dof_affected_atoms.len != 4) {
+        coordgen_probe_result_free(&probe);
+        return 26;
+    }
+    for (index = 0; index < 4; ++index) {
+        if (probe.dof_affected_atoms.ptr[index] != affected_atoms[index]) {
+            coordgen_probe_result_free(&probe);
+            return 27;
+        }
+    }
+    for (index = 0; index < probe.dof_count; ++index) {
+        const coordgen_probe_dof_t *d = &probe.dofs[index];
+        const float expected_penalty = (index == 5 || index == 8) ? 10.0f : 0.0f;
+        if (d->id != index || d->kind != kinds[index] || d->fragment != fragments[index] ||
+            d->current_state != 0 || d->optimal_state != 0 || d->state_count != counts[index] ||
+            d->tier != tiers[index] || d->affected_start != affected_starts[index] ||
+            d->affected_count != affected[index] ||
+            d->atom_a != pivots[index] || d->atom_b != COORDGEN_INVALID_INDEX ||
+            d->current_penalty != expected_penalty) {
+            coordgen_probe_result_free(&probe);
+            return 28;
+        }
+    }
     coordgen_probe_result_free(&probe);
-    return probe.owner == 0 ? 0 : 26;
+    return probe.owner == 0 ? 0 : 29;
 }
 
 /* cgz-7v2.8 regression: build_from_fragments must not be silently ignored.

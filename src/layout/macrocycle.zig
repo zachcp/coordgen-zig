@@ -882,10 +882,11 @@ pub fn collectAllDofs(
             },
         };
         for (primary) |entry| {
-            if (items.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+            if (items.items.len >= std.math.maxInt(u32) or affected.items.len > std.math.maxInt(u32)) return error.TooManyItems;
             items.append(allocator, .{
                 .id = core.ids.DofId.fromIndex(@intCast(items.items.len)),
                 .fragment = fragment.id,
+                .affected_atoms = .{ .start = @intCast(affected.items.len) },
                 .state = .{ .count = entry.count, .tier = entry.tier },
                 .payload = entry.payload,
             }) catch return error.OutOfMemory;
@@ -1528,6 +1529,74 @@ fn collectAllDofsAndDiscard(
 ) !void {
     var dofs = try collectAllDofs(allocator, bonds, graph, membership, fragmentation);
     defer dofs.deinit();
+}
+
+test "five-atom path DOFs match the stable upstream probe" {
+    const input_atoms = [_]topology.prepare.TestAtom{ .{}, .{}, .{}, .{}, .{} };
+    const input_bonds = [_]topology.prepare.TestBond{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 4 },
+    };
+    var prepared = try topology.prepareInput(std.testing.allocator, topology.prepare.TestInput{
+        .atoms = &input_atoms,
+        .bonds = &input_bonds,
+    });
+    defer prepared.deinit();
+    var fragmentation = try fragments.Fragmentation.init(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+    );
+    defer fragmentation.deinit();
+    var dofs = try collectAllDofs(
+        std.testing.allocator,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        fragmentation,
+    );
+    defer dofs.deinit();
+
+    const expected_kinds = [_]core.dof.DofKind{
+        .flip_fragment,   .change_parent_bond_length, .rotate_fragment, .scale_atoms,   .scale_atoms,
+        .flip_fragment,   .change_parent_bond_length, .rotate_fragment, .flip_fragment, .change_parent_bond_length,
+        .rotate_fragment, .scale_atoms,               .scale_atoms,
+    };
+    const expected_fragments = [_]u32{ 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 2, 2 };
+    const expected_counts = [_]u32{ 1, 7, 1, 2, 2, 2, 7, 5, 2, 7, 5, 2, 2 };
+    const expected_tiers = [_]u32{ 0, 2, 3, 4, 4, 0, 2, 3, 0, 2, 3, 4, 4 };
+    const expected_affected = [_]u32{ 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1 };
+    const expected_affected_starts = [_]u32{ 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 3 };
+    const expected_affected_atoms = [_]u32{ 0, 1, 4, 3 };
+    const expected_pivots = [_]u32{
+        std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), 1,                    0,
+        std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32),
+        std.math.maxInt(u32), 3,                    4,
+    };
+    try std.testing.expectEqual(expected_kinds.len, dofs.items.len);
+    for (dofs.items, 0..) |dof, index| {
+        try std.testing.expectEqual(core.ids.DofId.fromIndex(@intCast(index)), dof.id);
+        try std.testing.expectEqual(expected_kinds[index], dof.kind());
+        try std.testing.expectEqual(expected_fragments[index], dof.fragment.index());
+        try std.testing.expectEqual(@as(u32, 0), dof.state.current);
+        try std.testing.expectEqual(@as(u32, 0), dof.state.optimal);
+        try std.testing.expectEqual(expected_counts[index], dof.state.count);
+        try std.testing.expectEqual(expected_tiers[index], dof.state.tier);
+        try std.testing.expectEqual(expected_affected_starts[index], dof.affected_atoms.start);
+        try std.testing.expectEqual(expected_affected[index], dof.affected_atoms.len);
+        const pivot = switch (dof.payload) {
+            .scale_atoms => |scale| prepared.working.atoms[scale.pivot.index()].input_index,
+            else => std.math.maxInt(u32),
+        };
+        try std.testing.expectEqual(expected_pivots[index], pivot);
+    }
+    for (dofs.affected_atoms, expected_affected_atoms) |atom, expected| {
+        try std.testing.expectEqual(expected, prepared.working.atoms[atom.index()].input_index);
+    }
 }
 
 test "topology path extraction and bounded shape orchestration clean every allocation failure" {
