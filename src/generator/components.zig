@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core");
 const model = @import("model");
+const geometry = @import("geometry");
 const topology = @import("topology");
 
 const Vec2 = core.math.Vec2;
@@ -37,6 +38,134 @@ pub fn selectProximityCenter(graph: topology.Graph, relations: []const Proximity
         }
     }
     return best;
+}
+
+const WeightedAngle = struct { weight: f32, angle: f32 };
+
+/// Apply upstream's global bestRotation/maybeFlip rules to acyclic components.
+/// Ring-fusion and peptide candidate bonuses are deferred until those
+/// controller records are available; affected components are left untouched.
+pub fn orientAcyclicComponents(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+) core.errors.Error!void {
+    for (0..graph.component_count) |raw_component| {
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+        const members = graph.componentMembers(component);
+        var has_ring = false;
+        var constrained = false;
+        for (members) |atom| {
+            has_ring = has_ring or rings.atomRings(atom).len != 0;
+            constrained = constrained or atoms[atom.index()].fixed or atoms[atom.index()].constrained;
+        }
+        if (has_ring or constrained) continue;
+
+        var angles: std.ArrayList(WeightedAngle) = .empty;
+        defer angles.deinit(allocator);
+        for (members) |atom| {
+            if (graph.degree(atom) <= 1) continue;
+            const neighbors = graph.neighbors(atom);
+            for (neighbors[0 .. neighbors.len - 1], 0..) |first, first_index| {
+                for (neighbors[first_index + 1 ..]) |second| {
+                    var weight: f32 = 6;
+                    if (graph.degree(first) != 1) weight += 2;
+                    if (graph.degree(second) != 1) weight += 2;
+                    // Preserve pinned upstream's duplicated second-neighbor
+                    // carbon bonus.
+                    if (atoms[second.index()].atomic_number == .carbon) weight += 1;
+                    if (atoms[second.index()].atomic_number == .carbon) weight += 1;
+                    if (atoms[first.index()].formal_charge == 0) weight += 1;
+                    if (atoms[second.index()].formal_charge == 0) weight += 1;
+                    const direction = geometry.subtract(atoms[first.index()].coordinates, atoms[second.index()].coordinates);
+                    try addAngle(allocator, &angles, weight, std.math.atan2(-direction.y, direction.x));
+                }
+            }
+        }
+        for (bonds) |bond| {
+            if (graph.component(bond.start) != component or bond.effective_order == .zero or bond.skip) continue;
+            const direction = geometry.subtract(atoms[bond.end.index()].coordinates, atoms[bond.start.index()].coordinates);
+            var angle = roundToTwo(std.math.atan2(-direction.y, direction.x));
+            while (angle <= 0) angle += std.math.pi;
+            for (0..6) |index| {
+                var weight: f32 = if (index == 1 or index == 5) 5 else if (index == 0 or index == 3) 1.5 else 1;
+                if (bond.effective_order == .double and index == 3 and
+                    (graph.degree(bond.start) == 1 or graph.degree(bond.end) == 1)) weight += 1.5;
+                if (graph.degree(bond.start) == 1 and graph.degree(bond.end) == 1 and index == 0) weight += 10;
+                try addAngle(allocator, &angles, weight, angle);
+                angle += std.math.pi / 6.0;
+                if (angle > std.math.pi) angle -= std.math.pi;
+            }
+        }
+        if (angles.items.len > 1 and
+            angles.items[angles.items.len - 1].angle - angles.items[0].angle >= std.math.pi - 2 * geometry.epsilon)
+        {
+            angles.items[0].weight += angles.items[angles.items.len - 1].weight;
+            _ = angles.pop();
+        }
+        if (angles.items.len != 0) {
+            var best: usize = 0;
+            for (angles.items, 0..) |candidate, index| if (candidate.weight > angles.items[best].weight) {
+                best = index;
+            };
+            const center = componentCenter(atoms, members);
+            const sine = -std.math.sin(angles.items[best].angle);
+            const cosine = std.math.cos(angles.items[best].angle);
+            for (members) |atom| {
+                const relative = geometry.subtract(atoms[atom.index()].coordinates, center);
+                atoms[atom.index()].coordinates = geometry.add(center, geometry.rotate(relative, sine, cosine));
+            }
+        }
+        maybeFlipComponent(atoms, bonds, graph, component, members);
+    }
+}
+
+fn addAngle(allocator: std.mem.Allocator, angles: *std.ArrayList(WeightedAngle), weight: f32, raw_angle: f32) core.errors.Error!void {
+    var angle = roundToTwo(raw_angle);
+    while (angle <= 0) angle += std.math.pi;
+    for (angles.items, 0..) |*candidate, index| {
+        if (candidate.angle < angle - geometry.epsilon) continue;
+        if (candidate.angle - angle < geometry.epsilon and candidate.angle - angle > -geometry.epsilon) {
+            candidate.weight += weight;
+        } else {
+            angles.insert(allocator, index, .{ .weight = weight, .angle = angle }) catch return error.OutOfMemory;
+        }
+        return;
+    }
+    angles.append(allocator, .{ .weight = weight, .angle = angle }) catch return error.OutOfMemory;
+}
+
+fn maybeFlipComponent(atoms: []model.Atom, bonds: []const model.Bond, graph: topology.Graph, component: core.ids.MoleculeId, members: []const core.ids.AtomId) void {
+    if (members.len < 2) return;
+    const center = componentCenter(atoms, members);
+    const bounds = componentBounds(atoms, members);
+    const midpoint = Vec2{ .x = (bounds.max.x + bounds.min.x) * 0.5, .y = (bounds.max.y + bounds.min.y) * 0.5 };
+    var score_x: f32 = 0;
+    var score_y: f32 = 0;
+    if (midpoint.x - center.x > geometry.epsilon) score_x -= 0.5 else if (midpoint.x - center.x < -geometry.epsilon) score_x += 0.5;
+    if (midpoint.y - center.y > geometry.epsilon) score_y += 0.5 else if (midpoint.y - center.y < -geometry.epsilon) score_y -= 0.5;
+    for (bonds) |bond| {
+        if (graph.component(bond.start) != component or bond.effective_order != .double or bond.skip) continue;
+        var difference: ?f32 = null;
+        if (graph.degree(bond.start) == 1 and graph.degree(bond.end) > 1) {
+            difference = atoms[bond.start.index()].coordinates.y - atoms[bond.end.index()].coordinates.y;
+        } else if (graph.degree(bond.end) == 1 and graph.degree(bond.start) > 1) {
+            difference = atoms[bond.end.index()].coordinates.y - atoms[bond.start.index()].coordinates.y;
+        }
+        if (difference) |value| {
+            if (value > geometry.epsilon) score_y += 1 else if (value < -geometry.epsilon) score_y -= 1;
+        }
+    }
+    for (members) |atom| {
+        if (score_y < 0) atoms[atom.index()].coordinates.y = -atoms[atom.index()].coordinates.y;
+        if (score_x < 0) atoms[atom.index()].coordinates.x = -atoms[atom.index()].coordinates.x;
+    }
+}
+
+fn roundToTwo(value: f32) f32 {
+    return @round(value * 100) / 100;
 }
 
 /// Place the largest component at its existing position, then place neutral
@@ -308,6 +437,26 @@ test "proximity center uses relation count then size with first-wins ties" {
         .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(0) },
     };
     try std.testing.expectEqual(core.ids.MoleculeId.fromIndex(1), try selectProximityCenter(graph, &more_relations));
+}
+
+test "isolated acyclic bond rotates to the upstream horizontal preference" {
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 0) };
+    atoms[1].coordinates = .{ .y = 50 };
+    const bonds = [_]model.Bond{.{
+        .id = core.ids.BondId.fromIndex(0),
+        .input_index = 0,
+        .start = core.ids.AtomId.fromIndex(0),
+        .end = core.ids.AtomId.fromIndex(1),
+        .input_order = .single,
+        .effective_order = .single,
+    }};
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    try orientAcyclicComponents(std.testing.allocator, &atoms, &bonds, graph, rings);
+    try std.testing.expectApproxEqAbs(atoms[0].coordinates.y, atoms[1].coordinates.y, 0.05);
+    try std.testing.expectApproxEqAbs(core.math.bond_length, @abs(atoms[1].coordinates.x - atoms[0].coordinates.x), 0.001);
 }
 
 fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: topology.Graph) !void {

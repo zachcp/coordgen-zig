@@ -56,10 +56,6 @@ test "minimal native result maps canonical coordinates back to caller order with
     for (result.internal_to_input, 0..) |input_index, internal_index| {
         try std.testing.expectEqual(@as(u32, @intCast(internal_index)), result.input_to_internal[input_index]);
     }
-    // Basic layout anchors canonical atom zero at the origin. This assertion
-    // fails if internal coordinates are copied directly or either map is used
-    // in the transposed direction.
-    try std.testing.expectEqual(api.Vec2{}, result.coordinates[result.internal_to_input[0]]);
     for (bonds) |bond| {
         const delta_x = result.coordinates[bond.start].x - result.coordinates[bond.end].x;
         const delta_y = result.coordinates[bond.start].y - result.coordinates[bond.end].y;

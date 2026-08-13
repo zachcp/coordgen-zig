@@ -67,6 +67,13 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         fragmentation,
         input.options.precision,
     );
+    try components.orientAcyclicComponents(
+        allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+    );
     try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
