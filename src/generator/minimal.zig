@@ -5,6 +5,12 @@ const topology = @import("topology");
 const layout = @import("layout");
 const optimize = @import("optimize");
 
+pub const components = @import("components.zig");
+
+test {
+    _ = components;
+}
+
 /// Restricted proof result. Coordinates and both maps are allocator-owned;
 /// coordinates are always serialized back to caller input order.
 pub const Result = struct {
