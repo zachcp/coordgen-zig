@@ -12,6 +12,47 @@ pub const ProximityRelation = struct {
     end: core.ids.AtomId,
 };
 
+pub fn collectProximityRelations(
+    allocator: std.mem.Allocator,
+    working: model.WorkingGraph,
+) core.errors.Error![]ProximityRelation {
+    const output = allocator.alloc(ProximityRelation, working.proximity_relations.len) catch return error.OutOfMemory;
+    errdefer allocator.free(output);
+    for (working.proximity_relations, output) |relation, *destination| {
+        destination.* = try proximityEndpoints(
+            working.bonds,
+            working.extra_bonds,
+            working.residue_interactions,
+            relation,
+        );
+    }
+    return output;
+}
+
+fn proximityEndpoints(
+    bonds: []const model.Bond,
+    extra_bonds: []const model.ExtraBond,
+    residue_interactions: []const model.ResidueInteraction,
+    relation: model.ProximityRelation,
+) core.errors.Error!ProximityRelation {
+    return switch (relation) {
+        .bond => |id| if (id.index() < bonds.len)
+            .{ .start = bonds[id.index()].start, .end = bonds[id.index()].end }
+        else
+            error.InvalidMapping,
+        .extra_bond => |input_index| blk: {
+            for (extra_bonds) |bond| if (bond.input_index == input_index) {
+                break :blk .{ .start = bond.start, .end = bond.end };
+            };
+            return error.InvalidMapping;
+        },
+        .residue_interaction => |input_index| if (input_index < residue_interactions.len)
+            .{ .start = residue_interactions[input_index].start, .end = residue_interactions[input_index].end }
+        else
+            error.InvalidMapping,
+    };
+}
+
 /// Upstream chooses the component with the most incident proximity records,
 /// then the most atoms, retaining the first component on a complete tie.
 pub fn selectProximityCenter(graph: topology.Graph, relations: []const ProximityRelation) core.errors.Error!core.ids.MoleculeId {
@@ -217,6 +258,171 @@ fn localEndpoint(graph: topology.Graph, relation: ProximityRelation, component: 
     if (graph.component(relation.start) == component) return relation.start;
     if (graph.component(relation.end) == component) return relation.end;
     return null;
+}
+
+/// Place one relation-connected child using upstream's ligand/residue-style
+/// interaction-site averages and parent free-valence direction. The caller
+/// owns BFS order and marks the central component before invoking this.
+pub fn placeProximityChild(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+    child: core.ids.MoleculeId,
+    parent: core.ids.MoleculeId,
+    placed: []bool,
+) core.errors.Error!bool {
+    if (placed.len != graph.component_count or child == parent or !placed[parent.index()]) return error.InvalidMapping;
+    const child_members = graph.componentMembers(child);
+    const child_center = componentCenter(atoms, child_members);
+    var parent_position: Vec2 = .{};
+    var parent_addition: Vec2 = .{};
+    var child_position: Vec2 = .{};
+    var child_direction: Vec2 = .{};
+    var count: u32 = 0;
+    for (relations) |relation| {
+        const first_component = graph.component(relation.start) orelse return error.InvalidMapping;
+        const second_component = graph.component(relation.end) orelse return error.InvalidMapping;
+        const parent_atom, const child_atom = if (first_component == parent and second_component == child)
+            .{ relation.start, relation.end }
+        else if (second_component == parent and first_component == child)
+            .{ relation.end, relation.start }
+        else
+            continue;
+        count += 1;
+        parent_position = geometry.add(parent_position, atoms[parent_atom.index()].coordinates);
+        var addition = singleAdditionVector(atoms, graph, rings, parent_atom);
+        addition = geometry.scale(geometry.normalize(addition), core.math.bond_length * 3);
+        parent_addition = geometry.add(parent_addition, addition);
+        child_position = geometry.add(child_position, atoms[child_atom.index()].coordinates);
+        child_direction = geometry.add(child_direction, geometry.subtract(atoms[child_atom.index()].coordinates, child_center));
+    }
+    if (count == 0) return false;
+    const divisor: f32 = @floatFromInt(count);
+    parent_position = geometry.scale(parent_position, 1 / divisor);
+    parent_addition = geometry.scale(parent_addition, 1 / divisor);
+    child_position = geometry.scale(child_position, 1 / divisor);
+    child_direction = geometry.scale(child_direction, 1 / divisor);
+    var starting_position = geometry.add(parent_position, parent_addition);
+    starting_position = findGridPoint(atoms, graph, placed, starting_position, 0, 0, core.math.bond_length * 1.8);
+    const desired = geometry.subtract(starting_position, parent_position);
+    const opposite_child = geometry.scale(child_direction, -1);
+    const angle = geometry.signedAngle(desired, .{}, opposite_child) / 180 * std.math.pi;
+    const sine = std.math.sin(angle);
+    const cosine = std.math.cos(angle);
+    for (child_members) |atom| {
+        const relative = geometry.subtract(atoms[atom.index()].coordinates, child_position);
+        atoms[atom.index()].coordinates = geometry.add(geometry.rotate(relative, sine, cosine), starting_position);
+        atoms[atom.index()].coordinates.x = @round(atoms[atom.index()].coordinates.x);
+        atoms[atom.index()].coordinates.y = @round(atoms[atom.index()].coordinates.y);
+    }
+    placed[child.index()] = true;
+    _ = try flipFirstCrossingRelations(atoms, graph, relations, child, placed);
+    return true;
+}
+
+/// Place an acyclic connected proximity subsystem using upstream's
+/// ligand/residue style. Ring-shaped meta-graphs and central components below
+/// the pinned eight-atom cutoff belong to the general alignment path.
+pub fn arrangeProximityComponents(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+) core.errors.Error!bool {
+    if (relations.len == 0) return false;
+    const central = try selectProximityCenter(graph, relations);
+    if (graph.componentMembers(central).len < 8) return false;
+
+    const related = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(related);
+    @memset(related, false);
+    var unique_edges: usize = 0;
+    for (relations, 0..) |relation, index| {
+        const first = graph.component(relation.start) orelse return error.InvalidMapping;
+        const second = graph.component(relation.end) orelse return error.InvalidMapping;
+        if (first == second) continue;
+        related[first.index()] = true;
+        related[second.index()] = true;
+        var duplicate = false;
+        for (relations[0..index]) |previous| {
+            const previous_first = graph.component(previous.start) orelse return error.InvalidMapping;
+            const previous_second = graph.component(previous.end) orelse return error.InvalidMapping;
+            if ((previous_first == first and previous_second == second) or
+                (previous_first == second and previous_second == first))
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        unique_edges += @intFromBool(!duplicate);
+    }
+    var related_count: usize = 0;
+    for (related) |value| related_count += @intFromBool(value);
+    if (related_count != graph.component_count or unique_edges >= related_count) return false;
+
+    const placed = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(placed);
+    @memset(placed, false);
+    placed[central.index()] = true;
+    const parents = allocator.alloc(core.ids.MoleculeId, graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(parents);
+    @memset(parents, .invalid);
+    var queue: std.ArrayList(core.ids.MoleculeId) = .empty;
+    defer queue.deinit(allocator);
+    queue.append(allocator, central) catch return error.OutOfMemory;
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const current = queue.items[head];
+        if (current != central) {
+            if (placed[current.index()]) continue;
+            const parent = parents[current.index()];
+            if (!parent.isValid() or !try placeProximityChild(atoms, graph, rings, relations, current, parent, placed)) return error.InvalidMapping;
+        }
+        for (relations) |relation| {
+            const first = graph.component(relation.start) orelse return error.InvalidMapping;
+            const second = graph.component(relation.end) orelse return error.InvalidMapping;
+            const neighbor = if (first == current and second != current)
+                second
+            else if (second == current and first != current)
+                first
+            else
+                continue;
+            if (placed[neighbor.index()]) continue;
+            parents[neighbor.index()] = current;
+            queue.append(allocator, neighbor) catch return error.OutOfMemory;
+        }
+    }
+    for (related, placed) |is_related, is_placed| if (is_related and !is_placed) return false;
+    return true;
+}
+
+fn singleAdditionVector(
+    atoms: []const model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    atom: core.ids.AtomId,
+) Vec2 {
+    var output: Vec2 = .{};
+    var total_weight: f32 = 0;
+    for (graph.neighbors(atom)) |neighbor| {
+        const weight: f32 = if (shareRing(rings, atom, neighbor)) 4 else 1;
+        output = geometry.add(output, geometry.scale(
+            geometry.subtract(atoms[neighbor.index()].coordinates, atoms[atom.index()].coordinates),
+            weight,
+        ));
+        total_weight += weight;
+    }
+    if (total_weight != 0) output = geometry.scale(output, 1 / total_weight);
+    return geometry.scale(output, -1);
+}
+
+fn shareRing(rings: topology.RingMembership, first: core.ids.AtomId, second: core.ids.AtomId) bool {
+    for (rings.atomRings(first)) |first_ring| {
+        for (rings.atomRings(second)) |second_ring| if (first_ring == second_ring) return true;
+    }
+    return false;
 }
 
 /// Place the largest component at its existing position, then place neutral
@@ -536,6 +742,49 @@ test "first crossing proximity pair mirrors only its local component" {
     try std.testing.expectEqual(Vec2{ .x = -1 }, atoms[1].coordinates);
     try std.testing.expectEqual(Vec2{ .x = 1, .y = 2 }, atoms[2].coordinates);
     try std.testing.expectEqual(Vec2{ .x = -1, .y = 2 }, atoms[3].coordinates);
+}
+
+test "proximity child aligns interaction site with parent free valence" {
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 50) };
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(1),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = core.ids.AtomId.fromIndex(2),
+            .end = core.ids.AtomId.fromIndex(3),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    const relations = [_]ProximityRelation{.{
+        .start = core.ids.AtomId.fromIndex(1),
+        .end = core.ids.AtomId.fromIndex(2),
+    }};
+    var placed = [_]bool{ true, false };
+    try std.testing.expect(try placeProximityChild(
+        &atoms,
+        graph,
+        rings,
+        &relations,
+        core.ids.MoleculeId.fromIndex(1),
+        core.ids.MoleculeId.fromIndex(0),
+        &placed,
+    ));
+    try std.testing.expectEqual(Vec2{ .x = 200 }, atoms[2].coordinates);
+    try std.testing.expectEqual(Vec2{ .x = 250 }, atoms[3].coordinates);
+    try std.testing.expect(placed[1]);
 }
 
 fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: topology.Graph) !void {

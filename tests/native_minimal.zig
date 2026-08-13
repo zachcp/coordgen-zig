@@ -234,6 +234,25 @@ test "minimal native generation arranges disconnected neutral components" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
 }
 
+test "minimal native generation places an acyclic proximity child from a large center" {
+    var atoms: [10]api.AtomInput = undefined;
+    @memset(&atoms, .{});
+    var bonds: [9]api.BondInput = undefined;
+    for (bonds[0..7], 0..) |*bond, index| bond.* = .{
+        .start = @intCast(index),
+        .end = @intCast(index + 1),
+    };
+    bonds[7] = .{ .start = 8, .end = 9 };
+    bonds[8] = .{ .start = 7, .end = 8, .order = .zero };
+    const input = api.Input{ .atoms = &atoms, .bonds = &bonds };
+    var result = try generate(std.testing.allocator, input);
+    defer result.deinit();
+    const dx = result.coordinates[7].x - result.coordinates[8].x;
+    const dy = result.coordinates[7].y - result.coordinates[8].y;
+    try std.testing.expect(@sqrt(dx * dx + dy * dy) >= api.bond_length * 2);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+}
+
 test "minimal native validation rejects malformed input before generation" {
     const atoms = [_]api.AtomInput{ .{}, .{} };
     try std.testing.expectError(error.InvalidAtomIndex, generate(std.testing.allocator, .{

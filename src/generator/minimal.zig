@@ -35,11 +35,11 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
     try rejectOutOfScope(input);
     var prepared = try topology.prepareInput(allocator, input);
     defer prepared.deinit();
-    if (prepared.working.active_atom_count != input.atoms.len or
-        prepared.working.proximity_relations.len != 0)
-    {
+    if (prepared.working.active_atom_count != input.atoms.len) {
         return error.Unsupported;
     }
+    const proximity_relations = try components.collectProximityRelations(allocator, prepared.working);
+    defer allocator.free(proximity_relations);
 
     var fragmentation = try layout.Fragmentation.init(
         allocator,
@@ -74,7 +74,17 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.graph,
         prepared.rings,
     );
-    try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
+    if (proximity_relations.len == 0) {
+        try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
+    } else if (!try components.arrangeProximityComponents(
+        allocator,
+        prepared.working.atoms,
+        prepared.graph,
+        prepared.rings,
+        proximity_relations,
+    )) {
+        return error.Unsupported;
+    }
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(coordinates);
