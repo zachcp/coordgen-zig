@@ -36,7 +36,6 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
     var prepared = try topology.prepareInput(allocator, input);
     defer prepared.deinit();
     if (prepared.working.active_atom_count != input.atoms.len or
-        prepared.graph.component_count != 1 or
         prepared.working.proximity_relations.len != 0)
     {
         return error.Unsupported;
@@ -68,6 +67,7 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         fragmentation,
         input.options.precision,
     );
+    try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(coordinates);

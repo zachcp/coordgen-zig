@@ -6,6 +6,39 @@ const topology = @import("topology");
 const Vec2 = core.math.Vec2;
 const Bounds = struct { min: Vec2, max: Vec2 };
 
+pub const ProximityRelation = struct {
+    start: core.ids.AtomId,
+    end: core.ids.AtomId,
+};
+
+/// Upstream chooses the component with the most incident proximity records,
+/// then the most atoms, retaining the first component on a complete tie.
+pub fn selectProximityCenter(graph: topology.Graph, relations: []const ProximityRelation) core.errors.Error!core.ids.MoleculeId {
+    if (graph.component_count == 0 or relations.len == 0) return error.InvalidMapping;
+    var best = core.ids.MoleculeId.fromIndex(0);
+    var best_relations: usize = 0;
+    var best_atoms = graph.componentMembers(best).len;
+    for (0..graph.component_count) |raw_index| {
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_index));
+        var relation_count: usize = 0;
+        for (relations) |relation| {
+            const start_component = graph.component(relation.start) orelse return error.InvalidMapping;
+            const end_component = graph.component(relation.end) orelse return error.InvalidMapping;
+            relation_count += @intFromBool(start_component == component);
+            relation_count += @intFromBool(end_component == component and end_component != start_component);
+        }
+        const atom_count = graph.componentMembers(component).len;
+        if (relation_count > best_relations or
+            (relation_count == best_relations and atom_count > best_atoms))
+        {
+            best = component;
+            best_relations = relation_count;
+            best_atoms = atom_count;
+        }
+    }
+    return best;
+}
+
 /// Place the largest component at its existing position, then place neutral
 /// and charged components in upstream molecule order on the first
 /// non-clashing point of the pinned ten-level, one-bond-length grid.
@@ -238,6 +271,43 @@ test "counterion uses first unused opposite charged atom and shorter clearance" 
     defer graph.deinit();
     try arrangeComponents(std.testing.allocator, &atoms, graph);
     try std.testing.expectEqual(Vec2{ .x = -50, .y = 0 }, atoms[2].coordinates);
+}
+
+test "proximity center uses relation count then size with first-wins ties" {
+    var atoms = [_]model.Atom{
+        testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 50), testAtom(4, 0),
+    };
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(1),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = core.ids.AtomId.fromIndex(2),
+            .end = core.ids.AtomId.fromIndex(3),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const first_relation = [_]ProximityRelation{.{
+        .start = core.ids.AtomId.fromIndex(0),
+        .end = core.ids.AtomId.fromIndex(4),
+    }};
+    try std.testing.expectEqual(core.ids.MoleculeId.fromIndex(0), try selectProximityCenter(graph, &first_relation));
+    const more_relations = [_]ProximityRelation{
+        .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(4) },
+        .{ .start = core.ids.AtomId.fromIndex(3), .end = core.ids.AtomId.fromIndex(4) },
+        .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(0) },
+    };
+    try std.testing.expectEqual(core.ids.MoleculeId.fromIndex(1), try selectProximityCenter(graph, &more_relations));
 }
 
 fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: topology.Graph) !void {

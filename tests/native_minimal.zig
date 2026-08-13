@@ -90,10 +90,8 @@ test "minimal native generation explicitly rejects domains owned by later phases
     const atoms = [_]api.AtomInput{ .{}, .{}, .{} };
     const path = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
     const cycle = [_]api.BondInput{ path[0], path[1], .{ .start = 2, .end = 0 } };
-    const disconnected = [_]api.BondInput{path[0]};
     var cycle_result = try generate(std.testing.allocator, .{ .atoms = &atoms, .bonds = &cycle });
     cycle_result.deinit();
-    try expectUnsupported(.{ .atoms = &atoms, .bonds = &disconnected });
 
     var changed = atoms;
     changed[0].hidden = true;
@@ -213,6 +211,29 @@ test "minimal native generation runs discrete search for macrocycle substituents
         const dx = first.coordinates[bond.start].x - first.coordinates[bond.end].x;
         const dy = first.coordinates[bond.start].y - first.coordinates[bond.end].y;
         try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(dx * dx + dy * dy), 0.01);
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+}
+
+test "minimal native generation arranges disconnected neutral components" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 2, .end = 3 },
+    };
+    const input = api.Input{ .atoms = &atoms, .bonds = &bonds };
+    var result = try generate(std.testing.allocator, input);
+    defer result.deinit();
+    for (bonds) |bond| {
+        const dx = result.coordinates[bond.start].x - result.coordinates[bond.end].x;
+        const dy = result.coordinates[bond.start].y - result.coordinates[bond.end].y;
+        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(dx * dx + dy * dy), 0.001);
+    }
+    for (result.coordinates[0..2]) |first| {
+        for (result.coordinates[2..4]) |second| {
+            try std.testing.expect(@abs(first.x - second.x) >= api.bond_length or
+                @abs(first.y - second.y) >= api.bond_length);
+        }
     }
     try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
 }
