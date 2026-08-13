@@ -630,7 +630,7 @@ pub fn build(b: *std.Build) !void {
     );
     performance_step.dependOn(&performance_pending.step);
     const template_fixture = b.createModule(.{
-        .root_source_file = b.path("conformance/fixtures/templates_normalized.zig"),
+        .root_source_file = b.path("src/layout/templates/data.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -705,14 +705,14 @@ pub fn build(b: *std.Build) !void {
         compare_runs.addFileArg(generated[1]);
         const compare_fixture = b.addSystemCommand(&.{ "cmp", "-s" });
         compare_fixture.addFileArg(generated[0]);
-        compare_fixture.addFileArg(b.path("conformance/fixtures/templates_normalized.zig"));
+        compare_fixture.addFileArg(b.path("src/layout/templates/data.zig"));
 
         const extract_cpp = b.addSystemCommand(&.{ "python3", "tools/extract-template-reference.py" });
         extract_cpp.addFileArg(oracle.path("CoordgenTemplates.cpp"));
         const extracted = extract_cpp.addOutputFileArg("templates-from-cpp.zig");
         const compare_cpp = b.addSystemCommand(&.{ "cmp", "-s" });
         compare_cpp.addFileArg(extracted);
-        compare_cpp.addFileArg(b.path("conformance/fixtures/templates_normalized.zig"));
+        compare_cpp.addFileArg(b.path("src/layout/templates/data.zig"));
 
         const generate_raw = b.addRunArtifact(template_generator);
         generate_raw.addFileArg(oracle.path("templates.mae"));
