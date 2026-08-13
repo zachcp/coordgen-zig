@@ -446,8 +446,8 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
             output.rings.push_back(record_ring);
         }
     }
-    for (sketcherMinimizerFragment* fragment : minimizer._fragments) {
-        fragment_indices.emplace(fragment, static_cast<uint32_t>(output.fragments.size()));
+    for (uint32_t index = 0; index < minimizer._fragments.size(); ++index) {
+        fragment_indices.emplace(minimizer._fragments[index], index);
     }
     std::unordered_map<const sketcherMinimizerFragment*, const TemplateCapture*> template_captures;
     for (const TemplateCapture& template_capture : capture.templates) {

@@ -146,6 +146,42 @@ static int no_template_probe_smoke(void) {
     return probe.owner == 0 ? 0 : 23;
 }
 
+static int fragment_parent_probe_smoke(void) {
+    coordgen_atom_input_t atoms[5] = {0};
+    coordgen_bond_input_t bonds[4] = {0};
+    coordgen_input_t input = {0};
+    coordgen_probe_result_t probe = {0};
+    uint32_t index;
+
+    for (index = 0; index < 5; ++index) {
+        atoms[index].atomic_number = 6;
+        atoms[index].stereo_looking_from = COORDGEN_INVALID_INDEX;
+        atoms[index].stereo_atom_a = COORDGEN_INVALID_INDEX;
+        atoms[index].stereo_atom_b = COORDGEN_INVALID_INDEX;
+    }
+    for (index = 0; index < 4; ++index) {
+        bonds[index].start = index;
+        bonds[index].end = index + 1;
+        bonds[index].order = COORDGEN_BOND_SINGLE;
+        bonds[index].stereo_atom_a = COORDGEN_INVALID_INDEX;
+        bonds[index].stereo_atom_b = COORDGEN_INVALID_INDEX;
+        bonds[index].crossing_penalty_multiplier = 1.0f;
+    }
+    input.options = coordgen_default_options();
+    input.atoms = (coordgen_atom_span_t){atoms, 5, 0};
+    input.bonds = (coordgen_bond_span_t){bonds, 4, 0};
+    if (coordgen_probe_generate(&input, &probe) != COORDGEN_OK) return 24;
+    if (probe.fragment_count != 3 ||
+        probe.fragments[0].parent != COORDGEN_INVALID_INDEX ||
+        probe.fragments[1].parent != 0 ||
+        probe.fragments[2].parent != 1) {
+        coordgen_probe_result_free(&probe);
+        return 25;
+    }
+    coordgen_probe_result_free(&probe);
+    return probe.owner == 0 ? 0 : 26;
+}
+
 /* cgz-7v2.8 regression: build_from_fragments must not be silently ignored.
  * Upstream's sketcherMinimizer::buildFromFragments(bool) is an imperative
  * pipeline step (forwards to CoordgenMinimizer::buildFromFragments(bool
@@ -203,5 +239,6 @@ int main(void) {
     const int stable = stable_api_smoke();
     const int probe = stable != 0 ? stable : probe_api_smoke();
     const int no_template = probe != 0 ? probe : no_template_probe_smoke();
-    return no_template != 0 ? no_template : build_from_fragments_rejected_smoke();
+    const int fragment_parent = no_template != 0 ? no_template : fragment_parent_probe_smoke();
+    return fragment_parent != 0 ? fragment_parent : build_from_fragments_rejected_smoke();
 }
