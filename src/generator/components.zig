@@ -741,7 +741,35 @@ pub fn arrangeComponents(
     atoms: []model.Atom,
     graph: topology.Graph,
 ) core.errors.Error!void {
-    if (graph.component_count < 2) return;
+    return arrangeComponentsExcluding(allocator, atoms, graph, &.{});
+}
+
+/// Arrange ordinary components while leaving residue-only components for the
+/// dedicated crown/protein placement phase. A mixed excluded/non-excluded
+/// component violates the residue representative ownership contract.
+pub fn arrangeComponentsExcluding(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    excluded_atoms: []const bool,
+) core.errors.Error!void {
+    if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
+    var excluded_components: []bool = &.{};
+    defer if (excluded_components.len != 0) allocator.free(excluded_components);
+    var active_count: usize = graph.component_count;
+    if (excluded_atoms.len != 0) {
+        excluded_components = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
+        active_count = 0;
+        for (excluded_components, 0..) |*excluded, raw_component| {
+            const members = graph.componentMembers(core.ids.MoleculeId.fromIndex(@intCast(raw_component)));
+            var excluded_count: usize = 0;
+            for (members) |atom| excluded_count += @intFromBool(excluded_atoms[atom.index()]);
+            if (excluded_count != 0 and excluded_count != members.len) return error.InvalidMapping;
+            excluded.* = excluded_count == members.len;
+            active_count += @intFromBool(!excluded.*);
+        }
+    }
+    if (active_count < 2) return;
     const placed = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
     defer allocator.free(placed);
     @memset(placed, false);
@@ -749,9 +777,13 @@ pub fn arrangeComponents(
     defer allocator.free(charged_atom_used);
     @memset(charged_atom_used, false);
 
-    var central_index: u32 = 0;
-    var central_size = graph.componentMembers(core.ids.MoleculeId.fromIndex(0)).len;
-    for (1..graph.component_count) |raw_index| {
+    var central_index: u32 = if (excluded_components.len == 0)
+        0
+    else
+        @intCast(std.mem.indexOfScalar(bool, excluded_components, false).?);
+    var central_size = graph.componentMembers(core.ids.MoleculeId.fromIndex(central_index)).len;
+    for (0..graph.component_count) |raw_index| {
+        if (excluded_components.len != 0 and excluded_components[raw_index]) continue;
         const index: u32 = @intCast(raw_index);
         const size = graph.componentMembers(core.ids.MoleculeId.fromIndex(index)).len;
         if (size > central_size) {
@@ -764,7 +796,7 @@ pub fn arrangeComponents(
 
     for (0..graph.component_count) |raw_index| {
         const index: u32 = @intCast(raw_index);
-        if (placed[index]) continue;
+        if ((excluded_components.len != 0 and excluded_components[index]) or placed[index]) continue;
         const component = core.ids.MoleculeId.fromIndex(index);
         const members = graph.componentMembers(component);
         var charge: i64 = 0;
@@ -789,7 +821,7 @@ pub fn arrangeComponents(
 
     for (0..graph.component_count) |raw_index| {
         const index: u32 = @intCast(raw_index);
-        if (placed[index]) continue;
+        if ((excluded_components.len != 0 and excluded_components[index]) or placed[index]) continue;
         const component = core.ids.MoleculeId.fromIndex(index);
         const members = graph.componentMembers(component);
         var charge: i64 = 0;
@@ -1128,4 +1160,26 @@ test "neutral component placement cleans every allocation failure" {
     var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
     defer graph.deinit();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeAndDiscard, .{ &atoms, graph });
+}
+
+test "component arrangement ignores residue-only components" {
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 17) };
+    atoms[3].coordinates.y = 23;
+    const bonds = [_]model.Bond{.{
+        .id = core.ids.BondId.fromIndex(0),
+        .input_index = 0,
+        .start = core.ids.AtomId.fromIndex(0),
+        .end = core.ids.AtomId.fromIndex(1),
+        .input_order = .single,
+        .effective_order = .single,
+    }};
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const excluded = [_]bool{ false, false, false, true };
+    try arrangeComponentsExcluding(std.testing.allocator, &atoms, graph, &excluded);
+    try std.testing.expect(atoms[2].coordinates.x != 0 or atoms[2].coordinates.y != 0);
+    try std.testing.expectEqual(Vec2{ .x = 17, .y = 23 }, atoms[3].coordinates);
+
+    const mixed = [_]bool{ true, false, false, false };
+    try std.testing.expectError(error.InvalidMapping, arrangeComponentsExcluding(std.testing.allocator, &atoms, graph, &mixed));
 }

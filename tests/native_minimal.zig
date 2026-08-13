@@ -121,11 +121,6 @@ test "minimal native generation explicitly rejects domains owned by later phases
     try expectUnsupported(.{
         .atoms = &atoms,
         .bonds = &path,
-        .residues = &.{.{ .atom = 0 }},
-    });
-    try expectUnsupported(.{
-        .atoms = &atoms,
-        .bonds = &path,
         .residue_interactions = &.{.{ .start = 0, .end = 2 }},
     });
     try expectUnsupported(.{
@@ -141,6 +136,34 @@ test "minimal native generation explicitly rejects domains owned by later phases
         api.Options{ .debug_coordinates = true },
         api.Options{ .template_directory = "fixtures" },
     }) |options| try expectUnsupported(.{ .atoms = &atoms, .bonds = &path, .options = options });
+}
+
+test "minimal native generation places residue representatives around a ligand" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const residues = [_]api.ResidueInput{.{
+        .atom = 3,
+        .chain = "A",
+        .residue_number = 7,
+        .closest_ligand_atom = 1,
+    }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = try generate(std.testing.allocator, input);
+    defer first.deinit();
+    var repeated = try generate(std.testing.allocator, input);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, repeated.coordinates);
+    const dx = first.coordinates[3].x - first.coordinates[1].x;
+    const dy = first.coordinates[3].y - first.coordinates[1].y;
+    try std.testing.expect(@sqrt(dx * dx + dy * dy) > 40);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
 }
 
 test "minimal native generation reaches macrocycle lattice and forced-open fallback" {
