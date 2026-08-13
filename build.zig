@@ -69,6 +69,7 @@ const OracleOptions = struct {
     oracle: *std.Build.Dependency,
     instrumented_fragment_builder: std.Build.LazyPath,
     instrumented_minimizer: std.Build.LazyPath,
+    sanitize_c: std.zig.SanitizeC = .off,
 };
 
 const Oracle = struct {
@@ -95,6 +96,7 @@ fn addOracle(b: *std.Build, options: OracleOptions) Oracle {
         .target = options.target,
         .optimize = options.optimize,
         .link_libcpp = true,
+        .sanitize_c = options.sanitize_c,
     });
     library_module.addIncludePath(b.path("conformance/include"));
     // The instrumented copies of two translation units are generated into the
@@ -147,6 +149,7 @@ fn addOracle(b: *std.Build, options: OracleOptions) Oracle {
         .target = options.target,
         .optimize = options.optimize,
         .link_libcpp = true,
+        .sanitize_c = options.sanitize_c,
     });
     abi_module.addIncludePath(b.path("include"));
     abi_module.addIncludePath(b.path("conformance/include"));
@@ -575,6 +578,11 @@ pub fn build(b: *std.Build) !void {
         "enable-oracle",
         "Fetch the pinned C++ oracle for conformance-only build steps",
     ) orelse false;
+    const sanitize_oracle = b.option(
+        bool,
+        "sanitize-oracle",
+        "Instrument the native C++ oracle/facade with full C-family undefined-behavior checks",
+    ) orelse false;
 
     // `-fqemu` and `--libc-runtimes` are consumed by the build runner itself
     // and are not visible to this script: std.Build.enable_qemu is a vestigial
@@ -596,6 +604,7 @@ pub fn build(b: *std.Build) !void {
         "Measure the absolute oracle baseline on the representative corpus",
     );
     const performance_step = b.step("performance-check", "Enforce native/oracle performance thresholds");
+    const sanitizer_step = b.step("sanitizer-check", "Run oracle facade consumers with UB instrumentation");
     const performance_pending = b.addFail(
         "performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cgz-7v2.4.7",
     );
@@ -728,6 +737,7 @@ pub fn build(b: *std.Build) !void {
             .oracle = oracle,
             .instrumented_fragment_builder = instrumented_fragment_builder,
             .instrumented_minimizer = instrumented_minimizer,
+            .sanitize_c = if (sanitize_oracle) .full else .off,
         });
         const oracle_library = native_oracle.library;
         const oracle_abi = native_oracle.abi;
@@ -741,6 +751,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .link_libc = true,
             .link_libcpp = true,
+            .sanitize_c = if (sanitize_oracle) .full else .off,
         });
         oracle_abi_smoke_module.addIncludePath(b.path("include"));
         oracle_abi_smoke_module.addIncludePath(b.path("conformance/include"));
@@ -761,6 +772,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .link_libcpp = true,
+            .sanitize_c = if (sanitize_oracle) .full else .off,
         });
         oracle_abi_cpp_smoke_module.addIncludePath(b.path("include"));
         oracle_abi_cpp_smoke_module.addCSourceFile(.{
@@ -785,6 +797,7 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
             .link_libcpp = true,
+            .sanitize_c = if (sanitize_oracle) .full else .off,
         });
         rdkit_consumer_module.addIncludePath(b.path("include"));
         rdkit_consumer_module.addCSourceFile(.{
@@ -799,6 +812,16 @@ pub fn build(b: *std.Build) !void {
         const run_rdkit_consumer = b.addRunArtifact(rdkit_consumer);
         run_rdkit_consumer.expectExitCode(0);
         oracle_step.dependOn(&run_rdkit_consumer.step);
+        if (sanitize_oracle) {
+            sanitizer_step.dependOn(&run_oracle_abi_smoke.step);
+            sanitizer_step.dependOn(&run_oracle_abi_cpp_smoke.step);
+            sanitizer_step.dependOn(&run_rdkit_consumer.step);
+        } else {
+            const sanitizer_disabled = b.addFail(
+                "sanitizer-check requires -Denable-oracle=true -Dsanitize-oracle=true",
+            );
+            sanitizer_step.dependOn(&sanitizer_disabled.step);
+        }
 
         // Rehost all twenty public cases with repo-owned runners. The first
         // thirteen do not consume MAE fixtures. The fixture-backed seven read
@@ -1153,6 +1176,7 @@ pub fn build(b: *std.Build) !void {
         conformance_step.dependOn(&oracle_disabled.step);
         regeneration_step.dependOn(&oracle_disabled.step);
         performance_baseline_step.dependOn(&oracle_disabled.step);
+        sanitizer_step.dependOn(&oracle_disabled.step);
     }
 
     // Both examples execute as real consumers: Zig reads its source from the
@@ -1202,6 +1226,7 @@ pub fn build(b: *std.Build) !void {
         regeneration_step,
         performance_baseline_step,
         performance_step,
+        sanitizer_step,
         fuzz_step,
     });
 }

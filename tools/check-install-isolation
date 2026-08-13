@@ -100,4 +100,16 @@ pc_flags=$(PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" pkg-config --cflags --libs 
 "$work_dir/pkg-config-consumer" \
     || fail "pkg-config consumer did not observe the documented ABI behavior"
 
-echo "verified installed public ABI and pkg-config metadata, exclusion of the C++ oracle/probe header, and scratch-directory consumer builds"
+# C++17 uses the same installed extern "C" ABI without repo include paths or
+# an oracle. This is an executable interop check, not the compile-only shape
+# check used by abi-check.
+# Intentional splitting: pkg-config returns compiler arguments.
+# shellcheck disable=SC2086
+"$zig_path" c++ -std=c++17 -Wall -Wextra -Werror \
+    "$repo_root/examples/install_consumer.cpp" $pc_flags \
+    -o "$work_dir/pkg-config-cpp-consumer" \
+    || fail "installed C++ consumer did not compile/link from pkg-config metadata"
+"$work_dir/pkg-config-cpp-consumer" \
+    || fail "installed C++ consumer did not observe the documented ABI behavior"
+
+echo "verified installed public ABI and pkg-config metadata, exclusion of the C++ oracle/probe header, and scratch-directory C/C++ consumer builds"
