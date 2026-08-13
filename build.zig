@@ -304,7 +304,7 @@ fn createLayers(
         .topology = createInternalModule(b, target, optimize, "src/topology.zig"),
         .layout = createInternalModule(b, target, optimize, "src/layout.zig"),
         .optimize_layer = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
-        .generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
+        .generator = createInternalModule(b, target, optimize, "src/generator/minimal.zig"),
         .api = createInternalModule(b, target, optimize, "src/api.zig"),
         .c_abi = createInternalModule(b, target, optimize, "src/c_abi_types.zig"),
         .c_abi_exports = createInternalModule(b, target, optimize, "src/c_abi/exports.zig"),
@@ -335,6 +335,7 @@ pub fn build(b: *std.Build) !void {
     const model = layers.model;
     const geometry = layers.geometry;
     const topology = layers.topology;
+    const generator = layers.generator;
     const api = layers.api;
     const c_abi = layers.c_abi;
     const c_abi_exports = layers.c_abi_exports;
@@ -388,6 +389,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "geometry-test", .module = geometry },
             .{ .name = "topology-test", .module = topology },
             .{ .name = "layout-test", .module = layers.layout },
+            .{ .name = "generator-test", .module = generator },
             .{ .name = "api-test", .module = api },
             .{ .name = "c-abi-test", .module = c_abi },
             .{ .name = "c-abi-exports-test", .module = c_abi_exports },
@@ -417,6 +419,22 @@ pub fn build(b: *std.Build) !void {
         .root_module = corpus_classify_module,
     });
     const run_corpus_classify_tests = b.addRunArtifact(corpus_classify_tests);
+    const native_minimal_module = b.createModule(.{
+        .root_source_file = b.path("tests/native_minimal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api", .module = api },
+            .{ .name = "generator", .module = generator },
+        },
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    const native_minimal_tests = b.addTest(.{
+        .name = "native-minimal-test",
+        .root_module = native_minimal_module,
+    });
+    const run_native_minimal_tests = b.addRunArtifact(native_minimal_tests);
     const layer_tests = b.addTest(.{
         .name = "module-layer-test",
         .root_module = module_layers,
@@ -442,6 +460,7 @@ pub fn build(b: *std.Build) !void {
     for (layer_test_runs) |run| test_step.dependOn(&run.step);
     test_step.dependOn(&run_conformance_tests.step);
     test_step.dependOn(&run_corpus_classify_tests.step);
+    test_step.dependOn(&run_native_minimal_tests.step);
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
