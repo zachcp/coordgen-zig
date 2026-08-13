@@ -51,6 +51,18 @@ pub const Fragmentation = struct {
         defer allocator.free(root_fragment);
         @memset(root_fragment, .invalid);
         var fragment_count: u32 = 0;
+        // Fragment objects are born while upstream walks bonds, not while it
+        // walks atoms. Preserve that first-appearance order after the union of
+        // rigid groups has been established.
+        for (graph.structuralBonds()) |bond_id| {
+            const bond = bonds[bond_id.index()];
+            const roots = [_]usize{ find(parents, bond.start.index()), find(parents, bond.end.index()) };
+            for (roots) |root| {
+                if (root_fragment[root].isValid()) continue;
+                root_fragment[root] = core.ids.FragmentId.fromIndex(fragment_count);
+                fragment_count += 1;
+            }
+        }
         for (atoms) |atom| {
             if (atom.hidden or graph.component(atom.id) == null) continue;
             const root = find(parents, atom.id.index());
@@ -127,7 +139,17 @@ pub const Fragmentation = struct {
             const slot = &main_fragments[record.component.index()];
             if (!slot.isValid() or hasPriority(record, records[slot.index()], fragment_atoms, atoms, bonds, graph)) slot.* = record.id;
         }
+        try considerChains(allocator, records, atom_fragment, main_fragments, bonds, graph);
         try assignParents(allocator, records, atom_fragment, main_fragments, bonds, graph);
+        for (records) |*record| {
+            if (record.atom_count != 1 or !record.flags.constrained) continue;
+            for (records) |child| {
+                if (child.parent == record.id and child.flags.constrained) {
+                    record.flags.constrained_flip = true;
+                    break;
+                }
+            }
+        }
         return .{
             .allocator = allocator,
             .fragments = records,
@@ -205,11 +227,79 @@ fn priorityValues(record: Fragment, members: []const core.ids.AtomId, atoms: []c
         const atom = atoms[atom_id.index()];
         fixed += @intFromBool(atom.fixed);
         constrained += @intFromBool(atom.constrained);
-        heavy += @intFromBool(atom.atomic_number != .hydrogen);
+        // Upstream's historical countHeavyAtoms name is misleading: it
+        // counts non-carbon atoms, including explicit hydrogens.
+        heavy += @intFromBool(atom.atomic_number != .carbon);
         weight += @backingInt(atom.atomic_number);
         for (graph.incidentBonds(atom_id)) |bond_id| if (bonds[bond_id.index()].effective_order == .double) doubles += 1;
     }
     return .{ fixed, constrained, record.ring_count, record.atom_count, record.inter_bond_count, heavy, weight, doubles / 2 };
+}
+
+fn considerChains(allocator: std.mem.Allocator, records: []const Fragment, atom_fragment: []const core.ids.FragmentId, mains: []core.ids.FragmentId, bonds: []const model.Bond, graph: anytype) core.errors.Error!void {
+    const queue = allocator.alloc(core.ids.FragmentId, records.len) catch return error.OutOfMemory;
+    defer allocator.free(queue);
+    const visited = allocator.alloc(bool, records.len) catch return error.OutOfMemory;
+    defer allocator.free(visited);
+    for (mains, 0..) |*main, component_index| {
+        if (!main.isValid()) continue;
+        var constrained = false;
+        for (records) |record| if (record.component.index() == component_index) {
+            constrained = constrained or record.flags.fixed or record.flags.constrained;
+        };
+        if (constrained) continue;
+        var longest: usize = 0;
+        var longest_start = main.*;
+        for (records) |record| {
+            if (record.component.index() != component_index or !record.flags.chain or
+                chainNeighborCount(record.id, records, atom_fragment, bonds, graph) > 1) continue;
+            @memset(visited, false);
+            visited[record.id.index()] = true;
+            queue[0] = record.id;
+            var head: usize = 0;
+            var tail: usize = 1;
+            while (head < tail) : (head += 1) {
+                const current = queue[head];
+                for (graph.structuralBonds()) |bond_id| {
+                    const bond = bonds[bond_id.index()];
+                    const start = atom_fragment[bond.start.index()];
+                    const end = atom_fragment[bond.end.index()];
+                    const next = if (start == current) end else if (end == current) start else continue;
+                    if (next == current or visited[next.index()] or !records[next.index()].flags.chain) continue;
+                    visited[next.index()] = true;
+                    queue[tail] = next;
+                    tail += 1;
+                }
+            }
+            if (tail > longest) {
+                longest = tail;
+                longest_start = record.id;
+            }
+        }
+        if (longest >= acceptableChainLength(records[main.index()].ring_count)) main.* = longest_start;
+    }
+}
+
+fn chainNeighborCount(fragment: core.ids.FragmentId, records: []const Fragment, atom_fragment: []const core.ids.FragmentId, bonds: []const model.Bond, graph: anytype) usize {
+    var count: usize = 0;
+    for (graph.structuralBonds()) |bond_id| {
+        const bond = bonds[bond_id.index()];
+        const start = atom_fragment[bond.start.index()];
+        const end = atom_fragment[bond.end.index()];
+        const other = if (start == fragment) end else if (end == fragment) start else continue;
+        if (other != fragment and records[other.index()].flags.chain) count += 1;
+    }
+    return count;
+}
+
+fn acceptableChainLength(ring_count: u32) usize {
+    return switch (ring_count) {
+        0 => 1,
+        1 => 5,
+        2 => 8,
+        3 => 10,
+        else => 12,
+    };
 }
 
 fn assignParents(allocator: std.mem.Allocator, records: []Fragment, atom_fragment: []const core.ids.FragmentId, mains: []const core.ids.FragmentId, bonds: []const model.Bond, graph: anytype) core.errors.Error!void {
@@ -307,4 +397,32 @@ test "ordinary rings remain one rigid fragment" {
     try std.testing.expectEqual(@as(usize, 1), result.fragments.len);
     try std.testing.expectEqual(@as(u32, 1), result.fragments[0].ring_count);
     try std.testing.expect(!result.fragments[0].flags.chain);
+}
+
+test "prepared path fragments retain pinned canonical atom and creation order" {
+    const input_atoms = [_]topology.prepare.TestAtom{ .{}, .{}, .{}, .{}, .{} };
+    const input_bonds = [_]topology.prepare.TestBond{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 4 },
+    };
+    var prepared = try topology.prepareInput(std.testing.allocator, topology.prepare.TestInput{ .atoms = &input_atoms, .bonds = &input_bonds });
+    defer prepared.deinit();
+    var result = try Fragmentation.init(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+    );
+    defer result.deinit();
+    try std.testing.expectEqualSlices(u32, &.{ 2, 1, 3, 0, 4 }, prepared.working.order.activeInternalToInput(5));
+    try std.testing.expectEqual(@as(usize, 3), result.fragments.len);
+    try std.testing.expectEqualSlices(core.ids.AtomId, &.{ core.ids.AtomId.fromIndex(1), core.ids.AtomId.fromIndex(3) }, result.members(core.ids.FragmentId.fromIndex(0)));
+    try std.testing.expectEqualSlices(core.ids.AtomId, &.{core.ids.AtomId.fromIndex(0)}, result.members(core.ids.FragmentId.fromIndex(1)));
+    try std.testing.expectEqualSlices(core.ids.AtomId, &.{ core.ids.AtomId.fromIndex(2), core.ids.AtomId.fromIndex(4) }, result.members(core.ids.FragmentId.fromIndex(2)));
+    for (result.fragments) |fragment| try std.testing.expect(fragment.flags.chain);
+    try std.testing.expectEqual(core.ids.FragmentId.fromIndex(0), result.fragments[1].parent);
+    try std.testing.expectEqual(core.ids.FragmentId.fromIndex(1), result.fragments[2].parent);
 }
