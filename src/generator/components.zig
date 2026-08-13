@@ -168,6 +168,57 @@ fn roundToTwo(value: f32) f32 {
     return @round(value * 100) / 100;
 }
 
+/// Mirror one component across the axis perpendicular to its first crossing
+/// pair of already-placeable proximity relations, matching upstream's
+/// flipIfCrossingInteractions first-hit behavior.
+pub fn flipFirstCrossingRelations(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    relations: []const ProximityRelation,
+    component: core.ids.MoleculeId,
+    placed: []const bool,
+) core.errors.Error!bool {
+    if (placed.len != graph.component_count) return error.InvalidMapping;
+    for (relations, 0..) |first, first_index| {
+        const first_local = localEndpoint(graph, first, component) orelse continue;
+        const first_other = if (first_local == first.start) first.end else first.start;
+        const first_other_component = graph.component(first_other) orelse return error.InvalidMapping;
+        if (first_other_component == component or !placed[first_other_component.index()]) continue;
+        for (relations[first_index + 1 ..]) |second| {
+            const second_local = localEndpoint(graph, second, component) orelse continue;
+            const second_other = if (second_local == second.start) second.end else second.start;
+            const second_other_component = graph.component(second_other) orelse return error.InvalidMapping;
+            if (second_other_component == component or !placed[second_other_component.index()]) continue;
+            if (geometry.segmentIntersection(
+                atoms[first.start.index()].coordinates,
+                atoms[first.end.index()].coordinates,
+                atoms[second.start.index()].coordinates,
+                atoms[second.end.index()].coordinates,
+            ) == null) continue;
+
+            const first_point = atoms[first_local.index()].coordinates;
+            const second_point = atoms[second_local.index()].coordinates;
+            const middle = geometry.scale(geometry.add(first_point, second_point), 0.5);
+            const axis = geometry.normalize(geometry.subtract(first_point, second_point));
+            for (graph.componentMembers(component)) |atom| {
+                const relative = geometry.subtract(atoms[atom.index()].coordinates, middle);
+                const parallel = geometry.scale(axis, geometry.dot(axis, relative));
+                atoms[atom.index()].coordinates = geometry.subtract(atoms[atom.index()].coordinates, geometry.scale(parallel, 2));
+                atoms[atom.index()].coordinates.x = @round(atoms[atom.index()].coordinates.x);
+                atoms[atom.index()].coordinates.y = @round(atoms[atom.index()].coordinates.y);
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+fn localEndpoint(graph: topology.Graph, relation: ProximityRelation, component: core.ids.MoleculeId) ?core.ids.AtomId {
+    if (graph.component(relation.start) == component) return relation.start;
+    if (graph.component(relation.end) == component) return relation.end;
+    return null;
+}
+
 /// Place the largest component at its existing position, then place neutral
 /// and charged components in upstream molecule order on the first
 /// non-clashing point of the pinned ten-level, one-bond-length grid.
@@ -457,6 +508,34 @@ test "isolated acyclic bond rotates to the upstream horizontal preference" {
     try orientAcyclicComponents(std.testing.allocator, &atoms, &bonds, graph, rings);
     try std.testing.expectApproxEqAbs(atoms[0].coordinates.y, atoms[1].coordinates.y, 0.05);
     try std.testing.expectApproxEqAbs(core.math.bond_length, @abs(atoms[1].coordinates.x - atoms[0].coordinates.x), 0.001);
+}
+
+test "first crossing proximity pair mirrors only its local component" {
+    var atoms = [_]model.Atom{
+        testAtom(0, -1), testAtom(1, 1), testAtom(2, 1), testAtom(3, -1),
+    };
+    atoms[2].coordinates.y = 2;
+    atoms[3].coordinates.y = 2;
+    const bonds = [_]model.Bond{.{
+        .id = core.ids.BondId.fromIndex(0),
+        .input_index = 0,
+        .start = core.ids.AtomId.fromIndex(0),
+        .end = core.ids.AtomId.fromIndex(1),
+        .input_order = .single,
+        .effective_order = .single,
+    }};
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const relations = [_]ProximityRelation{
+        .{ .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(2) },
+        .{ .start = core.ids.AtomId.fromIndex(1), .end = core.ids.AtomId.fromIndex(3) },
+    };
+    const placed = [_]bool{ false, true, true };
+    try std.testing.expect(try flipFirstCrossingRelations(&atoms, graph, &relations, core.ids.MoleculeId.fromIndex(0), &placed));
+    try std.testing.expectEqual(Vec2{ .x = 1 }, atoms[0].coordinates);
+    try std.testing.expectEqual(Vec2{ .x = -1 }, atoms[1].coordinates);
+    try std.testing.expectEqual(Vec2{ .x = 1, .y = 2 }, atoms[2].coordinates);
+    try std.testing.expectEqual(Vec2{ .x = -1, .y = 2 }, atoms[3].coordinates);
 }
 
 fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: topology.Graph) !void {
