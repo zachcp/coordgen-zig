@@ -11,6 +11,10 @@ pub const clash_energy_threshold: f32 = 10;
 pub const rejected_solution_score: f32 = @floatFromInt(99_999_999);
 pub const sketcher_epsilon: f32 = 0.0001;
 pub const maximum_scored_solutions: usize = 10_000;
+pub const standard_crossing_bond_penalty: f32 = 2500;
+pub const terminal_bond_crossing_multiplier: f32 = 0.5;
+pub const macrocycle_bond_crossing_multiplier: f32 = 8;
+pub const ring_bond_crossing_multiplier: f32 = 2;
 
 pub const Evaluator = struct {
     context: ?*anyopaque = null,
@@ -18,6 +22,47 @@ pub const Evaluator = struct {
 
     fn score(self: Evaluator, states: []const u32) !f32 {
         return self.scoreFn(self.context, states);
+    }
+};
+
+pub const PoseEvaluator = struct {
+    dofs: []core.dof.Dof,
+    affected_atoms: []const core.ids.AtomId,
+    base_local_coordinates: []const core.math.Vec2,
+    local_coordinates: []core.math.Vec2,
+    global_coordinates: []core.math.Vec2,
+    rebuild_context: ?*anyopaque = null,
+    rebuildFn: *const fn (?*anyopaque, []const core.math.Vec2, []core.math.Vec2) anyerror!void,
+    score_context: ?*anyopaque = null,
+    scorePoseFn: *const fn (?*anyopaque, []const core.math.Vec2, []const core.dof.Dof) anyerror!f32,
+
+    pub fn evaluator(self: *PoseEvaluator) Evaluator {
+        return .{ .context = self, .scoreFn = evaluateOpaque };
+    }
+
+    fn evaluateOpaque(raw_context: ?*anyopaque, states: []const u32) !f32 {
+        const self: *PoseEvaluator = @ptrCast(@alignCast(raw_context orelse return error.InvalidMapping));
+        return self.evaluate(states);
+    }
+
+    pub fn evaluate(self: *PoseEvaluator, states: []const u32) !f32 {
+        if (states.len != self.dofs.len or
+            self.base_local_coordinates.len != self.local_coordinates.len or
+            self.local_coordinates.len != self.global_coordinates.len)
+        {
+            return error.InvalidMapping;
+        }
+        @memcpy(self.local_coordinates, self.base_local_coordinates);
+        for (self.dofs, states) |*dof, state| {
+            if (state >= dof.state.count) return error.InvalidDofState;
+            dof.state.current = state;
+            const start = dof.affected_atoms.start;
+            const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
+            if (end > self.affected_atoms.len) return error.InvalidMapping;
+            try apply(dof.*, self.affected_atoms[start..end], self.local_coordinates);
+        }
+        try self.rebuildFn(self.rebuild_context, self.local_coordinates, self.global_coordinates);
+        return self.scorePoseFn(self.score_context, self.global_coordinates, self.dofs);
     }
 };
 
@@ -49,6 +94,14 @@ pub const SolutionCache = struct {
 
     pub fn count(self: SolutionCache) usize {
         return self.scores.items.len;
+    }
+
+    pub fn has(self: SolutionCache, candidate: []const u32) bool {
+        if (candidate.len != self.state_count) return false;
+        for (0..self.count()) |index| {
+            if (std.mem.eql(u32, self.solution(index), candidate)) return true;
+        }
+        return false;
     }
 
     pub fn score(self: *SolutionCache, candidate: []const u32) !f32 {
@@ -85,6 +138,166 @@ pub const SolutionCache = struct {
         return self.states.items[index * self.state_count ..][0..self.state_count];
     }
 };
+
+pub const SearchResult = struct {
+    score: f32,
+    clean_pose: bool,
+    iterations: usize,
+};
+
+pub fn tieredSearch(
+    allocator: std.mem.Allocator,
+    dofs: []core.dof.Dof,
+    cache: *SolutionCache,
+    precision: f32,
+    initial_tier: u32,
+) !SearchResult {
+    if (cache.state_count != dofs.len or !std.math.isFinite(precision) or precision <= 0) return error.InvalidOption;
+    for (dofs) |dof| try dof.state.validate();
+    const scaled_width = @as(f64, 6) * @as(f64, precision);
+    if (scaled_width > @as(f64, @floatFromInt(std.math.maxInt(usize)))) return error.TooManyItems;
+    const max_width = @max(@as(usize, 1), @as(usize, @intFromFloat(scaled_width)));
+    var current_tier = initial_tier;
+    var growing = CandidateBuffer.init(allocator, dofs.len);
+    defer growing.deinit();
+    const states = allocator.alloc(u32, dofs.len) catch return error.OutOfMemory;
+    defer allocator.free(states);
+    saveStates(dofs, states);
+    var best_score = try cache.score(states);
+    try growing.put(states, best_score);
+
+    var iterations: usize = 0;
+    var valid = true;
+    while (valid and growing.count() != 0 and iterations < 100) {
+        iterations += 1;
+        valid = try growSolutions(allocator, dofs, cache, &current_tier, &growing, &best_score, max_width);
+    }
+    const best = try cache.best();
+    loadStates(dofs, best.states);
+    return .{ .score = best.score, .clean_pose = best.score < clash_energy_threshold, .iterations = iterations };
+}
+
+const CandidateBuffer = struct {
+    allocator: std.mem.Allocator,
+    state_count: usize,
+    states: std.ArrayList(u32) = .empty,
+    scores: std.ArrayList(f32) = .empty,
+
+    fn init(allocator: std.mem.Allocator, state_count: usize) CandidateBuffer {
+        return .{ .allocator = allocator, .state_count = state_count };
+    }
+
+    fn deinit(self: *CandidateBuffer) void {
+        self.scores.deinit(self.allocator);
+        self.states.deinit(self.allocator);
+    }
+
+    fn count(self: CandidateBuffer) usize {
+        return self.scores.items.len;
+    }
+
+    fn candidate(self: CandidateBuffer, index: usize) []const u32 {
+        return self.states.items[index * self.state_count ..][0..self.state_count];
+    }
+
+    fn clear(self: *CandidateBuffer) void {
+        self.states.clearRetainingCapacity();
+        self.scores.clearRetainingCapacity();
+    }
+
+    fn put(self: *CandidateBuffer, states: []const u32, score_value: f32) !void {
+        if (states.len != self.state_count) return error.InvalidMapping;
+        for (0..self.count()) |index| {
+            if (std.mem.eql(u32, self.candidate(index), states)) {
+                self.scores.items[index] = score_value;
+                return;
+            }
+        }
+        try self.states.ensureUnusedCapacity(self.allocator, states.len);
+        try self.scores.ensureUnusedCapacity(self.allocator, 1);
+        self.states.appendSliceAssumeCapacity(states);
+        self.scores.appendAssumeCapacity(score_value);
+    }
+
+    fn cloneFrom(self: *CandidateBuffer, source: CandidateBuffer) !void {
+        self.clear();
+        try self.states.appendSlice(self.allocator, source.states.items);
+        errdefer self.states.clearRetainingCapacity();
+        try self.scores.appendSlice(self.allocator, source.scores.items);
+    }
+};
+
+fn growSolutions(
+    allocator: std.mem.Allocator,
+    dofs: []core.dof.Dof,
+    cache: *SolutionCache,
+    current_tier: *u32,
+    growing: *CandidateBuffer,
+    best_score: *f32,
+    max_width: usize,
+) !bool {
+    var previous = CandidateBuffer.init(allocator, dofs.len);
+    defer previous.deinit();
+    try previous.cloneFrom(growing.*);
+    const order = allocator.alloc(usize, previous.count()) catch return error.OutOfMemory;
+    defer allocator.free(order);
+    for (order, 0..) |*index, value| index.* = value;
+    sortCandidates(order, previous);
+    growing.clear();
+    const best_score_for_run = best_score.*;
+    const states = allocator.alloc(u32, dofs.len) catch return error.OutOfMemory;
+    defer allocator.free(states);
+
+    for (order, 0..) |candidate_index, rank| {
+        if (rank > max_width) break;
+        for (dofs, 0..) |*dof, dof_index| {
+            if (dof.state.tier > current_tier.*) continue;
+            loadStates(dofs, previous.candidate(candidate_index));
+            for (1..dof.state.count) |_| {
+                dofs[dof_index].state.advance();
+                saveStates(dofs, states);
+                if (cache.has(states)) continue;
+                const score_value = try cache.score(states);
+                if (score_value == rejected_solution_score) return false;
+                if (score_value < best_score.*) best_score.* = score_value;
+                if (score_value < best_score_for_run) try growing.put(states, score_value);
+            }
+        }
+    }
+    if (growing.count() == 0 and current_tier.* < core.dof.Tier.scale_fragment) {
+        current_tier.* += 3;
+        try growing.cloneFrom(previous);
+    }
+    return true;
+}
+
+fn sortCandidates(order: []usize, candidates: CandidateBuffer) void {
+    for (1..order.len) |index| {
+        const value = order[index];
+        var cursor = index;
+        while (cursor > 0 and candidateLess(candidates, value, order[cursor - 1])) : (cursor -= 1) {
+            order[cursor] = order[cursor - 1];
+        }
+        order[cursor] = value;
+    }
+}
+
+fn candidateLess(candidates: CandidateBuffer, left: usize, right: usize) bool {
+    const left_score = candidates.scores.items[left];
+    const right_score = candidates.scores.items[right];
+    return left_score < right_score or
+        (left_score == right_score and lexicographicLess(candidates.candidate(left), candidates.candidate(right)));
+}
+
+fn saveStates(dofs: []const core.dof.Dof, states: []u32) void {
+    std.debug.assert(dofs.len == states.len);
+    for (dofs, states) |dof, *state| state.* = dof.state.current;
+}
+
+fn loadStates(dofs: []core.dof.Dof, states: []const u32) void {
+    std.debug.assert(dofs.len == states.len);
+    for (dofs, states) |*dof, state| dof.state.current = state;
+}
 
 pub const ExhaustiveResult = struct {
     score: f32,
@@ -192,6 +405,121 @@ fn lexicographicLess(left: []const u32, right: []const u32) bool {
         if (left_value != right_value) return left_value < right_value;
     }
     return false;
+}
+
+pub const BondScoreView = struct {
+    start: core.ids.AtomId,
+    end: core.ids.AtomId,
+    crossing_penalty_multiplier: f32 = 1,
+    terminal: bool = false,
+    macrocycle: bool = false,
+    small_ring: bool = false,
+    residue_interaction: bool = false,
+};
+
+pub const RingScoreView = struct {
+    atoms: []const core.ids.AtomId,
+    fragment: core.ids.FragmentId,
+};
+
+pub fn scoreClashInteractions(
+    interactions: []const core.interaction.Interaction,
+    coordinates: []const core.math.Vec2,
+) core.errors.Error!f32 {
+    var energy: f32 = 0;
+    for (interactions) |interaction| switch (interaction.payload) {
+        .clash => |clash| {
+            const start = try scoreCoordinate(coordinates, clash.segment_start);
+            const point = try scoreCoordinate(coordinates, clash.point);
+            const end = try scoreCoordinate(coordinates, clash.segment_end);
+            const distance = geometry.squaredDistancePointSegment(point, start, end).squared_distance;
+            if (distance <= clash.rest_squared_distance) {
+                energy += 0.5 * clash.force_constant * clash.secondary_force_constant * (clash.rest_squared_distance - distance);
+            }
+        },
+        else => {},
+    };
+    return energy;
+}
+
+pub fn scoreCrossBonds(bonds: []const BondScoreView, coordinates: []const core.math.Vec2) core.errors.Error!f32 {
+    if (bonds.len <= 2) return 0;
+    var energy: f32 = 0;
+    for (bonds, 0..) |first, first_index| {
+        if (first.residue_interaction) continue;
+        try validateScoreBond(first, coordinates.len);
+        for (bonds[first_index + 1 ..]) |second| {
+            if (second.residue_interaction) continue;
+            try validateScoreBond(second, coordinates.len);
+            if (!bondsClash(first, second, coordinates)) continue;
+            var penalty_value = standard_crossing_bond_penalty * first.crossing_penalty_multiplier * second.crossing_penalty_multiplier;
+            if (first.terminal or second.terminal) penalty_value *= terminal_bond_crossing_multiplier;
+            if (first.macrocycle or second.macrocycle) penalty_value *= macrocycle_bond_crossing_multiplier;
+            if (first.small_ring or second.small_ring) penalty_value *= ring_bond_crossing_multiplier;
+            energy += penalty_value;
+        }
+    }
+    return energy;
+}
+
+pub fn scoreAtomsInsideRings(
+    rings: []const RingScoreView,
+    atom_fragments: []const core.ids.FragmentId,
+    coordinates: []const core.math.Vec2,
+) core.errors.Error!f32 {
+    if (atom_fragments.len != coordinates.len) return error.InvalidMapping;
+    var energy: f32 = 0;
+    for (rings) |ring| {
+        if (ring.atoms.len < 3 or ring.atoms.len >= 9) continue;
+        var center: core.math.Vec2 = .{};
+        for (ring.atoms) |atom| center = add(center, try scoreCoordinate(coordinates, atom));
+        center = scale(center, 1 / @as(f32, @floatFromInt(ring.atoms.len)));
+        for (coordinates, atom_fragments) |coordinate_value, fragment| {
+            if (fragment == ring.fragment) continue;
+            const difference = subtract(center, coordinate_value);
+            if (difference.x > core.math.bond_length or difference.y > core.math.bond_length or
+                difference.x < -core.math.bond_length or difference.y < -core.math.bond_length)
+            {
+                continue;
+            }
+            const squared = difference.x * difference.x + difference.y * difference.y;
+            if (squared > core.math.bond_length * core.math.bond_length) continue;
+            const distance = @sqrt(squared);
+            if (distance < core.math.bond_length) energy += 50 + 100 * (1 - distance / core.math.bond_length);
+        }
+    }
+    return energy;
+}
+
+fn validateScoreBond(bond: BondScoreView, atom_count: usize) core.errors.Error!void {
+    if (!bond.start.isValid() or !bond.end.isValid() or bond.start.index() >= atom_count or
+        bond.end.index() >= atom_count or bond.start == bond.end or
+        !std.math.isFinite(bond.crossing_penalty_multiplier))
+    {
+        return error.InvalidMapping;
+    }
+}
+
+fn bondsClash(first: BondScoreView, second: BondScoreView, coordinates: []const core.math.Vec2) bool {
+    if (first.start == second.start or first.start == second.end or first.end == second.start or first.end == second.end) return false;
+    const first_start = coordinates[first.start.index()];
+    const first_end = coordinates[first.end.index()];
+    const second_start = coordinates[second.start.index()];
+    const second_end = coordinates[second.end.index()];
+    const coincidence_limit = sketcher_epsilon * sketcher_epsilon;
+    if (geometry.squaredDistance(first_start, second_start) < coincidence_limit or
+        geometry.squaredDistance(first_start, second_end) < coincidence_limit or
+        geometry.squaredDistance(first_end, second_start) < coincidence_limit or
+        geometry.squaredDistance(first_end, second_end) < coincidence_limit)
+    {
+        return true;
+    }
+    return geometry.segmentIntersection(first_start, first_end, second_start, second_end) != null;
+}
+
+fn scoreCoordinate(coordinates: []const core.math.Vec2, atom: core.ids.AtomId) core.errors.Error!core.math.Vec2 {
+    if (!atom.isValid() or atom.index() >= coordinates.len) return error.InvalidAtomIndex;
+    return coordinates[atom.index()];
 }
 
 pub fn affectedAtoms(collection: core.dof.Collection, dof: core.dof.Dof) core.errors.Error![]const core.ids.AtomId {
@@ -369,6 +697,89 @@ test "DOF penalties preserve state levels and flip context" {
     } }, 1, 2), 0, .{}));
 }
 
+test "discrete clash crossing and atoms-in-rings scores preserve pinned penalties" {
+    const coordinates = [_]core.math.Vec2{
+        .{ .x = -2 },
+        .{ .x = 2 },
+        .{ .y = -2 },
+        .{ .y = 2 },
+        .{ .x = 10 },
+        .{ .x = 12 },
+    };
+    const clash = core.interaction.Interaction{
+        .id = core.ids.InteractionId.fromIndex(0),
+        .payload = .{ .clash = .{
+            .segment_start = core.ids.AtomId.fromIndex(0),
+            .point = core.ids.AtomId.fromIndex(2),
+            .segment_end = core.ids.AtomId.fromIndex(1),
+            .rest_squared_distance = 9,
+        } },
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), try scoreClashInteractions(&.{clash}, &coordinates), 0.0001);
+
+    const bonds = [_]BondScoreView{
+        .{ .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(1), .terminal = true, .crossing_penalty_multiplier = 2 },
+        .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(3), .macrocycle = true, .small_ring = true, .crossing_penalty_multiplier = 3 },
+        .{ .start = core.ids.AtomId.fromIndex(4), .end = core.ids.AtomId.fromIndex(5) },
+    };
+    try std.testing.expectEqual(@as(f32, 120_000), try scoreCrossBonds(&bonds, &coordinates));
+
+    const ring_atoms = [_]core.ids.AtomId{
+        core.ids.AtomId.fromIndex(0),
+        core.ids.AtomId.fromIndex(1),
+        core.ids.AtomId.fromIndex(2),
+    };
+    const ring_coordinates = [_]core.math.Vec2{ .{ .x = -1 }, .{ .x = 1 }, .{}, .{} };
+    const fragments = [_]core.ids.FragmentId{
+        core.ids.FragmentId.fromIndex(0),
+        core.ids.FragmentId.fromIndex(0),
+        core.ids.FragmentId.fromIndex(0),
+        core.ids.FragmentId.fromIndex(1),
+    };
+    try std.testing.expectEqual(@as(f32, 150), try scoreAtomsInsideRings(&.{.{
+        .atoms = &ring_atoms,
+        .fragment = core.ids.FragmentId.fromIndex(0),
+    }}, &fragments, &ring_coordinates));
+}
+
+const RebuildTestContext = struct { calls: usize = 0 };
+
+fn rebuildTestPose(raw_context: ?*anyopaque, local: []const core.math.Vec2, global: []core.math.Vec2) !void {
+    const context: *RebuildTestContext = @ptrCast(@alignCast(raw_context.?));
+    context.calls += 1;
+    for (local, global) |source, *target| target.* = .{ .x = source.x + 10, .y = source.y };
+}
+
+fn scoreTestPose(_: ?*anyopaque, coordinates: []const core.math.Vec2, _: []const core.dof.Dof) !f32 {
+    return coordinates[2].y;
+}
+
+test "pose evaluation resets local coordinates, applies DOFs, and rebuilds once per uncached state" {
+    const base = [_]core.math.Vec2{ .{}, .{}, .{ .x = 2, .y = 3 } };
+    var local: [3]core.math.Vec2 = undefined;
+    var global: [3]core.math.Vec2 = undefined;
+    const affected = [_]core.ids.AtomId{core.ids.AtomId.fromIndex(2)};
+    var dofs = [_]core.dof.Dof{testDof(.{ .flip_fragment = .{} }, 0, 2)};
+    dofs[0].affected_atoms = .{ .start = 0, .len = 1 };
+    var rebuild_context = RebuildTestContext{};
+    var pose = PoseEvaluator{
+        .dofs = &dofs,
+        .affected_atoms = &affected,
+        .base_local_coordinates = &base,
+        .local_coordinates = &local,
+        .global_coordinates = &global,
+        .rebuild_context = &rebuild_context,
+        .rebuildFn = rebuildTestPose,
+        .scorePoseFn = scoreTestPose,
+    };
+    var cache = try SolutionCache.init(std.testing.allocator, 1, 1, pose.evaluator());
+    defer cache.deinit();
+    try std.testing.expectEqual(@as(f32, -3), try cache.score(&.{1}));
+    try std.testing.expectEqual(@as(f32, -3), try cache.score(&.{1}));
+    try std.testing.expectEqual(@as(usize, 1), rebuild_context.calls);
+    try std.testing.expectEqual(core.math.Vec2{ .x = 12, .y = -3 }, global[2]);
+}
+
 const ScoreContext = struct {
     calls: usize = 0,
 };
@@ -419,6 +830,24 @@ test "exhaustive search stores the first clean solution as optimal" {
     try std.testing.expectEqual(@as(usize, 4), context.calls);
 }
 
+test "tiered search widens by three tiers and restores the best solution" {
+    var context = ScoreContext{};
+    var cache = try SolutionCache.init(std.testing.allocator, 2, 1, .{ .context = &context, .scoreFn = targetScore });
+    defer cache.deinit();
+    var dofs = [_]core.dof.Dof{
+        testDof(.{ .flip_fragment = .{} }, 0, 2),
+        testDof(.{ .scale_atoms = .{ .pivot = core.ids.AtomId.fromIndex(0) } }, 0, 2),
+    };
+    dofs[1].id = core.ids.DofId.fromIndex(1);
+    dofs[1].state.tier = core.dof.Tier.scale_atoms;
+    const result = try tieredSearch(std.testing.allocator, &dofs, &cache, 1, 0);
+    try std.testing.expect(result.clean_pose);
+    try std.testing.expectEqual(@as(f32, 0), result.score);
+    try std.testing.expectEqual(@as(u32, 1), dofs[0].state.current);
+    try std.testing.expectEqual(@as(u32, 1), dofs[1].state.current);
+    try std.testing.expect(result.iterations >= 4);
+}
+
 test "tuple construction retains pinned ascending combination order" {
     var tuples = try buildTuples(std.testing.allocator, 4, 2);
     defer tuples.deinit();
@@ -436,6 +865,7 @@ fn allocateSearchState(allocator: std.mem.Allocator) !void {
         testDof(.{ .flip_fragment = .{} }, 0, 2),
     };
     _ = try exhaustiveSearch(allocator, &dofs, &.{ 0, 1 }, &cache, 100);
+    _ = try tieredSearch(allocator, &dofs, &cache, 1, 0);
     var tuples = try buildTuples(allocator, 5, 3);
     defer tuples.deinit();
 }
