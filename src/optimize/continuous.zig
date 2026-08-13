@@ -47,6 +47,127 @@ pub const MinimizeResult = struct {
 
 pub const StereoValidator = *const fn ([]const model.Atom) bool;
 
+pub const ConstructionOptions = struct {
+    intrafragment_clashes: bool = true,
+    rigid_atoms: []const bool = &.{},
+    atom_fragments: []const u32 = &.{},
+    atom_has_dofs: []const bool = &.{},
+    bond_in_non_macrocycle_ring: []const bool = &.{},
+};
+
+/// Construct the clash-then-stretch prefix of addInteractionsOfMolecule in
+/// upstream insertion order. Bend and E/Z construction depend on ordered ring
+/// context and are appended by their owning layout/macrocycle phases.
+pub fn buildBaseInteractions(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    options: ConstructionOptions,
+) core.errors.Error!core.interaction.Collection {
+    if ((options.rigid_atoms.len != 0 and options.rigid_atoms.len != atoms.len) or
+        (options.atom_fragments.len != 0 and options.atom_fragments.len != atoms.len) or
+        (options.atom_has_dofs.len != 0 and options.atom_has_dofs.len != atoms.len) or
+        (options.bond_in_non_macrocycle_ring.len != 0 and options.bond_in_non_macrocycle_ring.len != bonds.len))
+    {
+        return error.InvalidMapping;
+    }
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+
+    if (atoms.len > 1) {
+        for (atoms, 0..) |point, point_index| {
+            for (bonds) |bond| {
+                try validateBond(bond, atoms.len);
+                if (point.id == bond.start or point.id == bond.end) continue;
+                if (point.fixed and atoms[bond.start.index()].fixed and atoms[bond.end.index()].fixed) continue;
+                if (isRigid(options, point_index) and isRigid(options, bond.start.index()) and isRigid(options, bond.end.index())) continue;
+                if (areNeighbors(point.id, bond.start, bonds) or areNeighbors(point.id, bond.end, bonds)) continue;
+                if (!options.intrafragment_clashes and skipFragmentClash(options, point_index, bond)) continue;
+
+                var rest_scale: f32 = 0.8;
+                if (point.atomic_number == .carbon and point.formal_charge == 0) rest_scale -= 0.1;
+                const start = atoms[bond.start.index()];
+                const end = atoms[bond.end.index()];
+                if (start.atomic_number == .carbon and start.formal_charge == 0 and
+                    end.atomic_number == .carbon and end.formal_charge == 0)
+                {
+                    rest_scale -= 0.1;
+                }
+                const rest = core.math.bond_length * rest_scale;
+                try appendInteraction(allocator, &interactions, .{ .clash = .{
+                    .segment_start = bond.start,
+                    .point = point.id,
+                    .segment_end = bond.end,
+                    .rest_squared_distance = rest * rest,
+                } });
+            }
+        }
+    }
+
+    for (bonds, 0..) |bond, bond_index| {
+        try validateBond(bond, atoms.len);
+        var force_constant: f32 = 0.1;
+        var rest_length = core.math.bond_length;
+        if (isRigid(options, bond.start.index()) and isRigid(options, bond.end.index())) {
+            rest_length = geometry.length(geometry.subtract(atoms[bond.end.index()].coordinates, atoms[bond.start.index()].coordinates));
+        }
+        if (options.bond_in_non_macrocycle_ring.len != 0 and options.bond_in_non_macrocycle_ring[bond_index]) {
+            force_constant *= 50;
+        }
+        try appendInteraction(allocator, &interactions, .{ .stretch = .{
+            .atom_a = bond.start,
+            .atom_b = bond.end,
+            .force_constant = force_constant,
+            .rest_length = rest_length,
+        } });
+    }
+
+    return .{
+        .allocator = allocator,
+        .items = interactions.toOwnedSlice(allocator) catch return error.OutOfMemory,
+    };
+}
+
+fn appendInteraction(
+    allocator: std.mem.Allocator,
+    interactions: *std.ArrayList(core.interaction.Interaction),
+    payload: core.interaction.Payload,
+) core.errors.Error!void {
+    if (interactions.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+    interactions.append(allocator, .{
+        .id = core.ids.InteractionId.fromIndex(@intCast(interactions.items.len)),
+        .payload = payload,
+    }) catch return error.OutOfMemory;
+}
+
+fn validateBond(bond: model.Bond, atom_count: usize) core.errors.Error!void {
+    if (!bond.start.isValid() or !bond.end.isValid() or
+        bond.start.index() >= atom_count or bond.end.index() >= atom_count or bond.start == bond.end)
+    {
+        return error.InvalidAtomIndex;
+    }
+}
+
+fn isRigid(options: ConstructionOptions, index: usize) bool {
+    return options.rigid_atoms.len != 0 and options.rigid_atoms[index];
+}
+
+fn areNeighbors(first: core.ids.AtomId, second: core.ids.AtomId, bonds: []const model.Bond) bool {
+    for (bonds) |bond| {
+        if ((bond.start == first and bond.end == second) or (bond.start == second and bond.end == first)) return true;
+    }
+    return false;
+}
+
+fn skipFragmentClash(options: ConstructionOptions, point_index: usize, bond: model.Bond) bool {
+    if (options.atom_fragments.len == 0 or options.atom_has_dofs.len == 0) return false;
+    const start = bond.start.index();
+    const end = bond.end.index();
+    if (options.atom_has_dofs[start] or options.atom_has_dofs[point_index] or options.atom_has_dofs[end]) return false;
+    return options.atom_fragments[start] == options.atom_fragments[point_index] or
+        options.atom_fragments[end] == options.atom_fragments[point_index];
+}
+
 /// Run the pinned continuous minimization loop. Interaction scoring both
 /// returns energy and accumulates force; movable force is reset by applyForces.
 pub fn minimize(
@@ -344,6 +465,37 @@ fn expectForceSumZero(forces: []const core.math.Vec2) !void {
     for (forces) |force| sum = geometry.add(sum, force);
     try std.testing.expectApproxEqAbs(@as(f32, 0), sum.x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0), sum.y, 0.0001);
+}
+
+fn baseInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
+    const atoms = [_]model.Atom{
+        .{ .id = core.ids.AtomId.fromIndex(0), .input_index = 0, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(1), .input_index = 1, .atomic_number = .carbon, .coordinates = .{ .x = 60 } },
+        .{ .id = core.ids.AtomId.fromIndex(2), .input_index = 2, .atomic_number = .oxygen, .coordinates = .{ .x = 30, .y = 5 } },
+    };
+    const bonds = [_]model.Bond{.{
+        .id = core.ids.BondId.fromIndex(0),
+        .input_index = 0,
+        .start = atoms[0].id,
+        .end = atoms[1].id,
+        .input_order = .single,
+        .effective_order = .single,
+    }};
+    var interactions = try buildBaseInteractions(allocator, &atoms, &bonds, .{
+        .rigid_atoms = &.{ true, true, false },
+        .bond_in_non_macrocycle_ring = &.{true},
+    });
+    defer interactions.deinit();
+    try std.testing.expectEqual(@as(usize, 2), interactions.items.len);
+    const clash = interactions.items[0].payload.clash;
+    try std.testing.expectEqual(@as(f32, 1225), clash.rest_squared_distance);
+    const stretch = interactions.items[1].payload.stretch;
+    try std.testing.expectEqual(@as(f32, 5), stretch.force_constant);
+    try std.testing.expectEqual(@as(f32, 60), stretch.rest_length);
+}
+
+test "base interaction construction preserves clash-stretch order and cleans allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
 }
 
 test "force application caps movement, clears movable force, and retains fixed force" {
