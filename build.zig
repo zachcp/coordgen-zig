@@ -302,7 +302,7 @@ fn createLayers(
         .model = createInternalModule(b, target, optimize, "src/model.zig"),
         .geometry = createInternalModule(b, target, optimize, "src/geometry.zig"),
         .topology = createInternalModule(b, target, optimize, "src/topology.zig"),
-        .layout = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
+        .layout = createInternalModule(b, target, optimize, "src/layout.zig"),
         .optimize_layer = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
         .generator = createInternalModule(b, target, optimize, "build_support/empty_module.zig"),
         .api = createInternalModule(b, target, optimize, "src/api.zig"),
