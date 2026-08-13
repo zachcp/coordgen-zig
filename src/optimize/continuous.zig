@@ -778,12 +778,40 @@ test "continuous minimization converges a stretched bond and honors skip" {
     const result = try minimize(&interactions, state, .{});
     try std.testing.expect(result.converged);
     try std.testing.expect(result.iterations > 1);
+    // Same-process pinned C++ probe: 4.99363375, 55.0064354.
+    try std.testing.expectApproxEqAbs(@as(f32, 4.99363375), coordinates[0].x, 0.0002);
+    try std.testing.expectApproxEqAbs(@as(f32, 55.0064354), coordinates[1].x, 0.0002);
     try std.testing.expectApproxEqAbs(@as(f32, 50), geometry.length(geometry.subtract(coordinates[0], coordinates[1])), 0.05);
 
     const before = coordinates;
     const skipped = try minimize(&interactions, state, .{ .skip = true });
     try std.testing.expectEqual(@as(usize, 0), skipped.iterations);
     try std.testing.expectEqual(before, coordinates);
+}
+
+test "fixed-center bend minimization agrees with pinned oracle fixture" {
+    var coordinates = [_]core.math.Vec2{ .{ .x = 50 }, .{}, .{ .y = 50 } };
+    var forces = [_]core.math.Vec2{ .{}, .{}, .{} };
+    const fixed = [_]bool{ false, true, false };
+    const interactions = [_]core.interaction.Interaction{.{
+        .id = core.ids.InteractionId.fromIndex(0),
+        .payload = .{ .bend = .{
+            .atom_a = core.ids.AtomId.fromIndex(0),
+            .center = core.ids.AtomId.fromIndex(1),
+            .atom_b = core.ids.AtomId.fromIndex(2),
+        } },
+    }};
+    _ = try minimize(&interactions, .{ .coordinates = &coordinates, .forces = &forces, .fixed = &fixed }, .{});
+    // Same-process pinned C++ probe with the center constrained/fixed.
+    const expected = [_]core.math.Vec2{
+        .{ .x = 48.4643898, .y = -12.3434944 },
+        .{},
+        .{ .x = -12.3434944, .y = 48.4643898 },
+    };
+    for (expected, coordinates) |want, actual| {
+        try std.testing.expectApproxEqAbs(want.x, actual.x, 0.001);
+        try std.testing.expectApproxEqAbs(want.y, actual.y, 0.001);
+    }
 }
 
 test "nonfinite detection and 3D fallback preserve pinned asymmetries" {
