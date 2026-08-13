@@ -109,9 +109,6 @@ test "minimal native generation explicitly rejects domains owned by later phases
     try expectUnsupported(.{ .atoms = &changed, .bonds = &path });
 
     var changed_bonds = path;
-    changed_bonds[0].order = .zero;
-    try expectUnsupported(.{ .atoms = &atoms, .bonds = &changed_bonds });
-    changed_bonds = path;
     changed_bonds[0].skip = true;
     try expectUnsupported(.{ .atoms = &atoms, .bonds = &changed_bonds });
     changed_bonds = path;
@@ -251,6 +248,21 @@ test "minimal native generation places an acyclic proximity child from a large c
     const dy = result.coordinates[7].y - result.coordinates[8].y;
     try std.testing.expect(@sqrt(dx * dx + dy * dy) >= api.bond_length * 2);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+}
+
+test "minimal native generation uses general placement for a small proximity pair" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2, .order = .zero },
+    };
+    const input = api.Input{ .atoms = &atoms, .bonds = &bonds };
+    var result = try generate(std.testing.allocator, input);
+    defer result.deinit();
+    for (result.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    const dx = result.coordinates[1].x - result.coordinates[2].x;
+    const dy = result.coordinates[1].y - result.coordinates[2].y;
+    try std.testing.expect(@sqrt(dx * dx + dy * dy) >= api.bond_length);
 }
 
 test "minimal native validation rejects malformed input before generation" {

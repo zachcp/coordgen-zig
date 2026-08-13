@@ -333,7 +333,6 @@ pub fn arrangeProximityComponents(
 ) core.errors.Error!bool {
     if (relations.len == 0) return false;
     const central = try selectProximityCenter(graph, relations);
-    if (graph.componentMembers(central).len < 8) return false;
 
     const related = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
     defer allocator.free(related);
@@ -361,6 +360,12 @@ pub fn arrangeProximityComponents(
     var related_count: usize = 0;
     for (related) |value| related_count += @intFromBool(value);
     if (related_count != graph.component_count or unique_edges >= related_count) return false;
+    if (graph.componentMembers(central).len < 8) {
+        return if (related_count == 2 and unique_edges == 1)
+            try arrangeGeneralProximityPair(atoms, graph, rings, relations)
+        else
+            false;
+    }
 
     const placed = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
     defer allocator.free(placed);
@@ -396,6 +401,129 @@ pub fn arrangeProximityComponents(
     }
     for (related, placed) |is_related, is_placed| if (is_related and !is_placed) return false;
     return true;
+}
+
+/// General meta-graph placement for the exact two-component case. Upstream's
+/// recursively generated two-atom meta molecule is horizontal with centers
+/// at (0,0) and (50,0); each real component is aligned to its incident site,
+/// translated to that template, then expanded until 25-unit clashes clear.
+fn arrangeGeneralProximityPair(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+) core.errors.Error!bool {
+    if (graph.component_count != 2) return false;
+    const templates = [_]Vec2{ .{}, .{ .x = core.math.bond_length } };
+    for (0..2) |raw_component| {
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+        const site = try proximitySite(atoms, graph, rings, relations, component);
+        if (site.count == 0) return false;
+        const other_template = templates[1 - raw_component];
+        const direction = geometry.subtract(templates[raw_component], other_template);
+        const radians_per_degree: f32 = -std.math.pi / 180.0;
+        const angle = geometry.signedAngle(geometry.scale(site.addition, -1), .{}, direction) * radians_per_degree;
+        const sine = std.math.sin(angle);
+        const cosine = std.math.cos(angle);
+        for (graph.componentMembers(component)) |atom| {
+            const relative = geometry.subtract(atoms[atom.index()].coordinates, site.center);
+            atoms[atom.index()].coordinates = geometry.add(site.center, geometry.rotate(relative, sine, cosine));
+        }
+    }
+
+    var counter: u32 = 1;
+    var clever = false;
+    while (true) {
+        clever = !clever;
+        if (!clever) counter += 1;
+        for (0..2) |raw_component| {
+            const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+            const site = try proximitySite(atoms, graph, rings, relations, component);
+            const target = geometry.scale(templates[raw_component], @floatFromInt(counter));
+            const translation = geometry.subtract(target, site.center);
+            for (graph.componentMembers(component)) |atom| {
+                atoms[atom.index()].coordinates = geometry.add(atoms[atom.index()].coordinates, translation);
+            }
+        }
+        if (clever) try replaceTerminalSingletons(atoms, graph, rings, relations, counter);
+        if (!componentsClash(atoms, graph, core.math.bond_length * 0.5) or counter >= 10) break;
+    }
+    return true;
+}
+
+const ProximitySite = struct {
+    center: Vec2,
+    addition: Vec2,
+    count: u32,
+};
+
+fn proximitySite(
+    atoms: []const model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+    component: core.ids.MoleculeId,
+) core.errors.Error!ProximitySite {
+    var result = ProximitySite{ .center = .{}, .addition = .{}, .count = 0 };
+    for (relations) |relation| {
+        const local = localEndpoint(graph, relation, component) orelse continue;
+        const other = if (local == relation.start) relation.end else relation.start;
+        const other_component = graph.component(other) orelse return error.InvalidMapping;
+        if (other_component == component) continue;
+        result.center = geometry.add(result.center, atoms[local.index()].coordinates);
+        result.addition = geometry.add(result.addition, singleAdditionVector(atoms, graph, rings, local));
+        result.count += 1;
+    }
+    if (result.count != 0) result.center = geometry.scale(result.center, 1 / @as(f32, @floatFromInt(result.count)));
+    result.addition = geometry.normalize(result.addition);
+    return result;
+}
+
+fn replaceTerminalSingletons(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    relations: []const ProximityRelation,
+    counter: u32,
+) core.errors.Error!void {
+    for (0..2) |raw_component| {
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+        const members = graph.componentMembers(component);
+        if (members.len != 1) continue;
+        var coordinates: Vec2 = .{};
+        var count: u32 = 0;
+        var fallback: ?Vec2 = null;
+        for (relations) |relation| {
+            const local = localEndpoint(graph, relation, component) orelse continue;
+            const partner = if (local == relation.start) relation.end else relation.start;
+            if (graph.component(partner) == component) continue;
+            if (fallback == null) fallback = atoms[partner.index()].coordinates;
+            var addition = singleAdditionVector(atoms, graph, rings, partner);
+            if (geometry.length(addition) < geometry.epsilon) continue;
+            addition = geometry.scale(geometry.normalize(addition), core.math.bond_length * @as(f32, @floatFromInt(counter)));
+            coordinates = geometry.add(coordinates, geometry.add(atoms[partner.index()].coordinates, addition));
+            count += 1;
+        }
+        atoms[members[0].index()].coordinates = if (count != 0)
+            geometry.scale(coordinates, 1 / @as(f32, @floatFromInt(count)))
+        else
+            fallback orelse atoms[members[0].index()].coordinates;
+    }
+}
+
+fn componentsClash(atoms: []const model.Atom, graph: topology.Graph, distance: f32) bool {
+    const first = graph.componentMembers(core.ids.MoleculeId.fromIndex(0));
+    const second = graph.componentMembers(core.ids.MoleculeId.fromIndex(1));
+    const squared_distance = distance * distance;
+    for (first) |first_atom| {
+        for (second) |second_atom| {
+            if (geometry.squaredLength(geometry.subtract(
+                atoms[first_atom.index()].coordinates,
+                atoms[second_atom.index()].coordinates,
+            )) < squared_distance) return true;
+        }
+    }
+    return false;
 }
 
 fn singleAdditionVector(
