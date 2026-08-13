@@ -572,6 +572,11 @@ test "macrocycles dispatch through native polyomino placement" {
         atoms[bonds[opened.index()].start.index()].coordinates,
         atoms[bonds[opened.index()].end.index()].coordinates,
     ) - bond_length) > 0.001);
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        layoutWithOptionsAndDiscard,
+        .{ &atoms, &bonds, graph, rings, split, true },
+    );
 }
 
 fn layoutFixture(atoms: []model.Atom, bonds: []const model.Bond) !void {
@@ -595,6 +600,20 @@ fn layoutAndDiscard(
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
     try initializeCoordinates(allocator, atoms, bonds, graph, rings, split);
+}
+
+fn layoutWithOptionsAndDiscard(
+    allocator: std.mem.Allocator,
+    source_atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    split: fragments.Fragmentation,
+    force_open_macrocycles: bool,
+) !void {
+    const atoms = try allocator.dupe(model.Atom, source_atoms);
+    defer allocator.free(atoms);
+    try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, force_open_macrocycles);
 }
 
 fn expectBondLengths(atoms: []const model.Atom, bonds: []const model.Bond) !void {

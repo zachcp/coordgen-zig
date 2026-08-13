@@ -3,6 +3,7 @@ const core = @import("core");
 const geometry = @import("geometry");
 const model = @import("model");
 const topology = @import("topology");
+const fragments = @import("fragments.zig");
 
 pub const max_macrocycles: usize = 40;
 pub const path_failed: i32 = -1000;
@@ -791,6 +792,55 @@ pub fn findBondToOpen(
     return best;
 }
 
+/// Emit the invert-bond degrees of freedom created for eligible macrocycle
+/// substituents after neighbor placement. Affected atoms are the bound-side
+/// submolecule in deterministic graph traversal order.
+pub fn collectDofs(
+    allocator: std.mem.Allocator,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+) core.errors.Error!core.dof.Collection {
+    var dofs: std.ArrayList(core.dof.Dof) = .empty;
+    defer dofs.deinit(allocator);
+    var affected_atoms: std.ArrayList(core.ids.AtomId) = .empty;
+    defer affected_atoms.deinit(allocator);
+    for (fragmentation.atom_fragment, 0..) |fragment, atom_index| {
+        if (!fragment.isValid()) continue;
+        const atom = core.ids.AtomId.fromIndex(@intCast(atom_index));
+        const atom_rings = membership.atomRings(atom);
+        if (atom_rings.len != 1 or membership.atoms(atom_rings[0]).len < topology.rings.macrocycle_size or graph.degree(atom) != 3) continue;
+        var blocked_by_stereo = false;
+        for (graph.incidentBonds(atom)) |bond_id| {
+            const bond = bonds[bond_id.index()];
+            if (bond.stereo == .unspecified or graph.degree(bond.start) == 1 or graph.degree(bond.end) == 1) continue;
+            blocked_by_stereo = true;
+            break;
+        }
+        if (blocked_by_stereo) continue;
+        for (graph.neighbors(atom)) |neighbor| {
+            if (shareRing(atom, neighbor, membership)) continue;
+            const affected = try graph.reachableExcluding(allocator, neighbor, atom);
+            defer allocator.free(affected);
+            if (affected_atoms.items.len > std.math.maxInt(u32) or affected.len > std.math.maxInt(u32) or dofs.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+            const affected_start: u32 = @intCast(affected_atoms.items.len);
+            affected_atoms.appendSlice(allocator, affected) catch return error.OutOfMemory;
+            dofs.append(allocator, .{
+                .id = core.ids.DofId.fromIndex(@intCast(dofs.items.len)),
+                .fragment = fragment,
+                .affected_atoms = .{ .start = affected_start, .len = @intCast(affected.len) },
+                .state = .{ .count = 2, .tier = core.dof.Tier.invert_bond },
+                .payload = .{ .invert_bond = .{ .pivot = atom, .bound = neighbor } },
+            }) catch return error.OutOfMemory;
+        }
+    }
+    const owned_dofs = dofs.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    errdefer allocator.free(owned_dofs);
+    const owned_affected = affected_atoms.toOwnedSlice(allocator) catch return error.OutOfMemory;
+    return .{ .allocator = allocator, .items = owned_dofs, .affected_atoms = owned_affected };
+}
+
 pub fn lowestPeriod(neighbors: []const u8) usize {
     for (1..neighbors.len) |period| {
         var different = false;
@@ -979,6 +1029,13 @@ fn bondBetween(left: core.ids.AtomId, right: core.ids.AtomId, graph: topology.Gr
     return null;
 }
 
+fn shareRing(left: core.ids.AtomId, right: core.ids.AtomId, membership: topology.RingMembership) bool {
+    for (membership.atomRings(left)) |ring| {
+        if (std.mem.indexOfScalar(core.ids.RingId, membership.atomRings(right), ring) != null) return true;
+    }
+    return false;
+}
+
 fn orderRing(
     allocator: std.mem.Allocator,
     ring: core.ids.RingId,
@@ -1147,7 +1204,7 @@ test "invalid hard constraints reject every rotational start" {
     try std.testing.expect((try matchPolyomino(std.testing.allocator, shape, .{ .double_bonds = &invalid }, .{})) == null);
 }
 
-fn collectAndGenerateFixture(allocator: std.mem.Allocator) !void {
+fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !void {
     const ring_size = 13;
     var atoms: [ring_size + 2]model.Atom = undefined;
     for (&atoms, 0..) |*atom, index| atom.* = .{
@@ -1195,6 +1252,25 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator) !void {
     try std.testing.expect(bonds[opened.index()].end != core.ids.AtomId.fromIndex(0));
     try std.testing.expect(bonds[opened.index()].start != core.ids.AtomId.fromIndex(1));
     try std.testing.expect(bonds[opened.index()].end != core.ids.AtomId.fromIndex(1));
+    if (test_dofs) {
+        var fragmentation = try fragments.Fragmentation.init(allocator, &atoms, &bonds, graph, membership);
+        defer fragmentation.deinit();
+        var dofs = try collectDofs(allocator, &bonds, graph, membership, fragmentation);
+        defer dofs.deinit();
+        try std.testing.expectEqual(@as(usize, 1), dofs.items.len);
+        try std.testing.expectEqual(core.dof.DofKind.invert_bond, dofs.items[0].kind());
+        try std.testing.expectEqual(core.ids.AtomId.fromIndex(2), dofs.items[0].payload.invert_bond.pivot);
+        try std.testing.expectEqual(core.ids.AtomId.fromIndex(ring_size), dofs.items[0].payload.invert_bond.bound);
+        try std.testing.expectEqualSlices(core.ids.AtomId, &.{
+            core.ids.AtomId.fromIndex(ring_size),
+            core.ids.AtomId.fromIndex(ring_size + 1),
+        }, dofs.affected_atoms);
+        try std.testing.checkAllAllocationFailures(
+            std.testing.allocator,
+            collectDofsAndDiscard,
+            .{ &bonds, graph, membership, fragmentation },
+        );
+    }
     var data = try collectPathData(allocator, core.ids.RingId.fromIndex(0), &atoms, &bonds, graph, membership);
     defer data.deinit();
     try std.testing.expectEqual(@as(usize, ring_size), data.ordered_atoms.len);
@@ -1227,6 +1303,21 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator) !void {
     try std.testing.expectEqualSlices(core.math.Vec2, before, coordinates);
 }
 
+fn collectDofsAndDiscard(
+    allocator: std.mem.Allocator,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+) !void {
+    var dofs = try collectDofs(allocator, bonds, graph, membership, fragmentation);
+    defer dofs.deinit();
+}
+
 test "topology path extraction and bounded shape orchestration clean every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, collectAndGenerateFixture, .{});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, collectAndGenerateFixture, .{false});
+}
+
+test "macrocycle substituents emit invert-bond DOFs with their bound subtree" {
+    try collectAndGenerateFixture(std.testing.allocator, true);
 }
