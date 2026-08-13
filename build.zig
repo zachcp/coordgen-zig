@@ -387,6 +387,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "model-test", .module = model },
             .{ .name = "geometry-test", .module = geometry },
             .{ .name = "topology-test", .module = topology },
+            .{ .name = "layout-test", .module = layers.layout },
             .{ .name = "api-test", .module = api },
             .{ .name = "c-abi-test", .module = c_abi },
             .{ .name = "c-abi-exports-test", .module = c_abi_exports },

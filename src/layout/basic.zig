@@ -5,6 +5,7 @@ const topology = @import("topology");
 const fragments = @import("fragments.zig");
 
 pub const bond_length: f32 = 50;
+const pi: f32 = std.math.pi;
 
 /// Generate deterministic local coordinates for ordinary rigid fragments.
 /// Template and macrocycle dispatch are deliberately owned by their later
@@ -47,14 +48,14 @@ pub fn initializeCoordinates(
                 if (fragmentation.atom_fragment[neighbor.index()] == fragment.id and !placed[neighbor.index()]) unplaced_count += 1;
             }
             if (unplaced_count == 0) continue;
-            const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center);
+            const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
             var generated: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
                 if (fragmentation.atom_fragment[neighbor.index()] != fragment.id or placed[neighbor.index()]) continue;
                 const spread = if (unplaced_count == 1)
                     @as(f32, 0)
                 else
-                    (@as(f32, @floatFromInt(generated)) - @as(f32, @floatFromInt(unplaced_count - 1)) * 0.5) * (2 * std.math.pi / 3);
+                    (@as(f32, @floatFromInt(generated)) - @as(f32, @floatFromInt(unplaced_count - 1)) * 0.5) * (2 * pi / 3);
                 const angle = base_angle + spread;
                 atoms[neighbor.index()].coordinates = .{
                     .x = atoms[center.index()].coordinates.x + @cos(angle) * bond_length,
@@ -98,7 +99,7 @@ fn placeFragmentRings(
                 shared += @intFromBool(placed[atom.index()]);
             }
             if (already_complete) continue;
-            const score = shared * 10000 + @intFromBool(ring_atoms.len == 6) * 10 + ring_atoms.len;
+            const score = shared * 10000 + @as(usize, @intFromBool(ring_atoms.len == 6)) * 10 + ring_atoms.len;
             if (selected == null or score > selected_score) {
                 selected = ring;
                 selected_shared = shared;
@@ -145,7 +146,7 @@ fn regularRingCoordinates(allocator: std.mem.Allocator, count: usize) core.error
     const result = allocator.alloc(core.math.Vec2, count) catch return error.OutOfMemory;
     errdefer allocator.free(result);
     var coordinate: core.math.Vec2 = .{};
-    const step = 2 * std.math.pi / @as(f32, @floatFromInt(count));
+    const step = 2 * pi / @as(f32, @floatFromInt(count));
     for (result, 0..) |*destination, index| {
         destination.* = coordinate;
         const angle = step * @as(f32, @floatFromInt(index));
@@ -241,7 +242,7 @@ fn assembleFragments(atoms: []model.Atom, bonds: []const model.Bond, graph: topo
             if (length(child_direction) < 0.0001) child_direction = .{ .x = 1 };
             var desired_child_direction = outward;
             if (graph.degree(child_endpoint) == 2) {
-                desired_child_direction = rotateVector(scale(outward, -1), 2 * std.math.pi / 3);
+                desired_child_direction = rotateVector(scale(outward, -1), 2 * pi / 3);
             }
             const angle = std.math.atan2(desired_child_direction.y, desired_child_direction.x) - std.math.atan2(child_direction.y, child_direction.x);
             const source = atoms[child_endpoint.index()].coordinates;
@@ -275,8 +276,8 @@ fn openValenceDirection(
         count += 1;
     }
     if (count == 0) return .{ .x = 1 };
-    if (count == 1) return rotateVector(first_direction, -2 * std.math.pi / 3);
-    if (length(direction_sum) < 0.0001) return rotateVector(first_direction, std.math.pi);
+    if (count == 1) return rotateVector(first_direction, -2 * pi / 3);
+    if (length(direction_sum) < 0.0001) return rotateVector(first_direction, pi);
     return scale(direction_sum, -1 / length(direction_sum));
 }
 
@@ -402,13 +403,13 @@ fn orderRing(allocator: std.mem.Allocator, ring: model.Ring, bonds: []const mode
     return result;
 }
 
-fn parentAngle(atoms: []const model.Atom, graph: topology.Graph, fragmentation: fragments.Fragmentation, fragment: core.ids.FragmentId, center: core.ids.AtomId) f32 {
+fn parentAngle(atoms: []const model.Atom, graph: topology.Graph, fragmentation: fragments.Fragmentation, fragment: core.ids.FragmentId, center: core.ids.AtomId, placed: []const bool) f32 {
     for (graph.neighbors(center)) |neighbor| {
-        if (fragmentation.atom_fragment[neighbor.index()] != fragment or
+        if (!placed[neighbor.index()] or fragmentation.atom_fragment[neighbor.index()] != fragment or
             (atoms[neighbor.index()].coordinates.x == atoms[center.index()].coordinates.x and atoms[neighbor.index()].coordinates.y == atoms[center.index()].coordinates.y)) continue;
         const direction = atoms[center.index()].coordinates;
         const parent = atoms[neighbor.index()].coordinates;
-        return std.math.atan2(direction.y - parent.y, direction.x - parent.x) + std.math.pi / 3;
+        return std.math.atan2(direction.y - parent.y, direction.x - parent.x) + pi / 3;
     }
     return 0;
 }

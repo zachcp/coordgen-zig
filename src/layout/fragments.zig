@@ -78,7 +78,9 @@ pub const Fragmentation = struct {
         const counts = allocator.alloc(u32, fragment_count) catch return error.OutOfMemory;
         defer allocator.free(counts);
         @memset(counts, 0);
-        for (atom_fragment) |fragment| if (fragment.isValid()) counts[fragment.index()] += 1;
+        for (atom_fragment) |fragment| {
+            if (fragment.isValid()) counts[fragment.index()] += 1;
+        }
         var offset: u32 = 0;
         for (records, 0..) |*record, index| {
             record.* = .{
@@ -103,10 +105,10 @@ pub const Fragmentation = struct {
         }
 
         for (records) |*record| {
-            const members = fragment_atoms[record.atom_start..][0..record.atom_count];
-            record.component = graph.component(members[0]).?;
+            const fragment_members = fragment_atoms[record.atom_start..][0..record.atom_count];
+            record.component = graph.component(fragment_members[0]).?;
             var constrained_count: u32 = 0;
-            for (members) |atom_id| {
+            for (fragment_members) |atom_id| {
                 const atom = atoms[atom_id.index()];
                 record.flags.fixed = record.flags.fixed or atom.fixed;
                 record.flags.constrained = record.flags.constrained or atom.constrained;
@@ -231,7 +233,9 @@ fn priorityValues(record: Fragment, members: []const core.ids.AtomId, atoms: []c
         // counts non-carbon atoms, including explicit hydrogens.
         heavy += @intFromBool(atom.atomic_number != .carbon);
         weight += @backingInt(atom.atomic_number);
-        for (graph.incidentBonds(atom_id)) |bond_id| if (bonds[bond_id.index()].effective_order == .double) doubles += 1;
+        for (graph.incidentBonds(atom_id)) |bond_id| {
+            if (bonds[bond_id.index()].effective_order == .double) doubles += 1;
+        }
     }
     return .{ fixed, constrained, record.ring_count, record.atom_count, record.inter_bond_count, heavy, weight, doubles / 2 };
 }
