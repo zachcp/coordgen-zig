@@ -852,12 +852,16 @@ pub fn collectAllDofs(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!core.dof.Collection {
-    var specialized = try collectDofs(allocator, bonds, graph, membership, fragmentation);
-    defer specialized.deinit();
     var items: std.ArrayList(core.dof.Dof) = .empty;
     defer items.deinit(allocator);
     var affected: std.ArrayList(core.ids.AtomId) = .empty;
     defer affected.deinit(allocator);
+    const maximum_specialized = std.math.mul(usize, bonds.len, 4) catch return error.TooManyItems;
+    const primary_count = std.math.mul(usize, fragmentation.fragments.len, 3) catch return error.TooManyItems;
+    const maximum_items = std.math.add(usize, primary_count, maximum_specialized) catch return error.TooManyItems;
+    const maximum_affected = std.math.mul(usize, maximum_specialized, fragmentation.atom_fragment.len) catch return error.TooManyItems;
+    items.ensureTotalCapacity(allocator, maximum_items) catch return error.OutOfMemory;
+    affected.ensureTotalCapacity(allocator, maximum_affected) catch return error.OutOfMemory;
 
     for (fragmentation.fragments) |fragment| {
         const primary = [_]struct { payload: core.dof.Payload, count: u32, tier: u32 }{
@@ -886,23 +890,137 @@ pub fn collectAllDofs(
                 .payload = entry.payload,
             }) catch return error.OutOfMemory;
         }
-        for (specialized.items) |dof| {
-            if (dof.fragment != fragment.id) continue;
-            const source_start = dof.affected_atoms.start;
-            const source_end = std.math.add(u32, source_start, dof.affected_atoms.len) catch return error.InvalidMapping;
-            if (source_end > specialized.affected_atoms.len or affected.items.len > std.math.maxInt(u32)) return error.InvalidMapping;
-            const affected_start: u32 = @intCast(affected.items.len);
-            affected.appendSlice(allocator, specialized.affected_atoms[source_start..source_end]) catch return error.OutOfMemory;
-            var copied = dof;
-            copied.id = core.ids.DofId.fromIndex(@intCast(items.items.len));
-            copied.affected_atoms.start = affected_start;
-            items.append(allocator, copied) catch return error.OutOfMemory;
-        }
+        try appendSpecializedDofs(allocator, &items, &affected, fragment, bonds, graph, membership, fragmentation);
     }
     const owned_items = items.toOwnedSlice(allocator) catch return error.OutOfMemory;
     errdefer allocator.free(owned_items);
     const owned_affected = affected.toOwnedSlice(allocator) catch return error.OutOfMemory;
     return .{ .allocator = allocator, .items = owned_items, .affected_atoms = owned_affected };
+}
+
+const PendingDof = struct {
+    payload: core.dof.Payload,
+    state: core.dof.State,
+    affected: std.ArrayList(core.ids.AtomId) = .empty,
+};
+
+fn appendSpecializedDofs(
+    allocator: std.mem.Allocator,
+    output: *std.ArrayList(core.dof.Dof),
+    output_affected: *std.ArrayList(core.ids.AtomId),
+    fragment: fragments.Fragment,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+) core.errors.Error!void {
+    var pending: std.ArrayList(PendingDof) = .empty;
+    defer {
+        for (pending.items) |*dof| dof.affected.deinit(allocator);
+        pending.deinit(allocator);
+    }
+    const maximum_pending = std.math.mul(usize, bonds.len, 4) catch return error.TooManyItems;
+    pending.ensureTotalCapacity(allocator, maximum_pending) catch return error.OutOfMemory;
+    const membership_count = std.math.mul(usize, maximum_pending, fragmentation.atom_fragment.len) catch return error.TooManyItems;
+    const atom_dofs = allocator.alloc(bool, membership_count) catch return error.OutOfMemory;
+    defer allocator.free(atom_dofs);
+    @memset(atom_dofs, false);
+    const visited = allocator.alloc(bool, fragmentation.atom_fragment.len) catch return error.OutOfMemory;
+    defer allocator.free(visited);
+    @memset(visited, false);
+    const queue = allocator.alloc(core.ids.AtomId, fragment.atom_count) catch return error.OutOfMemory;
+    defer allocator.free(queue);
+    var head: usize = 0;
+    var tail: usize = 0;
+    const members = fragmentation.members(fragment.id);
+    for (members) |atom| {
+        if (membership.atomRings(atom).len == 0) continue;
+        queue[tail] = atom;
+        tail += 1;
+        visited[atom.index()] = true;
+    }
+    if (tail == 0) {
+        var start = members[0];
+        if (fragment.parent.isValid()) {
+            const parent_bond = bonds[fragment.bond_to_parent.index()];
+            start = if (fragmentation.atom_fragment[parent_bond.start.index()] == fragment.id) parent_bond.start else parent_bond.end;
+        }
+        queue[0] = start;
+        tail = 1;
+        visited[start.index()] = true;
+    }
+
+    while (head < tail) : (head += 1) {
+        const atom = queue[head];
+        for (graph.neighbors(atom)) |neighbor| {
+            if (fragmentation.atom_fragment[neighbor.index()] != fragment.id or visited[neighbor.index()]) continue;
+            visited[neighbor.index()] = true;
+            queue[tail] = neighbor;
+            tail += 1;
+            for (0..pending.items.len) |pending_index| {
+                if (!atom_dofs[pending_index * fragmentation.atom_fragment.len + atom.index()]) continue;
+                pending.items[pending_index].affected.append(allocator, neighbor) catch return error.OutOfMemory;
+                atom_dofs[pending_index * fragmentation.atom_fragment.len + neighbor.index()] = true;
+            }
+        }
+
+        if (eligibleInvertPivot(atom, bonds, graph, membership)) {
+            for (graph.neighbors(atom)) |neighbor| {
+                if (shareRing(atom, neighbor, membership)) continue;
+                try appendPendingDof(allocator, &pending, atom_dofs, fragmentation.atom_fragment.len, fragment.atom_count, .{ .invert_bond = .{ .pivot = atom, .bound = neighbor } }, .{
+                    .count = 2,
+                    .tier = core.dof.Tier.invert_bond,
+                }, neighbor);
+            }
+        }
+        for (graph.neighbors(atom)) |neighbor| {
+            if (fragmentation.atom_fragment[neighbor.index()] != fragment.id or shareRing(atom, neighbor, membership)) continue;
+            try appendPendingDof(allocator, &pending, atom_dofs, fragmentation.atom_fragment.len, fragment.atom_count, .{ .scale_atoms = .{ .pivot = atom } }, .{
+                .count = 2,
+                .tier = core.dof.Tier.scale_atoms,
+            }, neighbor);
+        }
+    }
+    if (tail != members.len) return error.InvalidMapping;
+    for (pending.items) |dof| {
+        if (output.items.len >= std.math.maxInt(u32) or output_affected.items.len > std.math.maxInt(u32) or dof.affected.items.len > std.math.maxInt(u32)) return error.TooManyItems;
+        const affected_start: u32 = @intCast(output_affected.items.len);
+        output_affected.appendSlice(allocator, dof.affected.items) catch return error.OutOfMemory;
+        output.append(allocator, .{
+            .id = core.ids.DofId.fromIndex(@intCast(output.items.len)),
+            .fragment = fragment.id,
+            .affected_atoms = .{ .start = affected_start, .len = @intCast(dof.affected.items.len) },
+            .state = dof.state,
+            .payload = dof.payload,
+        }) catch return error.OutOfMemory;
+    }
+}
+
+fn appendPendingDof(
+    allocator: std.mem.Allocator,
+    pending: *std.ArrayList(PendingDof),
+    atom_dofs: []bool,
+    atom_count: usize,
+    maximum_affected: usize,
+    payload: core.dof.Payload,
+    state: core.dof.State,
+    first_atom: core.ids.AtomId,
+) core.errors.Error!void {
+    const index = pending.items.len;
+    pending.append(allocator, .{ .payload = payload, .state = state }) catch return error.OutOfMemory;
+    pending.items[index].affected.ensureTotalCapacity(allocator, maximum_affected) catch return error.OutOfMemory;
+    pending.items[index].affected.append(allocator, first_atom) catch return error.OutOfMemory;
+    atom_dofs[index * atom_count + first_atom.index()] = true;
+}
+
+fn eligibleInvertPivot(atom: core.ids.AtomId, bonds: []const model.Bond, graph: topology.Graph, membership: topology.RingMembership) bool {
+    const atom_rings = membership.atomRings(atom);
+    if (atom_rings.len != 1 or membership.atoms(atom_rings[0]).len < topology.rings.macrocycle_size or graph.degree(atom) != 3) return false;
+    for (graph.incidentBonds(atom)) |bond_id| {
+        const bond = bonds[bond_id.index()];
+        if (bond.stereo != .unspecified and graph.degree(bond.start) != 1 and graph.degree(bond.end) != 1) return false;
+    }
+    return true;
 }
 
 pub fn lowestPeriod(neighbors: []const u8) usize {
@@ -1335,7 +1453,9 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
         );
         var all_dofs = try collectAllDofs(allocator, &bonds, graph, membership, fragmentation);
         defer all_dofs.deinit();
-        try std.testing.expectEqual(fragmentation.fragments.len * 3 + 1, all_dofs.items.len);
+        try std.testing.expect(all_dofs.items.len > fragmentation.fragments.len * 3 + 1);
+        var found_scale = false;
+        var found_invert = false;
         var dof_index: usize = 0;
         for (fragmentation.fragments) |fragment| {
             try std.testing.expectEqual(core.dof.DofKind.flip_fragment, all_dofs.items[dof_index].kind());
@@ -1343,8 +1463,13 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
             try std.testing.expectEqual(core.dof.DofKind.rotate_fragment, all_dofs.items[dof_index + 2].kind());
             try std.testing.expectEqual(fragment.id, all_dofs.items[dof_index].fragment);
             dof_index += 3;
-            while (dof_index < all_dofs.items.len and all_dofs.items[dof_index].fragment == fragment.id) dof_index += 1;
+            while (dof_index < all_dofs.items.len and all_dofs.items[dof_index].fragment == fragment.id) : (dof_index += 1) {
+                found_scale = found_scale or all_dofs.items[dof_index].kind() == .scale_atoms;
+                found_invert = found_invert or all_dofs.items[dof_index].kind() == .invert_bond;
+            }
         }
+        try std.testing.expect(found_scale);
+        try std.testing.expect(found_invert);
         try std.testing.checkAllAllocationFailures(
             std.testing.allocator,
             collectAllDofsAndDiscard,
