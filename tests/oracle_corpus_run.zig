@@ -246,7 +246,7 @@ fn emitProbe(
     for (probe.dofSlice()) |dof| {
         try dofs.append(gpa, try std.fmt.allocPrint(
             gpa,
-            "[kind={d} fragment={d} state={d}/{d}/{d} tier={d} atoms={d},{d} ring={d} multiplier={d}]",
+            "[kind={d} fragment={d} state={d}/{d}/{d} tier={d} affected={d} atoms={d},{d} ring={d} multiplier={d}]",
             .{
                 @backingInt(dof.kind),
                 dof.fragment,
@@ -254,6 +254,7 @@ fn emitProbe(
                 dof.optimal_state,
                 dof.state_count,
                 dof.tier,
+                dof.affected_count,
                 dof.atom_a,
                 dof.atom_b,
                 dof.ring,

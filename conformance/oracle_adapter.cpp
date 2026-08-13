@@ -2,14 +2,24 @@
 #include "coordgen_probe.h"
 #include "coordgen_oracle_hook.hpp"
 
-#include "sketcherMinimizer.h"
-
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
+#include <map>
 #include <new>
 #include <unordered_map>
 #include <vector>
+
+/* Conformance-only structural introspection. Production headers remain
+ * untouched; standard headers are parsed before these access macros. */
+#define protected public
+#define private public
+#include "sketcherMinimizerFragment.h"
+#undef private
+#undef protected
+#include "sketcherMinimizer.h"
 
 namespace {
 
@@ -480,6 +490,23 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
             probe.atom_b = COORDGEN_INVALID_INDEX;
             probe.ring = COORDGEN_INVALID_INDEX;
             probe.current_penalty = dof->getCurrentPenalty();
+            probe.affected_count = static_cast<uint32_t>(dof->m_atoms.size());
+            if (const auto* scale = dynamic_cast<const CoordgenScaleAtomsDOF*>(dof)) {
+                probe.atom_a = atomIndex(scale->m_pivotAtom);
+            } else if (const auto* invert = dynamic_cast<const CoordgenInvertBondDOF*>(dof)) {
+                probe.atom_a = atomIndex(invert->m_pivotAtom);
+                probe.atom_b = atomIndex(invert->m_boundAtom);
+            } else if (const auto* flip = dynamic_cast<const CoordgenFlipRingDOF*>(dof)) {
+                probe.atom_a = atomIndex(flip->m_pivotAtom1);
+                probe.atom_b = atomIndex(flip->m_pivotAtom2);
+                probe.variant_penalty_multiplier = flip->m_penalty;
+                for (const sketcherMinimizerRing* ring : fragment_rings) {
+                    if (ring->_atoms == flip->m_atoms) {
+                        probe.ring = ring_indices.at(ring);
+                        break;
+                    }
+                }
+            }
             output.dofs.push_back(probe);
         }
         record.dof_count = static_cast<uint32_t>(output.dofs.size()) - record.dof_start;
