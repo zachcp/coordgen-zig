@@ -129,6 +129,14 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
             );
         }
     }
+    for (prepared.working.atoms) |atom| if (!atom.coordinates.isFinite()) return error.InvalidCoordinate;
+    try topology.stereo.writeAtomBondDisplays(
+        allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+    );
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(coordinates);
@@ -188,7 +196,6 @@ fn optimizeDiscrete(
     if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
     var dofs = try layout.macrocycle.collectAllDofs(allocator, bonds, graph, rings, fragmentation);
     defer dofs.deinit();
-    if (dofs.items.len == 0) return false;
 
     const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_has_dofs);
@@ -215,6 +222,13 @@ fn optimizeDiscrete(
             filtered_count += 1;
         }
         scoring_interactions = filtered_interactions[0..filtered_count];
+    }
+    if (dofs.items.len == 0) {
+        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
+        defer allocator.free(coordinates);
+        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+        const clash_energy = try optimize.discrete.scoreClashInteractions(scoring_interactions, coordinates);
+        return clash_energy < optimize.discrete.clash_energy_threshold;
     }
 
     const bond_views = allocator.alloc(optimize.discrete.BondScoreView, bonds.len) catch return error.OutOfMemory;

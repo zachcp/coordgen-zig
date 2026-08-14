@@ -16,6 +16,7 @@ test "minimal native ethane and propane are finite deterministic caller-order la
     var second = try generate(std.testing.allocator, input);
     defer second.deinit();
     try std.testing.expectEqualSlices(api.Vec2, first.coordinates, second.coordinates);
+    try std.testing.expect(first.clean_pose);
     for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
     for (bonds) |bond| {
         const delta_x = first.coordinates[bond.start].x - first.coordinates[bond.end].x;
