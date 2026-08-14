@@ -431,6 +431,73 @@ pub fn arrangeProximityComponents(
     return true;
 }
 
+/// Run proximity placement on a compact copy of non-residue atoms, preserving
+/// full-graph coordinates and IDs outside that active subsystem.
+pub fn arrangeProximityComponentsExcluding(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    relations: []const ProximityRelation,
+    excluded_atoms: []const bool,
+) core.errors.Error!bool {
+    if (excluded_atoms.len != atoms.len) return error.InvalidMapping;
+    const old_to_new = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(old_to_new);
+    @memset(old_to_new, std.math.maxInt(u32));
+    var active_count: usize = 0;
+    for (excluded_atoms) |excluded| active_count += @intFromBool(!excluded);
+    if (active_count == 0) return false;
+    const active_atoms = allocator.alloc(model.Atom, active_count) catch return error.OutOfMemory;
+    defer allocator.free(active_atoms);
+    const new_to_old = allocator.alloc(u32, active_count) catch return error.OutOfMemory;
+    defer allocator.free(new_to_old);
+    var active_index: usize = 0;
+    for (atoms, excluded_atoms, 0..) |atom, excluded, old_index| {
+        if (excluded) continue;
+        if (active_index >= std.math.maxInt(u32)) return error.TooManyItems;
+        old_to_new[old_index] = @intCast(active_index);
+        new_to_old[active_index] = @intCast(old_index);
+        active_atoms[active_index] = atom;
+        active_atoms[active_index].id = core.ids.AtomId.fromIndex(@intCast(active_index));
+        active_index += 1;
+    }
+
+    var active_bond_count: usize = 0;
+    for (bonds) |bond| {
+        if (bond.start.index() >= atoms.len or bond.end.index() >= atoms.len) return error.InvalidMapping;
+        active_bond_count += @intFromBool(!excluded_atoms[bond.start.index()] and !excluded_atoms[bond.end.index()]);
+    }
+    const active_bonds = allocator.alloc(model.Bond, active_bond_count) catch return error.OutOfMemory;
+    defer allocator.free(active_bonds);
+    var bond_index: usize = 0;
+    for (bonds) |bond| {
+        if (excluded_atoms[bond.start.index()] or excluded_atoms[bond.end.index()]) continue;
+        active_bonds[bond_index] = bond;
+        active_bonds[bond_index].id = core.ids.BondId.fromIndex(@intCast(bond_index));
+        active_bonds[bond_index].start = core.ids.AtomId.fromIndex(old_to_new[bond.start.index()]);
+        active_bonds[bond_index].end = core.ids.AtomId.fromIndex(old_to_new[bond.end.index()]);
+        bond_index += 1;
+    }
+    const active_relations = allocator.alloc(ProximityRelation, relations.len) catch return error.OutOfMemory;
+    defer allocator.free(active_relations);
+    for (relations, active_relations) |relation, *active| {
+        if (relation.start.index() >= atoms.len or relation.end.index() >= atoms.len or
+            excluded_atoms[relation.start.index()] or excluded_atoms[relation.end.index()]) return error.InvalidMapping;
+        active.* = .{
+            .start = core.ids.AtomId.fromIndex(old_to_new[relation.start.index()]),
+            .end = core.ids.AtomId.fromIndex(old_to_new[relation.end.index()]),
+        };
+    }
+
+    var graph = try topology.Graph.init(allocator, active_atoms, active_bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(allocator, graph, active_bonds);
+    defer rings.deinit();
+    if (!try arrangeProximityComponents(allocator, active_atoms, graph, rings, active_relations)) return false;
+    for (active_atoms, new_to_old) |atom, old_index| atoms[old_index].coordinates = atom.coordinates;
+    return true;
+}
+
 /// General meta-graph placement. Upstream recursively lays out one carbon-like
 /// meta atom per component, aligns each real component's incident sites to its
 /// meta neighbors, then expands that template until 25-unit clashes clear.
@@ -1147,6 +1214,18 @@ fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: t
     try arrangeComponents(allocator, atoms, graph);
 }
 
+fn arrangeProximityExcludingAndDiscard(
+    allocator: std.mem.Allocator,
+    source_atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    relations: []const ProximityRelation,
+    excluded: []const bool,
+) !void {
+    const atoms = try allocator.dupe(model.Atom, source_atoms);
+    defer allocator.free(atoms);
+    if (!try arrangeProximityComponentsExcluding(allocator, atoms, bonds, relations, excluded)) return error.InvalidMapping;
+}
+
 test "neutral component placement cleans every allocation failure" {
     var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0) };
     const bonds = [_]model.Bond{.{
@@ -1182,4 +1261,37 @@ test "component arrangement ignores residue-only components" {
 
     const mixed = [_]bool{ true, false, false, false };
     try std.testing.expectError(error.InvalidMapping, arrangeComponentsExcluding(std.testing.allocator, &atoms, graph, &mixed));
+}
+
+test "proximity arrangement compacts excluded residue components and cleans allocation failures" {
+    const source_atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 19) };
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(1),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = core.ids.AtomId.fromIndex(1),
+            .end = core.ids.AtomId.fromIndex(2),
+            .input_order = .zero,
+            .effective_order = .zero,
+        },
+    };
+    const relations = [_]ProximityRelation{.{
+        .start = core.ids.AtomId.fromIndex(1),
+        .end = core.ids.AtomId.fromIndex(2),
+    }};
+    const excluded = [_]bool{ false, false, false, true };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeProximityExcludingAndDiscard, .{
+        &source_atoms,
+        &bonds,
+        &relations,
+        &excluded,
+    });
 }

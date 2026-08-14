@@ -222,6 +222,35 @@ test "minimal native generation places interacting protein-only chains" {
     try checkStableProteinAllocations(std.testing.allocator, input);
 }
 
+test "minimal native generation composes ligand proximity and residue placement" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2, .order = .zero },
+    };
+    const residues = [_]api.ResidueInput{.{
+        .atom = 3,
+        .chain = "A",
+        .residue_number = 4,
+        .closest_ligand_atom = 1,
+    }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = try generate(std.testing.allocator, input);
+    defer first.deinit();
+    var repeated = try generate(std.testing.allocator, input);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, repeated.coordinates);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.expect(!std.meta.eql(first.coordinates[1], first.coordinates[2]));
+    try std.testing.expect(!std.meta.eql(first.coordinates[1], first.coordinates[3]));
+}
+
 test "minimal native generation reaches macrocycle lattice and forced-open fallback" {
     const ring_size = 13;
     var atoms: [ring_size]api.AtomInput = undefined;

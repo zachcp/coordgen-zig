@@ -93,9 +93,13 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
     } else if (proximity_relations.len == 0) {
         try components.arrangeComponentsExcluding(allocator, prepared.working.atoms, prepared.graph, residue_atoms);
     } else if (prepared.working.residues.len != 0) {
-        // Mixed ordinary proximity and residue placement needs the combined
-        // upstream placement graph rather than either phase independently.
-        return error.Unsupported;
+        if (!try components.arrangeProximityComponentsExcluding(
+            allocator,
+            prepared.working.atoms,
+            prepared.working.bonds,
+            proximity_relations,
+            residue_atoms,
+        )) return error.Unsupported;
     } else if (!try components.arrangeProximityComponents(
         allocator,
         prepared.working.atoms,
