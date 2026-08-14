@@ -97,6 +97,332 @@ pub const LigandBond = struct {
     end: u32,
 };
 
+/// Place protein-only residue representatives using upstream's LID-style
+/// chain centers, interaction-priority traversal, and oriented clash grid.
+pub fn placeProteinOnly(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    residues: []const model.Residue,
+    chain_bytes: []const u8,
+    interactions: []const model.ResidueInteraction,
+) core.errors.Error!void {
+    if (residues.len == 0 or residues.len != atoms.len) return error.InvalidMapping;
+    const chain_indices = allocator.alloc(u32, residues.len) catch return error.OutOfMemory;
+    defer allocator.free(chain_indices);
+    const chain_count = try assignChainIndices(allocator, residues, chain_bytes, chain_indices);
+    const chain_centers = allocator.alloc(core.math.Vec2, chain_count) catch return error.OutOfMemory;
+    defer allocator.free(chain_centers);
+    initializeChainCenters(chain_centers);
+
+    for (residues, chain_indices) |residue, chain_index| {
+        if (residue.atom.index() >= atoms.len) return error.InvalidMapping;
+        atoms[residue.atom.index()].coordinates = chain_centers[chain_index];
+    }
+    for (interactions) |interaction| {
+        if (interaction.start.index() >= atoms.len or interaction.end.index() >= atoms.len or
+            residueForAtom(residues, interaction.start) == null or residueForAtom(residues, interaction.end) == null) return error.InvalidMapping;
+    }
+    shortenResidueInteractions(atoms, residues, interactions);
+
+    const order = try interactionTraversalOrder(allocator, residues, interactions);
+    defer allocator.free(order);
+    const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(placed);
+    @memset(placed, false);
+    for (order) |id| {
+        const residue = residues[id.index()];
+        var direction = core.math.Vec2{ .y = 1 };
+        for (interactions) |interaction| {
+            const partner_atom = if (interaction.start == residue.atom)
+                interaction.end
+            else if (interaction.end == residue.atom)
+                interaction.start
+            else
+                continue;
+            const partner_id = residueForAtom(residues, partner_atom) orelse return error.InvalidMapping;
+            if (!placed[partner_atom.index()] or chain_indices[partner_id.index()] == chain_indices[id.index()]) continue;
+            const delta = subtract(chain_centers[chain_indices[partner_id.index()]], chain_centers[chain_indices[id.index()]]);
+            const normal = normalize(.{ .x = -delta.y, .y = delta.x });
+            direction = scale(normal, 4);
+            break;
+        }
+        atoms[residue.atom.index()].coordinates = try exploreResidueGrid(
+            atoms[residue.atom.index()].coordinates,
+            direction,
+            residue.atom,
+            atoms,
+            residues,
+            interactions,
+            placed,
+        );
+        placed[residue.atom.index()] = true;
+    }
+    try minimizeProteinInteractions(allocator, atoms, residues, interactions);
+}
+
+fn assignChainIndices(
+    allocator: std.mem.Allocator,
+    residues: []const model.Residue,
+    chain_bytes: []const u8,
+    output: []u32,
+) core.errors.Error!usize {
+    if (output.len != residues.len) return error.InvalidMapping;
+    const sorted = allocator.alloc(u32, residues.len) catch return error.OutOfMemory;
+    defer allocator.free(sorted);
+    for (sorted, 0..) |*value, index| value.* = @intCast(index);
+    std.mem.sortUnstable(u32, sorted, ResidueOrderContext{ .residues = residues, .chains = chain_bytes }, residueLessThanRaw);
+    var chain_count: usize = 0;
+    var previous: ?[]const u8 = null;
+    for (sorted) |raw_id| {
+        const chain = try residueChain(residues[raw_id], chain_bytes);
+        if (previous == null or !std.mem.eql(u8, previous.?, chain)) {
+            chain_count += 1;
+            previous = chain;
+        }
+    }
+    previous = null;
+    var chain_index: u32 = 0;
+    for (sorted) |raw_id| {
+        const chain = try residueChain(residues[raw_id], chain_bytes);
+        if (previous) |prior| {
+            if (!std.mem.eql(u8, prior, chain)) chain_index += 1;
+        }
+        previous = chain;
+        output[raw_id] = chain_index;
+    }
+    return chain_count;
+}
+
+fn residueLessThanRaw(context: ResidueOrderContext, first: u32, second: u32) bool {
+    return residueLessThan(context, core.ids.ResidueId.fromIndex(first), core.ids.ResidueId.fromIndex(second));
+}
+
+fn initializeChainCenters(centers: []core.math.Vec2) void {
+    for (centers, 0..) |*center, index| {
+        center.* = .{ .x = @as(f32, @floatFromInt(index)) * core.math.bond_length * 10 };
+    }
+}
+
+fn shortenResidueInteractions(
+    atoms: []model.Atom,
+    residues: []const model.Residue,
+    interactions: []const model.ResidueInteraction,
+) void {
+    for (residues) |residue| {
+        for (interactions) |interaction| {
+            if (interaction.start != residue.atom and interaction.end != residue.atom) continue;
+            const midpoint = scale(add(atoms[interaction.start.index()].coordinates, atoms[interaction.end.index()].coordinates), 0.5);
+            const current = atoms[residue.atom.index()].coordinates;
+            atoms[residue.atom.index()].coordinates = add(current, scale(subtract(midpoint, current), 0.1));
+        }
+    }
+}
+
+fn interactionTraversalOrder(
+    allocator: std.mem.Allocator,
+    residues: []const model.Residue,
+    interactions: []const model.ResidueInteraction,
+) core.errors.Error![]core.ids.ResidueId {
+    const seeds = allocator.alloc(core.ids.ResidueId, residues.len) catch return error.OutOfMemory;
+    defer allocator.free(seeds);
+    for (seeds, 0..) |*seed, index| seed.* = core.ids.ResidueId.fromIndex(@intCast(index));
+    std.mem.sortUnstable(core.ids.ResidueId, seeds, InteractionOrderContext{ .residues = residues, .interactions = interactions }, interactionOrderLessThan);
+    const output = allocator.alloc(core.ids.ResidueId, residues.len) catch return error.OutOfMemory;
+    errdefer allocator.free(output);
+    const visited = allocator.alloc(bool, residues.len) catch return error.OutOfMemory;
+    defer allocator.free(visited);
+    @memset(visited, false);
+    const queue = allocator.alloc(core.ids.ResidueId, residues.len) catch return error.OutOfMemory;
+    defer allocator.free(queue);
+    var output_count: usize = 0;
+    for (seeds) |seed| {
+        if (visited[seed.index()]) continue;
+        var head: usize = 0;
+        var tail: usize = 1;
+        queue[0] = seed;
+        visited[seed.index()] = true;
+        while (head < tail) : (head += 1) {
+            const current = queue[head];
+            output[output_count] = current;
+            output_count += 1;
+            const atom = residues[current.index()].atom;
+            for (interactions) |interaction| {
+                const partner = if (interaction.start == atom)
+                    interaction.end
+                else if (interaction.end == atom)
+                    interaction.start
+                else
+                    continue;
+                const partner_id = residueForAtom(residues, partner) orelse return error.InvalidMapping;
+                if (visited[partner_id.index()]) continue;
+                visited[partner_id.index()] = true;
+                queue[tail] = partner_id;
+                tail += 1;
+            }
+        }
+    }
+    return output;
+}
+
+const InteractionOrderContext = struct {
+    residues: []const model.Residue,
+    interactions: []const model.ResidueInteraction,
+};
+
+fn interactionOrderLessThan(context: InteractionOrderContext, first: core.ids.ResidueId, second: core.ids.ResidueId) bool {
+    const first_count = residueInteractionCount(context.residues[first.index()].atom, context.interactions);
+    const second_count = residueInteractionCount(context.residues[second.index()].atom, context.interactions);
+    return if (first_count != second_count) first_count > second_count else first.index() < second.index();
+}
+
+fn residueInteractionCount(atom: core.ids.AtomId, interactions: []const model.ResidueInteraction) usize {
+    var count: usize = 0;
+    for (interactions) |interaction| count += @intFromBool(interaction.start == atom or interaction.end == atom);
+    return count;
+}
+
+fn residueForAtom(residues: []const model.Residue, atom: core.ids.AtomId) ?core.ids.ResidueId {
+    for (residues) |residue| if (residue.atom == atom) return residue.id;
+    return null;
+}
+
+fn exploreResidueGrid(
+    center: core.math.Vec2,
+    direction: core.math.Vec2,
+    residue_atom: core.ids.AtomId,
+    atoms: []const model.Atom,
+    residues: []const model.Residue,
+    interactions: []const model.ResidueInteraction,
+    placed: []const bool,
+) core.errors.Error!core.math.Vec2 {
+    var selected = center;
+    const direction_normal = normalize(.{ .x = -direction.y, .y = direction.x });
+    for (0..10) |level| {
+        const extent = @as(f32, @floatFromInt(level + 1)) * 5;
+        var candidates: [81]core.math.Vec2 = undefined;
+        var count: usize = 0;
+        appendCandidate(&candidates, &count, .{});
+        appendCandidate(&candidates, &count, .{ .x = extent });
+        appendCandidate(&candidates, &count, .{ .x = -extent });
+        appendCandidate(&candidates, &count, .{ .y = -extent });
+        appendCandidate(&candidates, &count, .{ .y = extent });
+        for (0..level) |offset_index| {
+            const offset = @as(f32, @floatFromInt(offset_index + 1)) * 5;
+            appendCandidate(&candidates, &count, .{ .x = extent, .y = offset });
+            appendCandidate(&candidates, &count, .{ .x = extent, .y = -offset });
+            appendCandidate(&candidates, &count, .{ .x = -extent, .y = offset });
+            appendCandidate(&candidates, &count, .{ .x = -extent, .y = -offset });
+            appendCandidate(&candidates, &count, .{ .x = offset, .y = -extent });
+            appendCandidate(&candidates, &count, .{ .x = -offset, .y = -extent });
+            appendCandidate(&candidates, &count, .{ .x = offset, .y = extent });
+            appendCandidate(&candidates, &count, .{ .x = -offset, .y = extent });
+        }
+        appendCandidate(&candidates, &count, .{ .x = extent, .y = extent });
+        appendCandidate(&candidates, &count, .{ .x = extent, .y = -extent });
+        appendCandidate(&candidates, &count, .{ .x = -extent, .y = extent });
+        appendCandidate(&candidates, &count, .{ .x = -extent, .y = -extent });
+        for (candidates[0..count]) |candidate| {
+            selected = add(center, add(scale(direction, candidate.y), scale(direction_normal, candidate.x)));
+            if (try residuePositionClear(selected, residue_atom, atoms, residues, interactions, placed)) return selected;
+        }
+    }
+    return selected;
+}
+
+fn appendCandidate(storage: []core.math.Vec2, count: *usize, value: core.math.Vec2) void {
+    storage[count.*] = value;
+    count.* += 1;
+}
+
+fn residuePositionClear(
+    position: core.math.Vec2,
+    residue_atom: core.ids.AtomId,
+    atoms: []const model.Atom,
+    residues: []const model.Residue,
+    interactions: []const model.ResidueInteraction,
+    placed: []const bool,
+) core.errors.Error!bool {
+    for (residues) |residue| {
+        if (residue.atom.index() >= atoms.len or residue.atom.index() >= placed.len) return error.InvalidMapping;
+        if (!placed[residue.atom.index()]) continue;
+        const other = atoms[residue.atom.index()].coordinates;
+        if (@abs(other.x - position.x) < core.math.bond_length * 1.3 and
+            @abs(other.y - position.y) < core.math.bond_length * 1.3) return false;
+    }
+    for (interactions) |existing| {
+        if (existing.start.index() >= atoms.len or existing.end.index() >= atoms.len) return error.InvalidMapping;
+        if (!placed[existing.start.index()] or !placed[existing.end.index()] or
+            existing.start == residue_atom or existing.end == residue_atom) continue;
+        if (pointSegmentDistance(position, atoms[existing.start.index()].coordinates, atoms[existing.end.index()].coordinates).distance <
+            core.math.bond_length * 1.3) return false;
+        for (interactions) |current| {
+            if (current.start != residue_atom and current.end != residue_atom) continue;
+            const partner = if (current.start == residue_atom) current.end else current.start;
+            if (partner.index() >= atoms.len or !placed[partner.index()]) continue;
+            if (segmentsIntersect(position, atoms[partner.index()].coordinates, atoms[existing.start.index()].coordinates, atoms[existing.end.index()].coordinates)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+fn minimizeProteinInteractions(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    residues: []const model.Residue,
+    residue_interactions: []const model.ResidueInteraction,
+) core.errors.Error!void {
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+    for (residues) |residue| {
+        for (residue_interactions) |bond| {
+            if (bond.start == residue.atom or bond.end == residue.atom) continue;
+            if (bond.start.index() >= atoms.len or bond.end.index() >= atoms.len or residue.atom.index() >= atoms.len) return error.InvalidMapping;
+            if (interactions.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+            interactions.append(allocator, .{
+                .id = core.ids.InteractionId.fromIndex(@intCast(interactions.items.len)),
+                .payload = .{ .clash = .{
+                    .segment_start = bond.start,
+                    .point = residue.atom,
+                    .segment_end = bond.end,
+                    .rest_squared_distance = core.math.bond_length * core.math.bond_length,
+                } },
+            }) catch return error.OutOfMemory;
+        }
+    }
+    if (interactions.items.len != 0) _ = try optimize.minimizeMolecule(allocator, atoms, interactions.items, .{}, null);
+}
+
+fn add(first: core.math.Vec2, second: core.math.Vec2) core.math.Vec2 {
+    return .{ .x = first.x + second.x, .y = first.y + second.y };
+}
+
+fn subtract(first: core.math.Vec2, second: core.math.Vec2) core.math.Vec2 {
+    return .{ .x = first.x - second.x, .y = first.y - second.y };
+}
+
+fn scale(value: core.math.Vec2, factor: f32) core.math.Vec2 {
+    return .{ .x = value.x * factor, .y = value.y * factor };
+}
+
+fn normalize(value: core.math.Vec2) core.math.Vec2 {
+    const length = @sqrt(value.x * value.x + value.y * value.y);
+    return if (length == 0) .{} else scale(value, 1 / length);
+}
+
+fn segmentsIntersect(a: core.math.Vec2, b: core.math.Vec2, c: core.math.Vec2, d: core.math.Vec2) bool {
+    const ab_c = cross(subtract(b, a), subtract(c, a));
+    const ab_d = cross(subtract(b, a), subtract(d, a));
+    const cd_a = cross(subtract(d, c), subtract(a, c));
+    const cd_b = cross(subtract(d, c), subtract(b, c));
+    return ab_c * ab_d < 0 and cd_a * cd_b < 0;
+}
+
+fn cross(first: core.math.Vec2, second: core.math.Vec2) f32 {
+    return first.x * second.y - first.y * second.x;
+}
+
 /// Place all residue representative atoms in successive crowns around an
 /// already-laid-out ligand. Protein-only inputs use a separate chain-grid
 /// phase and are rejected here.

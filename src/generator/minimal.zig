@@ -106,14 +106,24 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         return error.Unsupported;
     }
     if (prepared.working.residues.len != 0) {
-        try residues.placeAroundLigand(
-            allocator,
-            prepared.working.atoms,
-            prepared.working.bonds,
-            prepared.working.residues,
-            prepared.working.string_bytes,
-            prepared.working.residue_interactions,
-        );
+        if (prepared.working.residues.len == prepared.working.atoms.len) {
+            try residues.placeProteinOnly(
+                allocator,
+                prepared.working.atoms,
+                prepared.working.residues,
+                prepared.working.string_bytes,
+                prepared.working.residue_interactions,
+            );
+        } else {
+            try residues.placeAroundLigand(
+                allocator,
+                prepared.working.atoms,
+                prepared.working.bonds,
+                prepared.working.residues,
+                prepared.working.string_bytes,
+                prepared.working.residue_interactions,
+            );
+        }
     }
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
