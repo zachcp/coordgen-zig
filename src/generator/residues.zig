@@ -2,6 +2,9 @@ const std = @import("std");
 const core = @import("core");
 const model = @import("model");
 const optimize = @import("optimize");
+const topology = @import("topology");
+const layout = @import("layout");
+const components = @import("components.zig");
 
 const crown_grid_interval: f32 = 20;
 const first_crown_distance: f32 = 60;
@@ -112,7 +115,7 @@ pub fn placeProteinOnly(
     const chain_count = try assignChainIndices(allocator, residues, chain_bytes, chain_indices);
     const chain_centers = allocator.alloc(core.math.Vec2, chain_count) catch return error.OutOfMemory;
     defer allocator.free(chain_centers);
-    initializeChainCenters(chain_centers);
+    try initializeChainCenters(allocator, chain_centers, residues, chain_indices, interactions);
 
     for (residues, chain_indices) |residue, chain_index| {
         if (residue.atom.index() >= atoms.len) return error.InvalidMapping;
@@ -197,9 +200,66 @@ fn residueLessThanRaw(context: ResidueOrderContext, first: u32, second: u32) boo
     return residueLessThan(context, core.ids.ResidueId.fromIndex(first), core.ids.ResidueId.fromIndex(second));
 }
 
-fn initializeChainCenters(centers: []core.math.Vec2) void {
-    for (centers, 0..) |*center, index| {
-        center.* = .{ .x = @as(f32, @floatFromInt(index)) * core.math.bond_length * 10 };
+fn initializeChainCenters(
+    allocator: std.mem.Allocator,
+    centers: []core.math.Vec2,
+    residues: []const model.Residue,
+    chain_indices: []const u32,
+    residue_interactions: []const model.ResidueInteraction,
+) core.errors.Error!void {
+    if (centers.len == 0 or chain_indices.len != residues.len) return error.InvalidMapping;
+    const meta_atoms = allocator.alloc(model.Atom, centers.len) catch return error.OutOfMemory;
+    defer allocator.free(meta_atoms);
+    for (meta_atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    var meta_bonds: std.ArrayList(model.Bond) = .empty;
+    defer meta_bonds.deinit(allocator);
+    for (residue_interactions) |interaction| {
+        const first_residue = residueForAtom(residues, interaction.start) orelse return error.InvalidMapping;
+        const second_residue = residueForAtom(residues, interaction.end) orelse return error.InvalidMapping;
+        var first = chain_indices[first_residue.index()];
+        var second = chain_indices[second_residue.index()];
+        if (first == second) continue;
+        if (first > second) std.mem.swap(u32, &first, &second);
+        var found = false;
+        for (meta_bonds.items) |bond| {
+            if (bond.start.index() == first and bond.end.index() == second) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        if (meta_bonds.items.len >= std.math.maxInt(u32)) return error.TooManyItems;
+        const index: u32 = @intCast(meta_bonds.items.len);
+        meta_bonds.append(allocator, .{
+            .id = core.ids.BondId.fromIndex(index),
+            .input_index = index,
+            .start = core.ids.AtomId.fromIndex(first),
+            .end = core.ids.AtomId.fromIndex(second),
+            .input_order = .single,
+            .effective_order = .single,
+        }) catch return error.OutOfMemory;
+    }
+
+    var graph = try topology.Graph.init(allocator, meta_atoms, meta_bonds.items);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(allocator, graph, meta_bonds.items);
+    defer rings.deinit();
+    var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, meta_bonds.items, graph, rings);
+    defer fragmentation.deinit();
+    try layout.initializeCoordinates(allocator, meta_atoms, meta_bonds.items, graph, rings, fragmentation);
+    var interactions = try optimize.buildBaseInteractions(allocator, meta_atoms, meta_bonds.items, .{});
+    defer interactions.deinit();
+    if (interactions.items.len != 0) {
+        _ = try optimize.minimizeMolecule(allocator, meta_atoms, interactions.items, .{}, null);
+    }
+    try components.orientAcyclicComponents(allocator, meta_atoms, meta_bonds.items, graph, rings);
+    try components.arrangeComponents(allocator, meta_atoms, graph);
+    for (centers, meta_atoms) |*center, atom| {
+        center.* = scale(atom.coordinates, 10);
     }
 }
 
@@ -1110,4 +1170,21 @@ test "residue-only minimization separates close representatives" {
     };
     try minimizeResidueClashes(std.testing.allocator, &atoms, &residue_input);
     try std.testing.expect(distance(atoms[0].coordinates, atoms[1].coordinates) > 20);
+}
+
+test "protein chain meta-molecule preserves scaled interaction bonds" {
+    const residue_input = [_]model.Residue{
+        .{ .id = core.ids.ResidueId.fromIndex(0), .atom = core.ids.AtomId.fromIndex(0), .chain_start = 0, .chain_len = 1, .residue_number = 1 },
+        .{ .id = core.ids.ResidueId.fromIndex(1), .atom = core.ids.AtomId.fromIndex(1), .chain_start = 1, .chain_len = 1, .residue_number = 1 },
+        .{ .id = core.ids.ResidueId.fromIndex(2), .atom = core.ids.AtomId.fromIndex(2), .chain_start = 2, .chain_len = 1, .residue_number = 1 },
+    };
+    const chain_indices = [_]u32{ 0, 1, 2 };
+    const interactions = [_]model.ResidueInteraction{
+        .{ .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(1) },
+        .{ .start = core.ids.AtomId.fromIndex(1), .end = core.ids.AtomId.fromIndex(2) },
+    };
+    var centers: [3]core.math.Vec2 = undefined;
+    try initializeChainCenters(std.testing.allocator, &centers, &residue_input, &chain_indices, &interactions);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), distance(centers[0], centers[1]), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), distance(centers[1], centers[2]), 0.01);
 }
