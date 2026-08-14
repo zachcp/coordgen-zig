@@ -252,6 +252,81 @@ test "minimal native generation composes ligand proximity and residue placement"
     try std.testing.expect(!std.meta.eql(first.coordinates[1], first.coordinates[3]));
 }
 
+test "residue generation is invariant under reversed caller order" {
+    const atoms = [_]api.AtomInput{
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .oxygen },
+        .{ .atomic_number = .nitrogen },
+        .{ .atomic_number = .sulfur },
+    };
+    const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const residues = [_]api.ResidueInput{.{ .atom = 3, .chain = "A", .residue_number = 9, .closest_ligand_atom = 1 }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    var forward = try generate(std.testing.allocator, .{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    });
+    defer forward.deinit();
+
+    const reversed_atoms = [_]api.AtomInput{ atoms[3], atoms[2], atoms[1], atoms[0] };
+    const reversed_bonds = [_]api.BondInput{ .{ .start = 3, .end = 2 }, .{ .start = 2, .end = 1 } };
+    const reversed_residues = [_]api.ResidueInput{.{ .atom = 0, .chain = "A", .residue_number = 9, .closest_ligand_atom = 2 }};
+    const reversed_interactions = [_]api.ResidueInteractionInput{.{ .start = 0, .end = 2 }};
+    var reversed = try generate(std.testing.allocator, .{
+        .atoms = &reversed_atoms,
+        .bonds = &reversed_bonds,
+        .residues = &reversed_residues,
+        .residue_interactions = &reversed_interactions,
+    });
+    defer reversed.deinit();
+    for (forward.coordinates, 0..) |coordinate, index| {
+        try std.testing.expectEqual(coordinate, reversed.coordinates[forward.coordinates.len - 1 - index]);
+    }
+    try std.testing.expectEqual(forward.clean_pose, reversed.clean_pose);
+}
+
+const ThreadGenerationContext = struct {
+    input: api.Input,
+    output: [4]api.Vec2 = undefined,
+    clean_pose: bool = false,
+    failure: ?anyerror = null,
+};
+
+fn generateInThread(context: *ThreadGenerationContext) void {
+    var result = generate(std.heap.page_allocator, context.input) catch |err| {
+        context.failure = err;
+        return;
+    };
+    defer result.deinit();
+    @memcpy(&context.output, result.coordinates);
+    context.clean_pose = result.clean_pose;
+}
+
+test "residue generation has independent simultaneous contexts" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const residues = [_]api.ResidueInput{.{ .atom = 3, .chain = "A", .residue_number = 2, .closest_ligand_atom = 1 }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = ThreadGenerationContext{ .input = input };
+    var second = ThreadGenerationContext{ .input = input };
+    const first_thread = try std.Thread.spawn(.{}, generateInThread, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, generateInThread, .{&second});
+    first_thread.join();
+    second_thread.join();
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+    try std.testing.expectEqual(first.output, second.output);
+    try std.testing.expectEqual(first.clean_pose, second.clean_pose);
+}
+
 test "minimal native generation reaches macrocycle lattice and forced-open fallback" {
     const ring_size = 13;
     var atoms: [ring_size]api.AtomInput = undefined;
