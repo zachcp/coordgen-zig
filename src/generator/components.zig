@@ -17,17 +17,47 @@ pub fn collectProximityRelations(
     allocator: std.mem.Allocator,
     working: model.WorkingGraph,
 ) core.errors.Error![]ProximityRelation {
-    const output = allocator.alloc(ProximityRelation, working.proximity_relations.len) catch return error.OutOfMemory;
-    errdefer allocator.free(output);
-    for (working.proximity_relations, output) |relation, *destination| {
-        destination.* = try proximityEndpoints(
+    var count: usize = 0;
+    for (working.proximity_relations) |relation| {
+        const endpoints = try proximityEndpoints(
             working.bonds,
             working.extra_bonds,
             working.residue_interactions,
             relation,
         );
+        count += @intFromBool(!isResidueRelation(working.residues, relation, endpoints));
+    }
+    const output = allocator.alloc(ProximityRelation, count) catch return error.OutOfMemory;
+    errdefer allocator.free(output);
+    var output_index: usize = 0;
+    for (working.proximity_relations) |relation| {
+        const endpoints = try proximityEndpoints(
+            working.bonds,
+            working.extra_bonds,
+            working.residue_interactions,
+            relation,
+        );
+        if (isResidueRelation(working.residues, relation, endpoints)) continue;
+        output[output_index] = endpoints;
+        output_index += 1;
     }
     return output;
+}
+
+/// Upstream keeps residue interactions out of molecule-proximity placement
+/// whenever either endpoint is a residue; the dedicated residue phase owns
+/// them. Ordinary zero-order bonds remain proximity relations even if callers
+/// also attach residue metadata to an endpoint.
+fn isResidueRelation(
+    residues: []const model.Residue,
+    relation: model.ProximityRelation,
+    endpoints: ProximityRelation,
+) bool {
+    if (relation != .residue_interaction) return false;
+    for (residues) |residue| {
+        if (residue.atom == endpoints.start or residue.atom == endpoints.end) return true;
+    }
+    return false;
 }
 
 fn proximityEndpoints(
@@ -401,6 +431,73 @@ pub fn arrangeProximityComponents(
     return true;
 }
 
+/// Run proximity placement on a compact copy of non-residue atoms, preserving
+/// full-graph coordinates and IDs outside that active subsystem.
+pub fn arrangeProximityComponentsExcluding(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    relations: []const ProximityRelation,
+    excluded_atoms: []const bool,
+) core.errors.Error!bool {
+    if (excluded_atoms.len != atoms.len) return error.InvalidMapping;
+    const old_to_new = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(old_to_new);
+    @memset(old_to_new, std.math.maxInt(u32));
+    var active_count: usize = 0;
+    for (excluded_atoms) |excluded| active_count += @intFromBool(!excluded);
+    if (active_count == 0) return false;
+    const active_atoms = allocator.alloc(model.Atom, active_count) catch return error.OutOfMemory;
+    defer allocator.free(active_atoms);
+    const new_to_old = allocator.alloc(u32, active_count) catch return error.OutOfMemory;
+    defer allocator.free(new_to_old);
+    var active_index: usize = 0;
+    for (atoms, excluded_atoms, 0..) |atom, excluded, old_index| {
+        if (excluded) continue;
+        if (active_index >= std.math.maxInt(u32)) return error.TooManyItems;
+        old_to_new[old_index] = @intCast(active_index);
+        new_to_old[active_index] = @intCast(old_index);
+        active_atoms[active_index] = atom;
+        active_atoms[active_index].id = core.ids.AtomId.fromIndex(@intCast(active_index));
+        active_index += 1;
+    }
+
+    var active_bond_count: usize = 0;
+    for (bonds) |bond| {
+        if (bond.start.index() >= atoms.len or bond.end.index() >= atoms.len) return error.InvalidMapping;
+        active_bond_count += @intFromBool(!excluded_atoms[bond.start.index()] and !excluded_atoms[bond.end.index()]);
+    }
+    const active_bonds = allocator.alloc(model.Bond, active_bond_count) catch return error.OutOfMemory;
+    defer allocator.free(active_bonds);
+    var bond_index: usize = 0;
+    for (bonds) |bond| {
+        if (excluded_atoms[bond.start.index()] or excluded_atoms[bond.end.index()]) continue;
+        active_bonds[bond_index] = bond;
+        active_bonds[bond_index].id = core.ids.BondId.fromIndex(@intCast(bond_index));
+        active_bonds[bond_index].start = core.ids.AtomId.fromIndex(old_to_new[bond.start.index()]);
+        active_bonds[bond_index].end = core.ids.AtomId.fromIndex(old_to_new[bond.end.index()]);
+        bond_index += 1;
+    }
+    const active_relations = allocator.alloc(ProximityRelation, relations.len) catch return error.OutOfMemory;
+    defer allocator.free(active_relations);
+    for (relations, active_relations) |relation, *active| {
+        if (relation.start.index() >= atoms.len or relation.end.index() >= atoms.len or
+            excluded_atoms[relation.start.index()] or excluded_atoms[relation.end.index()]) return error.InvalidMapping;
+        active.* = .{
+            .start = core.ids.AtomId.fromIndex(old_to_new[relation.start.index()]),
+            .end = core.ids.AtomId.fromIndex(old_to_new[relation.end.index()]),
+        };
+    }
+
+    var graph = try topology.Graph.init(allocator, active_atoms, active_bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(allocator, graph, active_bonds);
+    defer rings.deinit();
+    if (!try arrangeProximityComponents(allocator, active_atoms, graph, rings, active_relations)) return false;
+    for (active_atoms, new_to_old) |atom, old_index| atoms[old_index].coordinates = atom.coordinates;
+    return true;
+}
+
 /// General meta-graph placement. Upstream recursively lays out one carbon-like
 /// meta atom per component, aligns each real component's incident sites to its
 /// meta neighbors, then expands that template until 25-unit clashes clear.
@@ -711,7 +808,35 @@ pub fn arrangeComponents(
     atoms: []model.Atom,
     graph: topology.Graph,
 ) core.errors.Error!void {
-    if (graph.component_count < 2) return;
+    return arrangeComponentsExcluding(allocator, atoms, graph, &.{});
+}
+
+/// Arrange ordinary components while leaving residue-only components for the
+/// dedicated crown/protein placement phase. A mixed excluded/non-excluded
+/// component violates the residue representative ownership contract.
+pub fn arrangeComponentsExcluding(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    excluded_atoms: []const bool,
+) core.errors.Error!void {
+    if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
+    var excluded_components: []bool = &.{};
+    defer if (excluded_components.len != 0) allocator.free(excluded_components);
+    var active_count: usize = graph.component_count;
+    if (excluded_atoms.len != 0) {
+        excluded_components = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
+        active_count = 0;
+        for (excluded_components, 0..) |*excluded, raw_component| {
+            const members = graph.componentMembers(core.ids.MoleculeId.fromIndex(@intCast(raw_component)));
+            var excluded_count: usize = 0;
+            for (members) |atom| excluded_count += @intFromBool(excluded_atoms[atom.index()]);
+            if (excluded_count != 0 and excluded_count != members.len) return error.InvalidMapping;
+            excluded.* = excluded_count == members.len;
+            active_count += @intFromBool(!excluded.*);
+        }
+    }
+    if (active_count < 2) return;
     const placed = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
     defer allocator.free(placed);
     @memset(placed, false);
@@ -719,9 +844,13 @@ pub fn arrangeComponents(
     defer allocator.free(charged_atom_used);
     @memset(charged_atom_used, false);
 
-    var central_index: u32 = 0;
-    var central_size = graph.componentMembers(core.ids.MoleculeId.fromIndex(0)).len;
-    for (1..graph.component_count) |raw_index| {
+    var central_index: u32 = if (excluded_components.len == 0)
+        0
+    else
+        @intCast(std.mem.indexOfScalar(bool, excluded_components, false).?);
+    var central_size = graph.componentMembers(core.ids.MoleculeId.fromIndex(central_index)).len;
+    for (0..graph.component_count) |raw_index| {
+        if (excluded_components.len != 0 and excluded_components[raw_index]) continue;
         const index: u32 = @intCast(raw_index);
         const size = graph.componentMembers(core.ids.MoleculeId.fromIndex(index)).len;
         if (size > central_size) {
@@ -734,7 +863,7 @@ pub fn arrangeComponents(
 
     for (0..graph.component_count) |raw_index| {
         const index: u32 = @intCast(raw_index);
-        if (placed[index]) continue;
+        if ((excluded_components.len != 0 and excluded_components[index]) or placed[index]) continue;
         const component = core.ids.MoleculeId.fromIndex(index);
         const members = graph.componentMembers(component);
         var charge: i64 = 0;
@@ -759,7 +888,7 @@ pub fn arrangeComponents(
 
     for (0..graph.component_count) |raw_index| {
         const index: u32 = @intCast(raw_index);
-        if (placed[index]) continue;
+        if ((excluded_components.len != 0 and excluded_components[index]) or placed[index]) continue;
         const component = core.ids.MoleculeId.fromIndex(index);
         const members = graph.componentMembers(component);
         var charge: i64 = 0;
@@ -973,6 +1102,23 @@ test "proximity center uses relation count then size with first-wins ties" {
     try std.testing.expectEqual(core.ids.MoleculeId.fromIndex(1), try selectProximityCenter(graph, &more_relations));
 }
 
+test "residue interactions are reserved for residue placement" {
+    const residues = [_]model.Residue{.{
+        .id = core.ids.ResidueId.fromIndex(0),
+        .atom = core.ids.AtomId.fromIndex(2),
+        .chain_start = 0,
+        .chain_len = 1,
+        .residue_number = 7,
+    }};
+    const endpoints = ProximityRelation{
+        .start = core.ids.AtomId.fromIndex(1),
+        .end = core.ids.AtomId.fromIndex(2),
+    };
+    try std.testing.expect(isResidueRelation(&residues, .{ .residue_interaction = 0 }, endpoints));
+    try std.testing.expect(!isResidueRelation(&residues, .{ .bond = core.ids.BondId.fromIndex(0) }, endpoints));
+    try std.testing.expect(!isResidueRelation(&.{}, .{ .residue_interaction = 0 }, endpoints));
+}
+
 test "isolated acyclic bond rotates to the upstream horizontal preference" {
     var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 0) };
     atoms[1].coordinates = .{ .y = 50 };
@@ -1068,6 +1214,18 @@ fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: t
     try arrangeComponents(allocator, atoms, graph);
 }
 
+fn arrangeProximityExcludingAndDiscard(
+    allocator: std.mem.Allocator,
+    source_atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    relations: []const ProximityRelation,
+    excluded: []const bool,
+) !void {
+    const atoms = try allocator.dupe(model.Atom, source_atoms);
+    defer allocator.free(atoms);
+    if (!try arrangeProximityComponentsExcluding(allocator, atoms, bonds, relations, excluded)) return error.InvalidMapping;
+}
+
 test "neutral component placement cleans every allocation failure" {
     var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0) };
     const bonds = [_]model.Bond{.{
@@ -1081,4 +1239,59 @@ test "neutral component placement cleans every allocation failure" {
     var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
     defer graph.deinit();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeAndDiscard, .{ &atoms, graph });
+}
+
+test "component arrangement ignores residue-only components" {
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 17) };
+    atoms[3].coordinates.y = 23;
+    const bonds = [_]model.Bond{.{
+        .id = core.ids.BondId.fromIndex(0),
+        .input_index = 0,
+        .start = core.ids.AtomId.fromIndex(0),
+        .end = core.ids.AtomId.fromIndex(1),
+        .input_order = .single,
+        .effective_order = .single,
+    }};
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const excluded = [_]bool{ false, false, false, true };
+    try arrangeComponentsExcluding(std.testing.allocator, &atoms, graph, &excluded);
+    try std.testing.expect(atoms[2].coordinates.x != 0 or atoms[2].coordinates.y != 0);
+    try std.testing.expectEqual(Vec2{ .x = 17, .y = 23 }, atoms[3].coordinates);
+
+    const mixed = [_]bool{ true, false, false, false };
+    try std.testing.expectError(error.InvalidMapping, arrangeComponentsExcluding(std.testing.allocator, &atoms, graph, &mixed));
+}
+
+test "proximity arrangement compacts excluded residue components and cleans allocation failures" {
+    const source_atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 19) };
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(1),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = core.ids.AtomId.fromIndex(1),
+            .end = core.ids.AtomId.fromIndex(2),
+            .input_order = .zero,
+            .effective_order = .zero,
+        },
+    };
+    const relations = [_]ProximityRelation{.{
+        .start = core.ids.AtomId.fromIndex(1),
+        .end = core.ids.AtomId.fromIndex(2),
+    }};
+    const excluded = [_]bool{ false, false, false, true };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeProximityExcludingAndDiscard, .{
+        &source_atoms,
+        &bonds,
+        &relations,
+        &excluded,
+    });
 }

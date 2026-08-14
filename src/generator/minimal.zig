@@ -6,9 +6,11 @@ const layout = @import("layout");
 const optimize = @import("optimize");
 
 pub const components = @import("components.zig");
+pub const residues = @import("residues.zig");
 
 test {
     _ = components;
+    _ = residues;
 }
 
 /// Restricted proof result. Coordinates and both maps are allocator-owned;
@@ -38,6 +40,17 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
     if (prepared.working.active_atom_count != input.atoms.len) {
         return error.Unsupported;
     }
+    var residue_atoms: []bool = &.{};
+    defer if (residue_atoms.len != 0) allocator.free(residue_atoms);
+    if (prepared.working.residues.len != 0) {
+        residue_atoms = allocator.alloc(bool, prepared.working.atoms.len) catch return error.OutOfMemory;
+        @memset(residue_atoms, false);
+        for (prepared.working.residues) |residue| {
+            if (residue.atom.index() >= residue_atoms.len or residue_atoms[residue.atom.index()] or
+                prepared.graph.degree(residue.atom) != 0) return error.InvalidMapping;
+            residue_atoms[residue.atom.index()] = true;
+        }
+    }
     const proximity_relations = try components.collectProximityRelations(allocator, prepared.working);
     defer allocator.free(proximity_relations);
 
@@ -66,6 +79,7 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.rings,
         fragmentation,
         input.options.precision,
+        residue_atoms,
     );
     try components.orientAcyclicComponents(
         allocator,
@@ -74,8 +88,18 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.graph,
         prepared.rings,
     );
-    if (proximity_relations.len == 0) {
+    if (proximity_relations.len == 0 and residue_atoms.len == 0) {
         try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
+    } else if (proximity_relations.len == 0) {
+        try components.arrangeComponentsExcluding(allocator, prepared.working.atoms, prepared.graph, residue_atoms);
+    } else if (prepared.working.residues.len != 0) {
+        if (!try components.arrangeProximityComponentsExcluding(
+            allocator,
+            prepared.working.atoms,
+            prepared.working.bonds,
+            proximity_relations,
+            residue_atoms,
+        )) return error.Unsupported;
     } else if (!try components.arrangeProximityComponents(
         allocator,
         prepared.working.atoms,
@@ -85,6 +109,34 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
     )) {
         return error.Unsupported;
     }
+    if (prepared.working.residues.len != 0) {
+        if (prepared.working.residues.len == prepared.working.atoms.len) {
+            try residues.placeProteinOnly(
+                allocator,
+                prepared.working.atoms,
+                prepared.working.residues,
+                prepared.working.string_bytes,
+                prepared.working.residue_interactions,
+            );
+        } else {
+            try residues.placeAroundLigand(
+                allocator,
+                prepared.working.atoms,
+                prepared.working.bonds,
+                prepared.working.residues,
+                prepared.working.string_bytes,
+                prepared.working.residue_interactions,
+            );
+        }
+    }
+    for (prepared.working.atoms) |atom| if (!atom.coordinates.isFinite()) return error.InvalidCoordinate;
+    try topology.stereo.writeAtomBondDisplays(
+        allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+    );
 
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(coordinates);
@@ -139,10 +191,11 @@ fn optimizeDiscrete(
     rings: topology.RingMembership,
     fragmentation: layout.Fragmentation,
     precision: f32,
+    excluded_atoms: []const bool,
 ) core.errors.Error!bool {
+    if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
     var dofs = try layout.macrocycle.collectAllDofs(allocator, bonds, graph, rings, fragmentation);
     defer dofs.deinit();
-    if (dofs.items.len == 0) return false;
 
     const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_has_dofs);
@@ -157,6 +210,26 @@ fn optimizeDiscrete(
         .atom_has_dofs = atom_has_dofs,
     });
     defer interactions.deinit();
+    var filtered_interactions: []core.interaction.Interaction = &.{};
+    defer if (filtered_interactions.len != 0) allocator.free(filtered_interactions);
+    var scoring_interactions = interactions.items;
+    var filtered_count: usize = 0;
+    if (excluded_atoms.len != 0) {
+        filtered_interactions = allocator.alloc(core.interaction.Interaction, interactions.items.len) catch return error.OutOfMemory;
+        for (interactions.items) |interaction| {
+            if (interactionTouchesExcluded(interaction, excluded_atoms)) continue;
+            filtered_interactions[filtered_count] = interaction;
+            filtered_count += 1;
+        }
+        scoring_interactions = filtered_interactions[0..filtered_count];
+    }
+    if (dofs.items.len == 0) {
+        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
+        defer allocator.free(coordinates);
+        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+        const clash_energy = try optimize.discrete.scoreClashInteractions(scoring_interactions, coordinates);
+        return clash_energy < optimize.discrete.clash_energy_threshold;
+    }
 
     const bond_views = allocator.alloc(optimize.discrete.BondScoreView, bonds.len) catch return error.OutOfMemory;
     defer allocator.free(bond_views);
@@ -193,7 +266,7 @@ fn optimizeDiscrete(
     const global = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(global);
     var score_context = DiscreteScoreContext{
-        .interactions = interactions.items,
+        .interactions = scoring_interactions,
         .bonds = bond_views,
         .rings = ring_views,
         .atom_fragments = fragmentation.atom_fragment,
@@ -223,8 +296,20 @@ fn optimizeDiscrete(
     return search.clean_pose;
 }
 
+fn interactionTouchesExcluded(interaction: core.interaction.Interaction, excluded_atoms: []const bool) bool {
+    if (excluded_atoms.len == 0) return false;
+    return switch (interaction.payload) {
+        .stretch => |value| excluded_atoms[value.atom_a.index()] or excluded_atoms[value.atom_b.index()],
+        .bend => |value| excluded_atoms[value.atom_a.index()] or excluded_atoms[value.center.index()] or excluded_atoms[value.atom_b.index()],
+        .clash => |value| excluded_atoms[value.segment_start.index()] or excluded_atoms[value.point.index()] or excluded_atoms[value.segment_end.index()],
+        .constraint => |value| excluded_atoms[value.atom.index()],
+        .ez_constraint => |value| excluded_atoms[value.side_a.index()] or excluded_atoms[value.double_a.index()] or
+            excluded_atoms[value.double_b.index()] or excluded_atoms[value.side_b.index()],
+    };
+}
+
 fn rejectOutOfScope(input: anytype) core.errors.Error!void {
-    if (input.residues.len != 0 or input.residue_interactions.len != 0 or input.extra_bonds.len != 0) return error.Unsupported;
+    if (input.extra_bonds.len != 0) return error.Unsupported;
     if (input.options.even_angles or input.options.constrain_all_atoms or input.options.build_from_fragments or
         input.options.debug_coordinates or input.options.template_directory != null) return error.Unsupported;
     for (input.atoms) |atom| {

@@ -16,6 +16,7 @@ test "minimal native ethane and propane are finite deterministic caller-order la
     var second = try generate(std.testing.allocator, input);
     defer second.deinit();
     try std.testing.expectEqualSlices(api.Vec2, first.coordinates, second.coordinates);
+    try std.testing.expect(first.clean_pose);
     for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
     for (bonds) |bond| {
         const delta_x = first.coordinates[bond.start].x - first.coordinates[bond.end].x;
@@ -72,6 +73,33 @@ fn expectUnsupported(input: api.Input) !void {
     try std.testing.expectError(error.Unsupported, generate(std.testing.allocator, input));
 }
 
+fn checkStableProteinAllocations(backing: std.mem.Allocator, input: api.Input) !void {
+    // ReleaseSafe observes one allocator-wrapper-specific warm-up allocation
+    // in this nested layout path. Measure the repeated stable phase, then fail
+    // each of its allocations in turn.
+    var warm = std.testing.FailingAllocator.init(backing, .{});
+    try generateAndDiscard(warm.allocator(), input);
+    try std.testing.expectEqual(warm.allocated_bytes, warm.freed_bytes);
+    var baseline = std.testing.FailingAllocator.init(backing, .{});
+    try generateAndDiscard(baseline.allocator(), input);
+    try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
+    var repeated = std.testing.FailingAllocator.init(backing, .{});
+    try generateAndDiscard(repeated.allocator(), input);
+    try std.testing.expectEqual(repeated.allocated_bytes, repeated.freed_bytes);
+    try std.testing.expectEqual(baseline.alloc_index, repeated.alloc_index);
+    const count = repeated.alloc_index;
+    for (0..count) |index| {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = index });
+        if (generateAndDiscard(failing.allocator(), input)) |_| {
+            if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
+            return error.NondeterministicMemoryUsage;
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            if (failing.allocated_bytes != failing.freed_bytes) return error.MemoryLeakDetected;
+        }
+    }
+}
+
 test "minimal native generation cleans every injected allocation failure" {
     const atoms = [_]api.AtomInput{ .{}, .{}, .{} };
     const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
@@ -121,11 +149,6 @@ test "minimal native generation explicitly rejects domains owned by later phases
     try expectUnsupported(.{
         .atoms = &atoms,
         .bonds = &path,
-        .residues = &.{.{ .atom = 0 }},
-    });
-    try expectUnsupported(.{
-        .atoms = &atoms,
-        .bonds = &path,
         .residue_interactions = &.{.{ .start = 0, .end = 2 }},
     });
     try expectUnsupported(.{
@@ -141,6 +164,167 @@ test "minimal native generation explicitly rejects domains owned by later phases
         api.Options{ .debug_coordinates = true },
         api.Options{ .template_directory = "fixtures" },
     }) |options| try expectUnsupported(.{ .atoms = &atoms, .bonds = &path, .options = options });
+}
+
+test "minimal native generation places residue representatives around a ligand" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const residues = [_]api.ResidueInput{.{
+        .atom = 3,
+        .chain = "A",
+        .residue_number = 7,
+        .closest_ligand_atom = 1,
+    }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = try generate(std.testing.allocator, input);
+    defer first.deinit();
+    var repeated = try generate(std.testing.allocator, input);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, repeated.coordinates);
+    const dx = first.coordinates[3].x - first.coordinates[1].x;
+    const dy = first.coordinates[3].y - first.coordinates[1].y;
+    try std.testing.expect(@sqrt(dx * dx + dy * dy) > 40);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+}
+
+test "minimal native generation places interacting protein-only chains" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const residues = [_]api.ResidueInput{
+        .{ .atom = 0, .chain = "A", .residue_number = 1 },
+        .{ .atom = 1, .chain = "A", .residue_number = 2 },
+        .{ .atom = 2, .chain = "B", .residue_number = 1 },
+        .{ .atom = 3, .chain = "B", .residue_number = 2 },
+    };
+    const interactions = [_]api.ResidueInteractionInput{
+        .{ .start = 0, .end = 2 },
+        .{ .start = 1, .end = 3 },
+    };
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &.{},
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = try generate(std.testing.allocator, input);
+    defer first.deinit();
+    var repeated = try generate(std.testing.allocator, input);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, repeated.coordinates);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.expect(!std.meta.eql(first.coordinates[0], first.coordinates[1]));
+    try std.testing.expect(!std.meta.eql(first.coordinates[0], first.coordinates[2]));
+    try checkStableProteinAllocations(std.testing.allocator, input);
+}
+
+test "minimal native generation composes ligand proximity and residue placement" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2, .order = .zero },
+    };
+    const residues = [_]api.ResidueInput{.{
+        .atom = 3,
+        .chain = "A",
+        .residue_number = 4,
+        .closest_ligand_atom = 1,
+    }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = try generate(std.testing.allocator, input);
+    defer first.deinit();
+    var repeated = try generate(std.testing.allocator, input);
+    defer repeated.deinit();
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, repeated.coordinates);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.expect(!std.meta.eql(first.coordinates[1], first.coordinates[2]));
+    try std.testing.expect(!std.meta.eql(first.coordinates[1], first.coordinates[3]));
+}
+
+test "residue generation is invariant under reversed caller order" {
+    const atoms = [_]api.AtomInput{
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .oxygen },
+        .{ .atomic_number = .nitrogen },
+        .{ .atomic_number = .sulfur },
+    };
+    const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const residues = [_]api.ResidueInput{.{ .atom = 3, .chain = "A", .residue_number = 9, .closest_ligand_atom = 1 }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    var forward = try generate(std.testing.allocator, .{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    });
+    defer forward.deinit();
+
+    const reversed_atoms = [_]api.AtomInput{ atoms[3], atoms[2], atoms[1], atoms[0] };
+    const reversed_bonds = [_]api.BondInput{ .{ .start = 3, .end = 2 }, .{ .start = 2, .end = 1 } };
+    const reversed_residues = [_]api.ResidueInput{.{ .atom = 0, .chain = "A", .residue_number = 9, .closest_ligand_atom = 2 }};
+    const reversed_interactions = [_]api.ResidueInteractionInput{.{ .start = 0, .end = 2 }};
+    var reversed = try generate(std.testing.allocator, .{
+        .atoms = &reversed_atoms,
+        .bonds = &reversed_bonds,
+        .residues = &reversed_residues,
+        .residue_interactions = &reversed_interactions,
+    });
+    defer reversed.deinit();
+    for (forward.coordinates, 0..) |coordinate, index| {
+        try std.testing.expectEqual(coordinate, reversed.coordinates[forward.coordinates.len - 1 - index]);
+    }
+    try std.testing.expectEqual(forward.clean_pose, reversed.clean_pose);
+}
+
+const ThreadGenerationContext = struct {
+    input: api.Input,
+    output: [4]api.Vec2 = undefined,
+    clean_pose: bool = false,
+    failure: ?anyerror = null,
+};
+
+fn generateInThread(context: *ThreadGenerationContext) void {
+    var result = generate(std.heap.page_allocator, context.input) catch |err| {
+        context.failure = err;
+        return;
+    };
+    defer result.deinit();
+    @memcpy(&context.output, result.coordinates);
+    context.clean_pose = result.clean_pose;
+}
+
+test "residue generation has independent simultaneous contexts" {
+    const atoms = [_]api.AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const residues = [_]api.ResidueInput{.{ .atom = 3, .chain = "A", .residue_number = 2, .closest_ligand_atom = 1 }};
+    const interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input = api.Input{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .residues = &residues,
+        .residue_interactions = &interactions,
+    };
+    var first = ThreadGenerationContext{ .input = input };
+    var second = ThreadGenerationContext{ .input = input };
+    const first_thread = try std.Thread.spawn(.{}, generateInThread, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, generateInThread, .{&second});
+    first_thread.join();
+    second_thread.join();
+    if (first.failure) |err| return err;
+    if (second.failure) |err| return err;
+    try std.testing.expectEqual(first.output, second.output);
+    try std.testing.expectEqual(first.clean_pose, second.clean_pose);
 }
 
 test "minimal native generation reaches macrocycle lattice and forced-open fallback" {
