@@ -676,6 +676,40 @@ fn shapeAndDiscard(
     allocator.free(shape);
 }
 
+fn checkShapeAllocationFailures(
+    backing: std.mem.Allocator,
+    atoms: []const core.math.Vec2,
+    bonds: []const LigandBond,
+    pockets: []const f32,
+) !void {
+    // macOS observes an allocator-wrapper-specific warm-up sequence in the
+    // marching-squares path. Find the repeated stable phase, then fail each
+    // allocation while retaining exact leak and swallowed-OOM checks.
+    var previous_count: ?usize = null;
+    var stable_count: ?usize = null;
+    for (0..8) |_| {
+        var warm = std.testing.FailingAllocator.init(backing, .{});
+        try shapeAndDiscard(warm.allocator(), atoms, bonds, pockets);
+        try std.testing.expectEqual(warm.allocated_bytes, warm.freed_bytes);
+        if (previous_count != null and previous_count.? == warm.alloc_index) {
+            stable_count = warm.alloc_index;
+            break;
+        }
+        previous_count = warm.alloc_index;
+    }
+    const allocation_count = stable_count orelse return error.NondeterministicMemoryUsage;
+    for (0..allocation_count) |index| {
+        var failing = std.testing.FailingAllocator.init(backing, .{ .fail_index = index });
+        if (shapeAndDiscard(failing.allocator(), atoms, bonds, pockets)) |_| {
+            if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
+            return error.NondeterministicMemoryUsage;
+        } else |err| {
+            if (err != error.OutOfMemory) return err;
+            if (failing.allocated_bytes != failing.freed_bytes) return error.MemoryLeakDetected;
+        }
+    }
+}
+
 /// Allocator-owned translation of upstream's `groupResiduesInSSEs` result.
 /// Groups and members retain chain-lexicographic/residue-number order.
 pub const SecondaryStructures = struct {
@@ -1055,7 +1089,7 @@ test "ligand crowns include bonds and clean allocation failures" {
     const shape = try shapeAroundLigand(std.testing.allocator, &atoms, &bonds, &pockets, 0);
     defer std.testing.allocator.free(shape);
     try std.testing.expect(shape.len > 8);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, shapeAndDiscard, .{ &atoms, &bonds, &pockets });
+    try checkShapeAllocationFailures(std.testing.allocator, &atoms, &bonds, &pockets);
     try std.testing.expectError(error.InvalidMapping, shapeAroundLigand(std.testing.allocator, &atoms, &.{.{ .start = 0, .end = 2 }}, &pockets, 0));
 }
 
