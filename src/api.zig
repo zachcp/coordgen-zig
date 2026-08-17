@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const generator = @import("generator");
 
 pub const InputIndex = core.ids.InputIndex;
 pub const invalid_input_index = core.ids.invalid_input_index;
@@ -251,6 +252,175 @@ pub const Result = struct {
         self.* = undefined;
     }
 };
+
+/// Generate 2D coordinates for `input`. The caller owns the returned value and
+/// must call `deinit` on it exactly once with the same allocator.
+///
+/// `input` is borrowed for the duration of the call and is never mutated:
+/// upstream's `initialize()` takes ownership of caller atoms and rewrites
+/// nonterminal metal bond orders in place, and this port surfaces that
+/// normalization as `Result.effective_bond_orders` instead (cgz-r11).
+///
+/// Coverage is deliberately partial and deliberately loud. An input whose
+/// domain no native phase owns yet returns `error.Unsupported` rather than a
+/// successful empty result; the exact rejected set is
+/// `generator.rejectOutOfScope`, and every rejection is a domain, never a
+/// size or a difficulty. Supported today: ordinary bonds, zero-order and
+/// residue-interaction proximity, rings and macrocycles, templates, residues,
+/// and the discrete pose search. Rejected today: extra bonds, hidden, fixed,
+/// constrained, template-positioned, or 3D-seeded atoms, caller-specified
+/// atom and bond stereo, skipped bonds, caller bond displays, and the
+/// `even_angles`, `constrain_all_atoms`, `build_from_fragments`,
+/// `debug_coordinates`, and `template_directory` options.
+///
+/// On any error the result is released before returning, so a failed call
+/// leaks nothing and leaves the caller nothing to free.
+pub fn generate(allocator: std.mem.Allocator, input: Input) core.errors.Error!Result {
+    try input.validate();
+    var result = Result.init(allocator, input.atoms.len, input.bonds.len) catch {
+        return error.OutOfMemory;
+    };
+    errdefer result.deinit();
+    result.clean_pose = try generator.generateInto(allocator, input, .{
+        .coordinates = result.coordinates,
+        .input_to_internal = result.input_to_internal,
+        .internal_to_input = result.internal_to_input,
+        .effective_bond_orders = result.effective_bond_orders,
+        .bond_displays = result.bond_displays,
+        .atom_stereo = result.atom_stereo,
+    });
+    return result;
+}
+
+test "public generation emits caller-ordered coordinates and every normalization output" {
+    const atoms = [_]AtomInput{
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .oxygen },
+        .{ .atomic_number = .nitrogen },
+    };
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = .single },
+        .{ .start = 1, .end = 2, .order = .double },
+    };
+    const atoms_before = atoms;
+    const bonds_before = bonds;
+    const input = Input{ .atoms = &atoms, .bonds = &bonds };
+
+    var result = try generate(std.testing.allocator, input);
+    defer result.deinit();
+
+    // Borrowed, never mutated: the upstream hazard cgz-r11 records.
+    try std.testing.expectEqualDeep(atoms_before, atoms);
+    try std.testing.expectEqualDeep(bonds_before, bonds);
+
+    try std.testing.expectEqual(atoms.len, result.coordinates.len);
+    try std.testing.expectEqual(bonds.len, result.effective_bond_orders.len);
+    try std.testing.expectEqual(bonds.len, result.bond_displays.len);
+    try std.testing.expectEqual(atoms.len, result.atom_stereo.len);
+
+    for (result.coordinates) |position| try std.testing.expect(position.isFinite());
+    for (bonds) |bond| {
+        const delta_x = result.coordinates[bond.start].x - result.coordinates[bond.end].x;
+        const delta_y = result.coordinates[bond.start].y - result.coordinates[bond.end].y;
+        try std.testing.expectApproxEqAbs(bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.001);
+    }
+    // A successful call that returned zeroed storage would pass every length
+    // assertion above; these are the facts that separate the two.
+    for (bonds, result.effective_bond_orders) |bond, effective| {
+        try std.testing.expectEqual(bond.order, effective);
+    }
+    for (result.bond_displays) |display| try std.testing.expectEqual(BondDisplay.none, display);
+    for (result.atom_stereo) |stereo| try std.testing.expectEqual(AtomStereo.unspecified, stereo);
+    for (result.internal_to_input, 0..) |input_index, internal_index| {
+        try std.testing.expectEqual(@as(u32, @intCast(internal_index)), result.input_to_internal[input_index]);
+    }
+}
+
+test "public generation surfaces the metal zero-order rewrite instead of mutating the caller" {
+    const atoms = [_]AtomInput{
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .iron },
+        .{ .atomic_number = .carbon },
+        .{ .atomic_number = .carbon },
+    };
+    // Only the two bonds at the iron have a nonterminal atom at both ends,
+    // which is the condition the rewrite applies to.
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = .single },
+        .{ .start = 1, .end = 2, .order = .single },
+        .{ .start = 2, .end = 3, .order = .single },
+        .{ .start = 3, .end = 4, .order = .single },
+    };
+    const expected = [_]BondOrder{ .single, .zero, .zero, .single };
+    const input = Input{ .atoms = &atoms, .bonds = &bonds };
+
+    var rewritten = try generate(std.testing.allocator, input);
+    defer rewritten.deinit();
+    try std.testing.expectEqualSlices(BondOrder, &expected, rewritten.effective_bond_orders);
+    for (bonds) |bond| try std.testing.expectEqual(BondOrder.single, bond.order);
+
+    var preserved = try generate(std.testing.allocator, .{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .options = .{ .treat_nonterminal_bonds_to_metal_as_zero_order = false },
+    });
+    defer preserved.deinit();
+    for (preserved.effective_bond_orders) |effective| {
+        try std.testing.expectEqual(BondOrder.single, effective);
+    }
+}
+
+test "public generation rejects an unowned domain instead of reporting empty success" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{} };
+    const bonds = [_]BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const extra = [_]BondInput{.{ .start = 0, .end = 2 }};
+    try std.testing.expectError(error.Unsupported, generate(std.testing.allocator, .{
+        .atoms = &atoms,
+        .bonds = &bonds,
+        .extra_bonds = &extra,
+    }));
+
+    const hidden = [_]AtomInput{ .{}, .{}, .{ .hidden = true } };
+    try std.testing.expectError(error.Unsupported, generate(std.testing.allocator, .{
+        .atoms = &hidden,
+        .bonds = &bonds,
+    }));
+
+    // Validation errors still precede domain rejection.
+    try std.testing.expectError(error.EmptyGraph, generate(std.testing.allocator, .{
+        .atoms = &.{},
+        .bonds = &.{},
+    }));
+}
+
+fn generateAndDiscard(allocator: std.mem.Allocator, input: Input) !void {
+    var result = try generate(allocator, input);
+    result.deinit();
+}
+
+test "public generation reports and cleans up every allocation failure" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{} };
+    const bonds = [_]BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
+    const input = Input{ .atoms = &atoms, .bonds = &bonds };
+    // checkAllAllocationFailures requires a deterministic allocation count and
+    // reports a first-call warm-up as nondeterminism. Discharge it here, and
+    // prove it is a warm-up rather than a leak by requiring the two following
+    // measured runs to agree exactly.
+    try generateAndDiscard(std.testing.allocator, input);
+    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try generateAndDiscard(baseline.allocator(), input);
+    var repeated = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try generateAndDiscard(repeated.allocator(), input);
+    try std.testing.expectEqual(baseline.alloc_index, repeated.alloc_index);
+    try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
+
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        generateAndDiscard,
+        .{input},
+    );
+}
 
 test "bond length and named precision values are conserved" {
     try std.testing.expectEqual(@as(f32, 50), bond_length);

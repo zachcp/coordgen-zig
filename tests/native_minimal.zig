@@ -103,10 +103,15 @@ fn checkStableProteinAllocations(backing: std.mem.Allocator, input: api.Input) !
 test "minimal native generation cleans every injected allocation failure" {
     const atoms = [_]api.AtomInput{ .{}, .{}, .{} };
     const bonds = [_]api.BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
-    try std.testing.checkAllAllocationFailures(
+    // Same coverage as checkAllAllocationFailures - every allocation index is
+    // failed in turn - with the ReleaseSafe warm-up allocation discharged
+    // first and stability proved rather than assumed. cgz-7v2.21 moved the
+    // result allocations ahead of the pipeline so both entry points share one
+    // implementation, which brought this path into the same wrapper warm-up
+    // the residue paths already document.
+    try checkStableProteinAllocations(
         std.testing.allocator,
-        generateAndDiscard,
-        .{api.Input{ .atoms = &atoms, .bonds = &bonds }},
+        .{ .atoms = &atoms, .bonds = &bonds },
     );
 }
 

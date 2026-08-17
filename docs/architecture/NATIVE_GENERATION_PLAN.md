@@ -21,11 +21,14 @@ Every module this plan decomposes is implemented and merged. `cgz-7v2.12`
 through `cgz-7v2.20` all landed in PRs #19 and #20 and are closed; `src/` is
 ~19,400 lines and CI is green on `main`.
 
-What has not happened is integration. A structurally valid call to
-`coordgen_generate` still returns `unsupported`
-(`src/c_abi/exports.zig`), `src/api.zig` exposes no public `generate`, and the
-only caller of the pipeline is `generator.minimal.generateValidated`. That
-wiring is `cgz-7v2.21`, and until it lands **no native output has ever been
+Integration landed with `cgz-7v2.21`: `api.generate` runs the full pipeline
+and `coordgen_generate` publishes owned spans for all six observables, so a
+supported input now returns coordinates through both the safe and the C entry
+point. Coverage is partial **by domain, never by size** — the rejected set is
+enumerated on `api.generate` and an unowned domain returns `Unsupported`
+rather than a successful empty result.
+
+What has still not happened is comparison. **No native output has yet been
 compared against the oracle** — the tolerance `T` in
 [`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md) is still a prior taken from the
 oracle's own float sensitivity, and the performance gate is still deliberately
@@ -219,10 +222,12 @@ the full upstream feature set:
 The minimal success fixture is a connected acyclic stereo-free molecule with
 no template, residue, proximity, macrocycle, constraint, clash, or minimization
 requirement. The internal result must contain deterministic caller-order
-coordinates at bond length 50. Public `generate` remains unsupported until the
-full integration bead can distinguish every supported domain and provide the
+coordinates at bond length 50. Public `generate` remained unsupported until the
+full integration bead could distinguish every supported domain and provide the
 complete ownership contract; unsupported domains must never return a silently
-empty successful result.
+empty successful result. `cgz-7v2.21` discharged that condition: both entry
+points reject by domain with `Unsupported`, and the C result publishes all six
+spans under one owner released by `coordgen_result_free`.
 
 ## Implementation beads and dependencies
 

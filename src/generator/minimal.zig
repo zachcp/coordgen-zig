@@ -30,10 +30,46 @@ pub const Result = struct {
     }
 };
 
+/// Caller-owned destinations for one generation. Every slice is indexed by
+/// caller input order; `coordinates`, `input_to_internal`, and `atom_stereo`
+/// are atom-indexed, the two bond slices are bond-indexed, and
+/// `internal_to_input` is the permutation itself. The three optional slices
+/// exist because `generateValidated` does not need them; the public API
+/// (cgz-7v2.21) does, and both go through one pipeline rather than two.
+pub const Outputs = struct {
+    coordinates: []core.math.Vec2,
+    input_to_internal: []u32,
+    internal_to_input: []core.ids.InputIndex,
+    effective_bond_orders: ?[]core.chemistry.BondOrder = null,
+    bond_displays: ?[]core.chemistry.BondDisplay = null,
+    atom_stereo: ?[]core.chemistry.AtomStereo = null,
+};
+
 /// Compose validated safe-API-shaped input through native preparation,
-/// fragmentation, and basic/macrocycle layout. This intentionally rejects
-/// every domain whose owning native phase is not integrated yet.
-pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.errors.Error!Result {
+/// fragmentation, and basic/macrocycle layout, writing every observable into
+/// caller-owned storage and returning the clean-pose verdict. This
+/// intentionally rejects every domain whose owning native phase is not
+/// integrated yet.
+///
+/// Output storage is borrowed, never retained: on any error the destinations
+/// hold unspecified values and the caller frees them, which is what lets the
+/// public entry point own its result allocation in one place.
+pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outputs) core.errors.Error!bool {
+    if (outputs.coordinates.len != input.atoms.len or
+        outputs.input_to_internal.len != input.atoms.len or
+        outputs.internal_to_input.len != input.atoms.len)
+    {
+        return error.InvalidMapping;
+    }
+    if (outputs.atom_stereo) |slice| {
+        if (slice.len != input.atoms.len) return error.InvalidMapping;
+    }
+    if (outputs.effective_bond_orders) |slice| {
+        if (slice.len != input.bonds.len) return error.InvalidMapping;
+    }
+    if (outputs.bond_displays) |slice| {
+        if (slice.len != input.bonds.len) return error.InvalidMapping;
+    }
     try rejectOutOfScope(input);
     var prepared = try topology.prepareInput(allocator, input);
     defer prepared.deinit();
@@ -138,15 +174,57 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.rings,
     );
 
+    if (prepared.working.order.input_to_internal.len != outputs.input_to_internal.len or
+        prepared.working.order.internal_to_input.len != outputs.internal_to_input.len)
+    {
+        return error.InvalidMapping;
+    }
+    @memcpy(outputs.input_to_internal, prepared.working.order.input_to_internal);
+    @memcpy(outputs.internal_to_input, prepared.working.order.internal_to_input);
+    for (prepared.working.atoms, prepared.working.order.internal_to_input) |atom, input_index| {
+        outputs.coordinates[input_index] = atom.coordinates;
+    }
+    if (outputs.atom_stereo) |slice| {
+        for (prepared.working.atoms) |atom| {
+            if (atom.input_index >= slice.len) return error.InvalidMapping;
+            slice[atom.input_index] = atom.stereo;
+        }
+    }
+    // Bonds are stored in structural-first internal order, so they are
+    // serialized through their own input index rather than the atom
+    // permutation. prepare() emits exactly one internal bond per input bond.
+    if (outputs.effective_bond_orders) |slice| {
+        if (prepared.working.bonds.len != slice.len) return error.InvalidMapping;
+        for (prepared.working.bonds) |bond| {
+            if (bond.input_index >= slice.len) return error.InvalidMapping;
+            slice[bond.input_index] = bond.effective_order;
+        }
+    }
+    if (outputs.bond_displays) |slice| {
+        if (prepared.working.bonds.len != slice.len) return error.InvalidMapping;
+        for (prepared.working.bonds) |bond| {
+            if (bond.input_index >= slice.len) return error.InvalidMapping;
+            slice[bond.input_index] = bond.display;
+        }
+    }
+    return clean_pose;
+}
+
+/// Restricted proof entry point: allocates and owns the three observables it
+/// reports. Retained for the native module tests that predate the public
+/// entry point; new callers should use the public `api.generate`.
+pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.errors.Error!Result {
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(coordinates);
-    const input_to_internal = allocator.dupe(u32, prepared.working.order.input_to_internal) catch return error.OutOfMemory;
+    const input_to_internal = allocator.alloc(u32, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(input_to_internal);
-    const internal_to_input = allocator.dupe(core.ids.InputIndex, prepared.working.order.internal_to_input) catch return error.OutOfMemory;
+    const internal_to_input = allocator.alloc(core.ids.InputIndex, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(internal_to_input);
-    for (prepared.working.atoms, prepared.working.order.internal_to_input) |atom, input_index| {
-        coordinates[input_index] = atom.coordinates;
-    }
+    const clean_pose = try generateInto(allocator, input, .{
+        .coordinates = coordinates,
+        .input_to_internal = input_to_internal,
+        .internal_to_input = internal_to_input,
+    });
     return .{
         .allocator = allocator,
         .coordinates = coordinates,

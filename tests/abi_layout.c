@@ -131,9 +131,10 @@ static int check_default_options(void) {
  * the documented error-code and ownership contracts end to end through the
  * real ABI boundary rather than by inspection.
  *
- * The discrete/continuous coordinate-generation pipeline is not wired yet
- * (see cgz-7v2.4), so the third case below - a structurally valid input -
- * deliberately expects COORDGEN_ERROR_UNSUPPORTED rather than coordinates.
+ * The third case below is a structurally valid, in-domain input: it must come
+ * back with owned coordinates at the public bond length, which is what
+ * separates a wired pipeline (cgz-7v2.21) from one that reports success and
+ * hands back zeroed storage.
  */
 static int check_generate_error_paths(void) {
     coordgen_result_t result;
@@ -178,8 +179,27 @@ static int check_generate_error_paths(void) {
     valid_input.atoms.len = 2;
     valid_input.bonds.ptr = &bond;
     valid_input.bonds.len = 1;
-    if (coordgen_generate(&valid_input, &result) != COORDGEN_ERROR_UNSUPPORTED) return 1;
+    if (coordgen_generate(&valid_input, &result) != COORDGEN_OK) return 1;
+    if (result.owner == NULL) return 1;
+    if (result.coordinates.ptr == NULL || result.coordinates.len != 2) return 1;
+    if (result.input_to_internal.len != 2 || result.internal_to_input.len != 2) return 1;
+    if (result.atom_stereo.len != 2) return 1;
+    if (result.effective_bond_orders.ptr == NULL || result.effective_bond_orders.len != 1) return 1;
+    if (result.bond_displays.len != 1) return 1;
+    if (result.effective_bond_orders.ptr[0] != COORDGEN_BOND_SINGLE) return 1;
+    if (result.bond_displays.ptr[0] != COORDGEN_BOND_DISPLAY_NONE) return 1;
+    {
+        /* Squared distance keeps this free of libm. A zeroed-but-successful
+         * result fails here, which is the point of asserting it at all. */
+        const float delta_x = result.coordinates.ptr[0].x - result.coordinates.ptr[1].x;
+        const float delta_y = result.coordinates.ptr[0].y - result.coordinates.ptr[1].y;
+        const float squared = delta_x * delta_x + delta_y * delta_y;
+        const float expected = COORDGEN_BOND_LENGTH * COORDGEN_BOND_LENGTH;
+        if (squared < expected - 5.0f || squared > expected + 5.0f) return 1;
+    }
     coordgen_result_free(&result);
+    /* Ownership released, and the freed value is the documented zero. */
+    if (result.owner != NULL || result.coordinates.ptr != NULL) return 1;
 
     return 0;
 }

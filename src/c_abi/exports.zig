@@ -22,6 +22,13 @@
 const std = @import("std");
 const core = @import("core");
 const c_abi = @import("c_abi");
+const api = @import("api");
+
+/// The installed library is std-only by build policy, so the C entry points
+/// cannot reach for libc's allocator. smp_allocator is thread-safe, which the
+/// ABI requires: coordgen_abi.h documents concurrent generation on distinct
+/// inputs, and the allocator is the only state these entry points share.
+const generation_allocator = std.heap.smp_allocator;
 
 const AtomFlags = c_abi.AtomFlags;
 const BondFlags = c_abi.BondFlags;
@@ -120,8 +127,184 @@ fn validateBondField(bond: BondInput, atom_count: usize) ?core.errors.ErrorCode 
     if (!std.math.isFinite(bond.crossing_penalty_multiplier) or bond.crossing_penalty_multiplier < 0) {
         return .invalid_option;
     }
+    // The oracle adapter rejects an out-of-range display with
+    // COORDGEN_ERROR_INVALID_STEREO (conformance/oracle_adapter.cpp:206), and
+    // a consumer of the shared header must not be able to tell the two
+    // implementations apart by which code comes back.
+    if (core.chemistry.BondDisplay.fromPublic(bond.display) == null) return .invalid_stereo;
     if (validateBondStereoField(bond, atom_count)) |err| return err;
     return null;
+}
+
+fn validFlag(value: u32) bool {
+    return value <= 1;
+}
+
+/// Mirrors the oracle adapter's option contract exactly
+/// (conformance/oracle_adapter.cpp:146-156): a boolean option carries 0 or 1
+/// and nothing else, so a caller passing 2 learns it now rather than getting
+/// whichever meaning the implementation happened to infer.
+fn validateOptions(options: c_abi.Options) ?core.errors.ErrorCode {
+    if (!std.math.isFinite(options.precision) or options.precision <= 0) return .invalid_option;
+    if (!validFlag(options.score_residue_interactions) or
+        !validFlag(options.treat_nonterminal_bonds_to_metal_as_zero_order) or
+        !validFlag(options.even_angles) or
+        !validFlag(options.skip_minimization) or
+        !validFlag(options.force_open_macrocycles) or
+        !validFlag(options.constrain_all_atoms) or
+        !validFlag(options.build_from_fragments) or
+        !validFlag(options.debug_coordinates) or
+        !validFlag(options.load_templates))
+    {
+        return .invalid_option;
+    }
+    return null;
+}
+
+fn optionalIndex(value: u32) ?core.ids.InputIndex {
+    return if (isIndexPresent(value)) value else null;
+}
+
+fn stringSlice(view: c_abi.StringView) []const u8 {
+    const len: usize = @intCast(view.len);
+    return if (view.ptr) |p| p[0..len] else &[_]u8{};
+}
+
+/// Borrowed C spans become borrowed-plus-owned safe values: the arrays below
+/// are allocated for the duration of the call, while every string and index
+/// span inside them still points at caller memory, which the safe API also
+/// only borrows.
+fn convertAtoms(allocator: std.mem.Allocator, span: []const AtomInput) core.errors.Error![]api.AtomInput {
+    const converted = allocator.alloc(api.AtomInput, span.len) catch return error.OutOfMemory;
+    errdefer allocator.free(converted);
+    for (span, converted) |atom, *destination| {
+        destination.* = .{
+            .atomic_number = core.chemistry.AtomicNumber.fromPublic(atom.atomic_number) orelse {
+                return error.InvalidAtomicNumber;
+            },
+            .formal_charge = atom.formal_charge,
+            .fixed = atom.flags & AtomFlags.fixed != 0,
+            .constrained = atom.flags & AtomFlags.constrained != 0,
+            .hidden = atom.flags & AtomFlags.hidden != 0,
+            .template_coordinates = if (atom.flags & AtomFlags.has_template_coordinates != 0)
+                atom.template_coordinates
+            else
+                null,
+            .coordinates_3d = if (atom.flags & AtomFlags.has_coordinates_3d != 0)
+                atom.coordinates_3d
+            else
+                null,
+            .stereo = .{
+                .value = core.chemistry.AtomStereo.fromPublic(atom.stereo) orelse return error.InvalidStereo,
+                .looking_from = optionalIndex(atom.stereo_looking_from),
+                .atom_a = optionalIndex(atom.stereo_atom_a),
+                .atom_b = optionalIndex(atom.stereo_atom_b),
+            },
+        };
+    }
+    return converted;
+}
+
+fn convertBonds(allocator: std.mem.Allocator, span: []const BondInput) core.errors.Error![]api.BondInput {
+    const converted = allocator.alloc(api.BondInput, span.len) catch return error.OutOfMemory;
+    errdefer allocator.free(converted);
+    for (span, converted) |bond, *destination| {
+        destination.* = .{
+            .start = bond.start,
+            .end = bond.end,
+            .order = core.chemistry.BondOrder.fromInt(bond.order) orelse return error.InvalidBondOrder,
+            .skip = bond.flags & BondFlags.skip != 0,
+            .stereo = .{
+                .value = core.chemistry.BondStereo.fromPublic(bond.stereo) orelse return error.InvalidStereo,
+                .atom_a = optionalIndex(bond.stereo_atom_a),
+                .atom_b = optionalIndex(bond.stereo_atom_b),
+            },
+            .display = core.chemistry.BondDisplay.fromPublic(bond.display) orelse {
+                return error.InvalidStereo;
+            },
+            .crossing_penalty_multiplier = bond.crossing_penalty_multiplier,
+        };
+    }
+    return converted;
+}
+
+fn convertResidues(allocator: std.mem.Allocator, span: []const ResidueInput) core.errors.Error![]api.ResidueInput {
+    const converted = allocator.alloc(api.ResidueInput, span.len) catch return error.OutOfMemory;
+    errdefer allocator.free(converted);
+    for (span, converted) |residue, *destination| {
+        destination.* = .{
+            .atom = residue.atom,
+            .chain = stringSlice(residue.chain),
+            .residue_number = residue.residue_number,
+            .closest_ligand_atom = optionalIndex(residue.closest_ligand_atom),
+        };
+    }
+    return converted;
+}
+
+fn convertResidueInteractions(
+    allocator: std.mem.Allocator,
+    span: []const ResidueInteractionInput,
+) core.errors.Error![]api.ResidueInteractionInput {
+    const converted = allocator.alloc(api.ResidueInteractionInput, span.len) catch return error.OutOfMemory;
+    errdefer allocator.free(converted);
+    for (span, converted) |interaction, *destination| {
+        destination.* = .{
+            .start = interaction.start,
+            .end = interaction.end,
+            .other_start_atoms = asSlice(u32, interaction.other_start_atoms),
+            .other_end_atoms = asSlice(u32, interaction.other_end_atoms),
+            .crossing_penalty_multiplier = interaction.crossing_penalty_multiplier,
+        };
+    }
+    return converted;
+}
+
+fn encodeEnumSpan(allocator: std.mem.Allocator, values: anytype) core.errors.Error![]u32 {
+    const encoded = allocator.alloc(u32, values.len) catch return error.OutOfMemory;
+    for (values, encoded) |value, *destination| destination.* = @backingInt(value);
+    return encoded;
+}
+
+fn vec2Span(slice: []core.math.Vec2) c_abi.Vec2Span {
+    return .{ .ptr = slice.ptr, .len = @intCast(slice.len) };
+}
+
+fn u32Span(slice: []u32) c_abi.U32Span {
+    return .{ .ptr = slice.ptr, .len = @intCast(slice.len) };
+}
+
+/// Moves `generated` into the C result. The three enum-typed observables are
+/// re-encoded as u32 spans because the ABI carries them that way; the other
+/// three slices are handed over unchanged. On success `generated` no longer
+/// owns those three, which is why the caller releases exactly the re-encoded
+/// originals and never calls `api.Result.deinit`.
+fn publishResult(
+    allocator: std.mem.Allocator,
+    generated: api.Result,
+    result: *Result,
+) core.errors.Error!void {
+    const effective_bond_orders = try encodeEnumSpan(allocator, generated.effective_bond_orders);
+    errdefer allocator.free(effective_bond_orders);
+    const bond_displays = try encodeEnumSpan(allocator, generated.bond_displays);
+    errdefer allocator.free(bond_displays);
+    const atom_stereo = try encodeEnumSpan(allocator, generated.atom_stereo);
+    errdefer allocator.free(atom_stereo);
+    const owner = allocator.create(ResultOwner) catch return error.OutOfMemory;
+    owner.* = .{ .allocator = allocator };
+
+    // Nothing below can fail, so the ownership move is atomic from the
+    // caller's side: either every span is published, or none is.
+    result.* = .{
+        .coordinates = vec2Span(generated.coordinates),
+        .input_to_internal = u32Span(generated.input_to_internal),
+        .internal_to_input = u32Span(generated.internal_to_input),
+        .effective_bond_orders = u32Span(effective_bond_orders),
+        .bond_displays = u32Span(bond_displays),
+        .atom_stereo = u32Span(atom_stereo),
+        .clean_pose = @intFromBool(generated.clean_pose),
+        .owner = owner,
+    };
 }
 
 fn validateResidueField(residue: ResidueInput, atom_count: usize) ?core.errors.ErrorCode {
@@ -157,21 +340,18 @@ fn validateResidueInteractionField(
 /// through the C representation. `too_many_items` is not: every span's `len`
 /// is already a `uint32_t` in the ABI, so the u32-overflow case
 /// api.Input.validate() guards against for the wider Zig `usize` slices
-/// cannot occur through this entry point. The topology, layout, optimize, and
-/// generator layers are all implemented, but nothing calls them from here yet,
-/// so a structurally valid input deliberately returns `unsupported` rather
-/// than a silently-empty result. Wiring this entry point to the pipeline is
-/// cgz-7v2.21; the assertions below at `expect = .unsupported` are part of
-/// that bead's diff.
+/// cannot occur through this entry point.
+///
+/// Coverage is partial by domain, never by size, and a domain no native phase
+/// owns yet returns `unsupported` rather than a silently-empty success. The
+/// rejected set is enumerated on `api.generate`.
 export fn coordgen_generate(input: *const Input, result: *Result) callconv(.c) core.errors.ErrorCode {
     result.* = .{};
 
     const atom_count: usize = input.atoms.len;
     if (atom_count == 0) return .empty_graph;
 
-    if (!std.math.isFinite(input.options.precision) or input.options.precision <= 0) {
-        return .invalid_option;
-    }
+    if (validateOptions(input.options)) |err| return err;
 
     for (asSlice(AtomInput, input.atoms)) |atom| {
         if (validateAtomField(atom, atom_count)) |err| return err;
@@ -189,7 +369,76 @@ export fn coordgen_generate(input: *const Input, result: *Result) callconv(.c) c
         if (validateResidueInteractionField(interaction, atom_count)) |err| return err;
     }
 
-    return .unsupported;
+    return generateThroughSafeApi(generation_allocator, input, result);
+}
+
+fn generateThroughSafeApi(
+    allocator: std.mem.Allocator,
+    input: *const Input,
+    result: *Result,
+) core.errors.ErrorCode {
+    const atoms = convertAtoms(allocator, asSlice(AtomInput, input.atoms)) catch |err| {
+        return core.errors.code(err);
+    };
+    defer allocator.free(atoms);
+    const bonds = convertBonds(allocator, asSlice(BondInput, input.bonds)) catch |err| {
+        return core.errors.code(err);
+    };
+    defer allocator.free(bonds);
+    const extra_bonds = convertBonds(allocator, asSlice(BondInput, input.extra_bonds)) catch |err| {
+        return core.errors.code(err);
+    };
+    defer allocator.free(extra_bonds);
+    const residues = convertResidues(allocator, asSlice(ResidueInput, input.residues)) catch |err| {
+        return core.errors.code(err);
+    };
+    defer allocator.free(residues);
+    const residue_interactions = convertResidueInteractions(
+        allocator,
+        asSlice(ResidueInteractionInput, input.residue_interactions),
+    ) catch |err| return core.errors.code(err);
+    defer allocator.free(residue_interactions);
+
+    const template_directory = input.options.template_directory;
+    const safe_input = api.Input{
+        .atoms = atoms,
+        .bonds = bonds,
+        .residues = residues,
+        .residue_interactions = residue_interactions,
+        .extra_bonds = extra_bonds,
+        .options = .{
+            .precision = input.options.precision,
+            .score_residue_interactions = input.options.score_residue_interactions != 0,
+            .treat_nonterminal_bonds_to_metal_as_zero_order = input.options.treat_nonterminal_bonds_to_metal_as_zero_order != 0,
+            .even_angles = input.options.even_angles != 0,
+            .skip_minimization = input.options.skip_minimization != 0,
+            .force_open_macrocycles = input.options.force_open_macrocycles != 0,
+            .constrain_all_atoms = input.options.constrain_all_atoms != 0,
+            .build_from_fragments = input.options.build_from_fragments != 0,
+            .debug_coordinates = input.options.debug_coordinates != 0,
+            .load_templates = input.options.load_templates != 0,
+            // A present-but-empty view is still a request for process-global
+            // template state, which no phase owns; only an absent view selects
+            // the built-in data. The oracle adapter refuses the same shape.
+            .template_directory = if (template_directory.ptr != null or template_directory.len != 0)
+                stringSlice(template_directory)
+            else
+                null,
+        },
+    };
+
+    var generated = api.generate(allocator, safe_input) catch |err| return core.errors.code(err);
+    publishResult(allocator, generated, result) catch |err| {
+        generated.deinit();
+        result.* = .{};
+        return core.errors.code(err);
+    };
+    // publishResult moved the other three slices into `result`; these are the
+    // originals of the three it re-encoded.
+    allocator.free(generated.atom_stereo);
+    allocator.free(generated.bond_displays);
+    allocator.free(generated.effective_bond_orders);
+    return .ok;
 }
 
 const ResultOwner = struct {
@@ -229,6 +478,7 @@ test "coordgen_generate reaches every documented error path that api.Input.valid
         residues: []const ResidueInput = &.{},
         residue_interactions: []const ResidueInteractionInput = &.{},
         precision: f32 = 1,
+        even_angles: u32 = 0,
         expect: core.errors.ErrorCode,
     };
     const cases = [_]Case{
@@ -291,16 +541,35 @@ test "coordgen_generate reaches every documented error path that api.Input.valid
             .expect = .invalid_atom_index,
         },
         .{
-            // Structurally sound input: no generator is wired yet.
+            // A boolean option carrying a value other than 0 or 1.
+            .atoms = &.{.{}},
+            .expect = .invalid_option,
+            .even_angles = 2,
+        },
+        .{
             .atoms = &.{ .{}, .{} },
+            .bonds = &.{.{ .start = 0, .end = 1, .order = 1, .display = 9 }},
+            .expect = .invalid_stereo,
+        },
+        .{
+            // A domain no native phase owns: rejected by name, never as an
+            // empty success. Hidden atoms are excluded from canonical order
+            // upstream, and no native phase reproduces that yet.
+            .atoms = &.{ .{}, .{ .flags = AtomFlags.hidden } },
             .bonds = &.{.{ .start = 0, .end = 1, .order = 1 }},
             .expect = .unsupported,
+        },
+        .{
+            // Structurally sound and in-domain.
+            .atoms = &.{ .{}, .{} },
+            .bonds = &.{.{ .start = 0, .end = 1, .order = 1 }},
+            .expect = .ok,
         },
     };
 
     for (cases) |case| {
         const input: Input = .{
-            .options = .{ .precision = case.precision },
+            .options = .{ .precision = case.precision, .even_angles = case.even_angles },
             .atoms = .{ .ptr = case.atoms.ptr, .len = @intCast(case.atoms.len) },
             .bonds = .{ .ptr = case.bonds.ptr, .len = @intCast(case.bonds.len) },
             .residues = .{ .ptr = case.residues.ptr, .len = @intCast(case.residues.len) },
@@ -312,10 +581,95 @@ test "coordgen_generate reaches every documented error path that api.Input.valid
         var result: Result = undefined;
         const code = coordgen_generate(&input, &result);
         try std.testing.expectEqual(case.expect, code);
-        if (code != .unsupported) {
+        if (code == .ok) {
+            try std.testing.expect(result.owner != null);
+            coordgen_result_free(&result);
+        } else {
+            // Every failure path leaves the documented zero value, so a caller
+            // that frees unconditionally is still correct.
             try std.testing.expect(result.owner == null);
+            try std.testing.expect(result.coordinates.ptr == null);
         }
     }
+}
+
+test "coordgen_generate publishes every observable span and frees them as one unit" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{} };
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = 1 },
+        .{ .start = 1, .end = 2, .order = 2 },
+    };
+    const input: Input = .{
+        .atoms = .{ .ptr = &atoms, .len = atoms.len },
+        .bonds = .{ .ptr = &bonds, .len = bonds.len },
+    };
+    var result: Result = undefined;
+    try std.testing.expectEqual(core.errors.ErrorCode.ok, coordgen_generate(&input, &result));
+
+    try std.testing.expectEqual(@as(u32, atoms.len), result.coordinates.len);
+    try std.testing.expectEqual(@as(u32, atoms.len), result.input_to_internal.len);
+    try std.testing.expectEqual(@as(u32, atoms.len), result.internal_to_input.len);
+    try std.testing.expectEqual(@as(u32, atoms.len), result.atom_stereo.len);
+    try std.testing.expectEqual(@as(u32, bonds.len), result.effective_bond_orders.len);
+    try std.testing.expectEqual(@as(u32, bonds.len), result.bond_displays.len);
+
+    const coordinates = result.coordinates.ptr.?[0..result.coordinates.len];
+    for (coordinates) |position| try std.testing.expect(position.isFinite());
+    for (bonds) |bond| {
+        const delta_x = coordinates[bond.start].x - coordinates[bond.end].x;
+        const delta_y = coordinates[bond.start].y - coordinates[bond.end].y;
+        try std.testing.expectApproxEqAbs(
+            c_abi.bond_length,
+            @sqrt(delta_x * delta_x + delta_y * delta_y),
+            0.001,
+        );
+    }
+    // The enum observables cross the ABI as their pinned numeric values.
+    const effective = result.effective_bond_orders.ptr.?[0..result.effective_bond_orders.len];
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, effective);
+    const displays = result.bond_displays.ptr.?[0..result.bond_displays.len];
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0 }, displays);
+
+    coordgen_result_free(&result);
+    try std.testing.expect(result.owner == null);
+    try std.testing.expect(result.coordinates.ptr == null);
+    try std.testing.expect(result.atom_stereo.ptr == null);
+}
+
+test "coordgen_generate is repeatable and independent across concurrent contexts" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = 1 },
+        .{ .start = 1, .end = 2, .order = 1 },
+        .{ .start = 2, .end = 3, .order = 1 },
+    };
+    const input: Input = .{
+        .atoms = .{ .ptr = &atoms, .len = atoms.len },
+        .bonds = .{ .ptr = &bonds, .len = bonds.len },
+    };
+
+    const Worker = struct {
+        fn run(shared: *const Input, out: *[4]core.math.Vec2, ok: *bool) void {
+            var local: Result = undefined;
+            ok.* = coordgen_generate(shared, &local) == .ok;
+            if (!ok.*) return;
+            @memcpy(out, local.coordinates.ptr.?[0..4]);
+            coordgen_result_free(&local);
+        }
+    };
+
+    var first: [4]core.math.Vec2 = undefined;
+    var second: [4]core.math.Vec2 = undefined;
+    var first_ok = false;
+    var second_ok = false;
+    const left = try std.Thread.spawn(.{}, Worker.run, .{ &input, &first, &first_ok });
+    const right = try std.Thread.spawn(.{}, Worker.run, .{ &input, &second, &second_ok });
+    left.join();
+    right.join();
+
+    try std.testing.expect(first_ok);
+    try std.testing.expect(second_ok);
+    try std.testing.expectEqualSlices(core.math.Vec2, &first, &second);
 }
 
 test "coordgen_result_free is a safe no-op on a zeroed (failure) result" {

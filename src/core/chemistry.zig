@@ -203,6 +203,18 @@ pub const BondDisplay = enum(u32) {
     solid_reverse = 2,
     hashed_forward = 3,
     hashed_reverse = 4,
+
+    /// See AtomStereo.fromPublic: the same illegal-behavior hazard applies.
+    pub fn fromPublic(value: u32) ?BondDisplay {
+        return switch (value) {
+            0 => .none,
+            1 => .solid_forward,
+            2 => .solid_reverse,
+            3 => .hashed_forward,
+            4 => .hashed_reverse,
+            else => null,
+        };
+    }
 };
 
 test "chemical enums have stable widths and zero-order bonds are conserved" {
