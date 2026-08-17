@@ -71,6 +71,15 @@ pub const ResidueInteractionInput = struct {
 /// All upstream generation controls are represented in a single-shot request.
 /// Per-atom constrain/fix vectors are normalized into AtomInput flags;
 /// addExtraBond is normalized into Input.extra_bonds.
+///
+/// There is no `build_from_fragments` field. cgz-r25 removed it rather than
+/// mirror `c_abi.Options.reserved` here: upstream's buildFromFragments(bool)
+/// is an imperative pipeline step runGenerateCoordinates() already performs
+/// unconditionally (cgz-7v2.8), never a stored option, so the field could
+/// accept only its default. `c_abi.Options` keeps the slot because it is
+/// `extern` and bound by coordgen_abi.h's frozen byte layout; this struct is
+/// plain Zig with no layout obligation, so the slot has nothing holding it in
+/// place and is simply gone.
 pub const Options = struct {
     precision: f32 = Precision.standard,
     score_residue_interactions: bool = true,
@@ -79,7 +88,6 @@ pub const Options = struct {
     skip_minimization: bool = false,
     force_open_macrocycles: bool = false,
     constrain_all_atoms: bool = false,
-    build_from_fragments: bool = false,
     debug_coordinates: bool = false,
     load_templates: bool = true,
     /// Borrowed for the duration of generate(); null selects built-in data.
@@ -268,7 +276,6 @@ test "complete option table has pinned defaults" {
     try std.testing.expect(!options.skip_minimization);
     try std.testing.expect(!options.force_open_macrocycles);
     try std.testing.expect(!options.constrain_all_atoms);
-    try std.testing.expect(!options.build_from_fragments);
     try std.testing.expect(!options.debug_coordinates);
     try std.testing.expect(options.load_templates);
     try std.testing.expect(options.template_directory == null);

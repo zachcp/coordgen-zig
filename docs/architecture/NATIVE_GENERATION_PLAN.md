@@ -327,7 +327,10 @@ that waits on generation, so none of them is reopened wholesale.
    independent of each other once step 3 exists.
 5. **`cgz-7v2.4.8` — final validation audit and scoped parity report.**
 
-Two open items are cheap now and expensive later: `cgz-r25` (the
-`build_from_fragments` slot is frozen in the public option table and step 1
-freezes public generation around it) and `cgz-7v2.3` (owner-controlled mirrors
-for the pinned archives, which every gate above assumes will keep resolving).
+`cgz-r25` is settled: the `build_from_fragments` slot is now
+`coordgen_options_t.reserved`, required to be zero, and gone from
+`api.Options` entirely, so step 1 freezes public generation around a reserved
+field rather than around a name that promises a toggle. See
+[FOUNDATION_CONTRACTS.md](FOUNDATION_CONTRACTS.md). One open item remains cheap
+now and expensive later: `cgz-7v2.3` (owner-controlled mirrors for the pinned
+archives, which every gate above assumes will keep resolving).

@@ -310,7 +310,7 @@ fn interactionTouchesExcluded(interaction: core.interaction.Interaction, exclude
 
 fn rejectOutOfScope(input: anytype) core.errors.Error!void {
     if (input.extra_bonds.len != 0) return error.Unsupported;
-    if (input.options.even_angles or input.options.constrain_all_atoms or input.options.build_from_fragments or
+    if (input.options.even_angles or input.options.constrain_all_atoms or
         input.options.debug_coordinates or input.options.template_directory != null) return error.Unsupported;
     for (input.atoms) |atom| {
         if (atom.hidden or atom.fixed or atom.constrained or atom.template_coordinates != null or
