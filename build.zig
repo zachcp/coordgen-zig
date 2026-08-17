@@ -522,6 +522,26 @@ pub fn build(b: *std.Build) !void {
     module_graph_step.dependOn(&module_import_check.step);
     module_graph_step.dependOn(&module_import_self_test.step);
 
+    // Its own step, deliberately not part of `test`, because it is RED on
+    // landing and says so: six public entry points of the layout and optimize
+    // layers have no caller outside their own tests (cgz-7v2.24). That is the
+    // cgz-r35 family, which nothing in this build could previously see -
+    // coverage-check counts assertion sites, so a well-tested orphan reads as
+    // covered, and module-graph-check validates which layers may import which,
+    // not which imports exist. A gate that must fail until real work lands is
+    // cgz-r20's rule, not a defect in the gate.
+    const reachability_step = b.step(
+        "reachability-check",
+        "Reject a public layout/optimize/generator entry point with no caller outside its own tests",
+    );
+    const reachability_check = b.addSystemCommand(&.{ "python3", "tools/check-reachability" });
+    const reachability_self_test = b.addSystemCommand(&.{ "python3", "tools/check-reachability", "--self-test" });
+    reachability_step.dependOn(&reachability_check.step);
+    reachability_step.dependOn(&reachability_self_test.step);
+    // The self-test runs with the default checks even while the scan is red, so
+    // the checker itself cannot rot unnoticed behind its own known failure.
+    module_graph_step.dependOn(&reachability_self_test.step);
+
     const policy_command = b.addSystemCommand(&.{ "sh", "tools/check-build-policy" });
     const external_consumer = b.addRunFile(std.Build.LazyPath.zig_exe);
     external_consumer.addArgs(&.{ "build", "test", "--summary", "failures", "--cache-dir" });
