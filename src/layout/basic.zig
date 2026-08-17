@@ -118,9 +118,13 @@ fn initializeCoordinatesInternal(
             }
         }
     }
+    // Upstream's order inside buildFragment is fallbackIfNanCoordinates, then
+    // rotateMainFragment for a constrained root, then the fixed-coordinate
+    // reset (CoordgenFragmentBuilder.cpp:858-866). The fallback ran last here,
+    // after assembly had already propagated a NaN parent into its children.
+    fallbackOnValid3dCoordinates(atoms, fragmentation);
     try assembleFragments(atoms, bonds, graph, fragmentation);
     alignConstrainedMainFragments(atoms, fragmentation);
-    fallbackOn3dCoordinates(atoms, fragmentation);
     restoreFixedCoordinates(atoms);
     return outcome;
 }
@@ -861,21 +865,61 @@ fn restoreFixedCoordinates(atoms: []model.Atom) void {
     };
 }
 
-fn fallbackOn3dCoordinates(atoms: []model.Atom, fragmentation: fragments.Fragmentation) void {
+/// `CoordgenFragmentBuilder::fallbackIfNanCoordinates`: when a fragment's
+/// generated coordinates hold a NaN and its input 3D coordinates are usable,
+/// project those instead.
+///
+/// This was cgz-7v2.25. A hand-rolled version was wired here that copied 3D x/y
+/// straight through - unscaled, unmirrored, unrounded - while the faithful
+/// transcription sat unreachable in the optimize layer, and their triggers
+/// disagreed as well. Two implementations of one upstream function is how that
+/// happened, so there is now exactly one, in the layer that calls it.
+fn fallbackOnValid3dCoordinates(atoms: []model.Atom, fragmentation: fragments.Fragmentation) void {
     for (fragmentation.fragments) |fragment| {
         const members = fragmentation.members(fragment.id);
-        var generated_finite = true;
-        var source_valid = true;
-        for (members) |atom| {
-            generated_finite = generated_finite and atoms[atom.index()].coordinates.isFinite();
-            source_valid = source_valid and atoms[atom.index()].coordinates_3d != null and atoms[atom.index()].coordinates_3d.?.isFinite();
-        }
-        if (generated_finite or !source_valid) continue;
+        if (!fragmentHasNan(atoms, members)) continue;
+        if (!fragmentHasValid3dSource(atoms, members)) continue;
         for (members) |atom| {
             const source = atoms[atom.index()].coordinates_3d.?;
-            atoms[atom.index()].coordinates = .{ .x = source.x, .y = source.y };
+            // The 35x scale and the negated y are upstream's projection, and the
+            // rounding keeps the emergency pose on the same two-decimal grid as
+            // the rest of the layout.
+            atoms[atom.index()].coordinates = .{
+                .x = roundToTwoDecimalDigits(source.x * 35),
+                .y = roundToTwoDecimalDigits(-source.y * 35),
+            };
         }
     }
+}
+
+/// `CoordgenMinimizer::hasNaNCoordinates`: NaN only. An infinity is deliberately
+/// not a trigger upstream, and the hand-rolled version tested `!isFinite()`,
+/// which made it one and took the fallback where upstream would not.
+fn fragmentHasNan(atoms: []const model.Atom, members: []const core.ids.AtomId) bool {
+    for (members) |atom| {
+        const position = atoms[atom.index()].coordinates;
+        if (std.math.isNan(position.x) or std.math.isNan(position.y)) return true;
+    }
+    return false;
+}
+
+/// `CoordgenMinimizer::hasValid3DCoordinates`: upstream's 10,000,001 sentinel.
+/// It is a one-sided magnitude ceiling rather than a finiteness test, so a
+/// negative infinity passes it while a positive one does not; the test below
+/// pins that asymmetry rather than tidying it away.
+fn fragmentHasValid3dSource(atoms: []const model.Atom, members: []const core.ids.AtomId) bool {
+    const invalid_coordinates: f32 = 10_000_001;
+    for (members) |atom| {
+        const source = atoms[atom.index()].coordinates_3d orelse return false;
+        if (!(source.x < invalid_coordinates and
+            source.y < invalid_coordinates and
+            source.z < invalid_coordinates)) return false;
+    }
+    return true;
+}
+
+fn roundToTwoDecimalDigits(value: f32) f32 {
+    return @floor(value * 100 + 0.5) * 0.01;
 }
 
 fn fragmentCenter(atoms: []const model.Atom, members: []const core.ids.AtomId) core.math.Vec2 {
@@ -1259,7 +1303,7 @@ test "fragment assembly preserves every acyclic parent bond length" {
     };
 }
 
-test "constrained alignment, fixed reset, and valid 3D fallback are deterministic" {
+test "constrained alignment and fixed reset are deterministic" {
     var atoms: [3]model.Atom = undefined;
     for (&atoms, 0..) |*atom, index| atom.* = .{
         .id = core.ids.AtomId.fromIndex(@intCast(index)),
@@ -1285,17 +1329,59 @@ test "constrained alignment, fixed reset, and valid 3D fallback are deterministi
     try layoutFixture(&atoms, &bonds);
     try std.testing.expectEqual(core.math.Vec2{ .x = -12, .y = 34 }, atoms[2].coordinates);
 
-    for (&atoms, 0..) |*atom, index| {
-        atom.fixed = false;
-        atom.constrained = true;
-        atom.template_coordinates = .{ .x = std.math.nan(f32), .y = 0 };
-        atom.coordinates_3d = .{ .x = @floatFromInt(index * 3), .y = @floatFromInt(index * 5), .z = 7 };
-    }
-    try layoutFixture(&atoms, &bonds);
+}
+
+test "the 3D fallback applies upstream's scaled, mirrored projection" {
+    // Exercised directly rather than through the whole layout: the projection is
+    // what cgz-7v2.25 got wrong, and upstream runs this BEFORE the constrained
+    // rotation, so driving it end to end would measure the rotation's handling
+    // of a deliberately broken template instead of the projection.
+    var atoms: [3]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+        .coordinates = .{ .x = std.math.nan(f32), .y = 0 },
+        .coordinates_3d = .{ .x = @floatFromInt(index * 3), .y = @floatFromInt(index * 5), .z = 7 },
+    };
+    var bonds = [_]model.Bond{
+        .{ .id = core.ids.BondId.fromIndex(0), .input_index = 0, .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(1), .input_order = .single, .effective_order = .single },
+        .{ .id = core.ids.BondId.fromIndex(1), .input_index = 1, .start = core.ids.AtomId.fromIndex(1), .end = core.ids.AtomId.fromIndex(2), .input_order = .single, .effective_order = .single },
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+
+    fallbackOnValid3dCoordinates(&atoms, split);
+    // 35x, y negated, rounded to two decimals - not the raw 3D x/y a hand-rolled
+    // version used to copy through.
     for (atoms, 0..) |atom, index| {
-        try std.testing.expectEqual(@as(f32, @floatFromInt(index * 3)), atom.coordinates.x);
-        try std.testing.expectEqual(@as(f32, @floatFromInt(index * 5)), atom.coordinates.y);
+        const source: f32 = @floatFromInt(index);
+        try std.testing.expectApproxEqAbs(source * 3 * 35, atom.coordinates.x, 0.001);
+        try std.testing.expectApproxEqAbs(-(source * 5) * 35, atom.coordinates.y, 0.001);
     }
+
+    // An infinity is not NaN, so it does not trigger the fallback at all.
+    for (&atoms) |*atom| atom.coordinates = .{ .x = std.math.inf(f32), .y = 0 };
+    fallbackOnValid3dCoordinates(&atoms, split);
+    for (atoms) |atom| try std.testing.expectEqual(std.math.inf(f32), atom.coordinates.x);
+
+    // A missing 3D source declines; and the sentinel is a one-sided ceiling, so
+    // a negative infinity passes it where a positive one does not.
+    for (&atoms) |*atom| {
+        atom.coordinates = .{ .x = std.math.nan(f32), .y = 0 };
+        atom.coordinates_3d = null;
+    }
+    fallbackOnValid3dCoordinates(&atoms, split);
+    for (atoms) |atom| try std.testing.expect(std.math.isNan(atom.coordinates.x));
+
+    for (&atoms) |*atom| atom.coordinates_3d = .{ .x = -std.math.inf(f32), .y = 0, .z = 0 };
+    try std.testing.expect(fragmentHasValid3dSource(&atoms, split.members(split.fragments[0].id)));
+    for (&atoms) |*atom| atom.coordinates_3d = .{ .x = std.math.inf(f32), .y = 0, .z = 0 };
+    try std.testing.expect(!fragmentHasValid3dSource(&atoms, split.members(split.fragments[0].id)));
 }
 
 test "planarity scoring separates a flat fused system from a bond shared by three rings" {
