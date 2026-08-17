@@ -79,6 +79,14 @@ REFERENCE_ROOTS = (
 # printed when --list-exemptions is passed so the table cannot rot silently
 # into a list of bare paths.
 UNREACHABLE_EXEMPT = {
+    "src/layout/templates.zig::rmsd": (
+        "cgz-7v2.27: it is not a dead helper, it is the scoring function of a "
+        "stage native does not have. Upstream's sole caller of RMSD is "
+        "alignWithParentDirectionConstrained, the constrained half of the "
+        "child-fragment side choice, and that whole stage is missing - so this "
+        "becomes reachable when cgz-7v2.27 lands, and deleting it now would "
+        "mean writing it again. Exempt until then, not indefinitely."
+    ),
     "src/optimize/discrete.zig::avoidTerminalClashes": (
         "cgz-r36, closed: upstream calls it on the !cleanPose path before "
         "minimizing, and wiring it into native's equivalent changed the "
