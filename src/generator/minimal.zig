@@ -102,7 +102,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.rings,
     );
     defer fragmentation.deinit();
-    try layout.initializeCoordinatesWithOptions(
+    const layout_outcome = try layout.initializeCoordinatesWithOptions(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
@@ -127,6 +127,24 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         input.options.precision,
         residue_atoms,
     );
+    // Upstream requires minimization when the discrete search could not reach
+    // a clean pose, and separately when maybeMinimizeRings fired during ring
+    // placement (CoordgenMinimizer.cpp:1272 and :1458). Both feed one
+    // molecule-level flag, and skip_minimization suppresses the run itself
+    // rather than the flag, matching CoordgenMinimizer::run.
+    if ((!clean_pose or layout_outcome.minimization_required) and
+        !input.options.skip_minimization)
+    {
+        try minimizeGenerated(
+            allocator,
+            prepared.working.atoms,
+            prepared.working.bonds,
+            prepared.graph,
+            prepared.rings,
+            fragmentation,
+            input.options.even_angles,
+        );
+    }
     try components.orientAcyclicComponents(
         allocator,
         prepared.working.atoms,
@@ -242,6 +260,66 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         .internal_to_input = internal_to_input,
         .clean_pose = clean_pose,
     };
+}
+
+/// Assemble the four interaction families upstream feeds
+/// addInteractionsOfMolecule - clash and stretch with intrafragment clashes
+/// enabled, bends, and chiral inversion constraints - and run the continuous
+/// minimizer over them.
+///
+/// The clash set differs from the discrete pass on purpose: minimizeMolecule
+/// passes intrafragmentClashes = true where avoidClashesOfMolecule passes
+/// false.
+fn minimizeGenerated(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    fragmentation: layout.Fragmentation,
+    even_angles: bool,
+) core.errors.Error!void {
+    const atom_fragments = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(atom_fragments);
+    for (fragmentation.atom_fragment, atom_fragments) |fragment, *output| output.* = fragment.index();
+
+    var base = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
+        .intrafragment_clashes = true,
+        .atom_fragments = atom_fragments,
+    });
+    defer base.deinit();
+
+    var analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds);
+    defer analysis.deinit();
+    var groups = try bends.build(allocator, atoms, bonds, graph, rings, analysis);
+    defer groups.deinit();
+    var bend_interactions = try optimize.buildBendInteractions(
+        allocator,
+        atoms,
+        groups.groups,
+        .{ .even_angles = even_angles },
+    );
+    defer bend_interactions.deinit();
+
+    const ez_constraints = try inversions.buildChiralInversionConstraints(
+        allocator,
+        atoms,
+        bonds,
+        graph,
+        rings,
+    );
+    defer allocator.free(ez_constraints);
+    var ez_interactions = try optimize.buildEzInteractions(allocator, ez_constraints);
+    defer ez_interactions.deinit();
+
+    var combined = try optimize.combineInteractions(allocator, &.{
+        base.items,
+        bend_interactions.items,
+        ez_interactions.items,
+    });
+    defer combined.deinit();
+
+    _ = try optimize.minimizeMolecule(allocator, atoms, combined.items, .{}, null);
 }
 
 const DiscreteScoreContext = struct {

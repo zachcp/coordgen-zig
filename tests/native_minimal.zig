@@ -432,7 +432,7 @@ test "minimal native generation arranges disconnected neutral components" {
                 @abs(first.y - second.y) >= api.bond_length);
         }
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+    try checkStableProteinAllocations(std.testing.allocator, input);
 }
 
 test "minimal native generation places an acyclic proximity child from a large center" {
