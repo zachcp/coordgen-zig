@@ -465,6 +465,34 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
+    // The parity ceiling is enumerated per corpus member, so it is checkable
+    // without an oracle: regenerate each enumerated member and confirm it
+    // still hashes to the bytes the row was measured against. Deliberately on
+    // `test` rather than on `corpus-check`, because the point of cgz-r26 is
+    // that the enumeration is portable and does not need the oracle build.
+    const parity_ceiling_module = b.createModule(.{
+        .root_source_file = b.path("tests/parity_ceiling_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "conformance", .module = conformance }},
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    const parity_ceiling_check = b.addExecutable(.{
+        .name = "parity-ceiling-check",
+        .root_module = parity_ceiling_module,
+    });
+    const run_parity_ceiling_check = b.addRunArtifact(parity_ceiling_check);
+    run_parity_ceiling_check.expectExitCode(0);
+    run_parity_ceiling_check.addArg("--ceiling");
+    run_parity_ceiling_check.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+    const parity_ceiling_step = b.step(
+        "parity-ceiling-check",
+        "Verify the enumerated parity ceiling still names the members it was measured on",
+    );
+    parity_ceiling_step.dependOn(&run_parity_ceiling_check.step);
+    test_step.dependOn(parity_ceiling_step);
+
     const coverage_step = b.step("coverage-check", "Validate requirements-to-test traceability");
     const coverage_check = b.addSystemCommand(&.{
         "python3",
@@ -1117,6 +1145,11 @@ pub fn build(b: *std.Build) !void {
         }
         run_classify.addArg("--expectations");
         run_classify.addFileArg(b.path("conformance/parity_expectations.tsv"));
+        // The fraction ceilings bound how many pairs may be order-unstable;
+        // this enumerates which. Both are checked, and an order-unstable pair
+        // missing from the enumeration fails closed (cgz-r13, cgz-r26).
+        run_classify.addArg("--ceiling");
+        run_classify.addFileArg(b.path("conformance/parity_ceiling.tsv"));
         run_classify.addArg("--manifest");
         const generated_manifest = run_classify.addOutputFileArg("parity_manifest.tsv");
 
