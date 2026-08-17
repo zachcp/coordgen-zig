@@ -1,0 +1,73 @@
+# The pointer-order parity ceiling, enumerated per (member, observable)
+# (cgz-r13, given a portable home by cgz-r26).
+#
+# Columns are tab separated:
+#   member  observable  order_ceiling_bl  input_sha256  evidence
+#
+# member          `{partition}/{index}`, the corpus identity. Portable: every
+#                 member is generated from nothing but those two values by an
+#                 integer-only, value-pinned PRNG, so it does not move under a
+#                 toolchain bump, an optimize-mode change, or a different
+#                 architecture. See src/conformance/corpus.zig.
+# observable      A name from `comparison.Observable`. An observable whose
+#                 normal tier is exact may never appear: structural
+#                 observables stay exact on ceiling members too.
+# order_ceiling_bl  `-`, or a deviation bound in bond lengths (one bond = 50
+#                 units). `-` means the pair is excused from *exact*
+#                 comparison and nothing else; it keeps its normal tier's
+#                 tolerance T. A number replaces T for that one pair. Only
+#                 `coordinates` may carry a number, because it is the only
+#                 observable the classifier measures a per-member magnitude
+#                 for; a number on any other would be invented. A bound at or
+#                 above 1.0 is rejected by the loader: above that boundary a
+#                 "tolerant" pass no longer means the layout matched.
+# input_sha256    SHA-256 of the member's canonical dump
+#                 (`corpus.writeMolecule`). A property of the member, so every
+#                 row naming it must repeat the same value. It is what makes
+#                 the identity checkable rather than assumed: if the generator
+#                 is ever edited, the identity still parses but now names a
+#                 different molecule, and this digest is what catches that.
+# evidence        The bead that admitted the row.
+#
+# THIS FILE IS THE AUTHORITATIVE CEILING. conformance/parity_manifest.tsv also
+# names these members, but it is a per-(architecture, toolchain, optimize-mode)
+# artifact and a gate that reads it changes meaning per host.
+# conformance/parity_expectations.tsv is portable but its schema is
+# per-partition fractions, and a fraction permits N failures without saying
+# which N. Neither can carry this enumeration; this file exists because both
+# properties are required at once.
+#
+# Fail closed. A (member, observable) pair measured order-unstable with no row
+# here is a hard failure, not a budget hit — `zig build corpus-check` enforces
+# that, and `comparison.differentialComparison` returns
+# error.UnenumeratedOrderInstability for it. The converse is not a failure: a
+# row is permission, not obligation, so an enumerated pair that happens to be
+# stable on some host passes.
+#
+# Admitting a member is a code review event with a recorded measurement, the
+# same standing as regenerating the manifest. Add the row, cite the bead that
+# measured it, and state the headroom in a comment above it so a later
+# widening appears as a diff.
+
+# adversarial/917, 1538 and 1588 diverge only in the component transform, by
+# one to two units in the last place; their coordinates are bit-identical
+# (order_max_dev_bl 0.000 in the manifest). Nothing is widened for them.
+adversarial/917	component_transforms	-	d87db99cd98ca2874e02632633d4f8b3361bdff22dd7f94c50e8ae44c47a7e6a	cgz-r13
+adversarial/917	component_transforms_set	-	d87db99cd98ca2874e02632633d4f8b3361bdff22dd7f94c50e8ae44c47a7e6a	cgz-r13
+adversarial/1538	component_transforms	-	00f261302d9aacccbc9966f1e3df43e2c53cb92aa771667ef0740cd083b25736	cgz-r13
+adversarial/1538	component_transforms_set	-	00f261302d9aacccbc9966f1e3df43e2c53cb92aa771667ef0740cd083b25736	cgz-r13
+adversarial/1588	component_transforms	-	11f18d73b633676d2825477d9be49e4484e7ef1ffe943a60025903dac0c1c0aa	cgz-r13
+adversarial/1588	component_transforms_set	-	11f18d73b633676d2825477d9be49e4484e7ef1ffe943a60025903dac0c1c0aa	cgz-r13
+
+# adversarial/1695 is the whole coordinate population of the ceiling: one
+# member of 2000, measured at 0.580 bond lengths under reversed heap address
+# order. The bound is 0.75, which is 0.17 bond lengths of headroom over that
+# measurement and 0.25 below the 1.0 boundary where a deviation stops being
+# float jitter and becomes a different local minimum. It is stated with
+# headroom because the measurement is per-build and this file is not; it is
+# held below 1.0 because a port that relayouts this member is a failure, not a
+# ceiling hit. Its transforms carry the same divergence but the classifier
+# publishes no magnitude for them, so they are not widened.
+adversarial/1695	coordinates	0.75	9b872879b3441f566576f40f16c9029d80eb696f8c6bd56c1acd0ea5f19889e3	cgz-r13
+adversarial/1695	component_transforms	-	9b872879b3441f566576f40f16c9029d80eb696f8c6bd56c1acd0ea5f19889e3	cgz-r13
+adversarial/1695	component_transforms_set	-	9b872879b3441f566576f40f16c9029d80eb696f8c6bd56c1acd0ea5f19889e3	cgz-r13

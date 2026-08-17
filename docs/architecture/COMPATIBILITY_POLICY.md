@@ -59,8 +59,19 @@ questions and must not be substituted for one another.
   perturbation, as a per-partition fraction with deliberate host headroom. It
   is a property of the oracle.
 - The **parity ceiling** is the set of (member, observable) pairs the *port* is
-  excused from exact or tolerant comparison on. It is the `order_unstable`
-  column of `conformance/parity_manifest.tsv`, read per member.
+  excused from exact or tolerant comparison on. It is enumerated in
+  `conformance/parity_ceiling.tsv`, keyed by corpus member identity.
+
+`cgz-r26` moved that enumeration out of the manifest's `order_unstable` column
+and into its own artifact. The decision is unchanged; only its home is. The
+column was the measurement that produced the rows and stays published evidence,
+but the manifest is a per-(architecture, toolchain, optimize-mode) file, so a
+gate reading it would change meaning per host — and this section's whole point
+is a claim that holds everywhere. `parity_ceiling.tsv` is keyed by
+`{partition}/{index}`, which is portable because the corpus generator is a pure
+integer function of exactly those two values, and each row pins the SHA-256 of
+the member it names so the identity cannot quietly repoint. The consumer
+contract is in [COMPARISON_SEMANTICS.md](COMPARISON_SEMANTICS.md).
 
 A fraction can never define the ceiling. A ceiling of `0.002` on 2000 members
 permits four failures but does not say which four, so a port could trade a
