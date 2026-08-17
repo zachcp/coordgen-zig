@@ -658,18 +658,13 @@ pub fn build(b: *std.Build) !void {
         "performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cgz-7v2.4.7",
     );
     performance_step.dependOn(&performance_pending.step);
-    const template_fixture = b.createModule(.{
-        .root_source_file = b.path("src/layout/templates/data.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const template_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/template_generate.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "conformance", .module = conformance },
-            .{ .name = "template_fixture", .module = template_fixture },
+            .{ .name = "layout", .module = layers.layout },
         },
     });
     const template_generator_tests = b.addTest(.{

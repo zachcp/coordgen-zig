@@ -1,6 +1,6 @@
 const std = @import("std");
 const conformance = @import("conformance");
-const fixture = @import("template_fixture");
+const fixture = @import("layout").templates.data;
 
 const TemplateError = error{
     BondIndexOutOfRange,

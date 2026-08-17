@@ -350,6 +350,46 @@ fn alignedDeviation(reference: []const Point, candidate: []const Point, reflect:
     return max_deviation;
 }
 
+/// Invert the oracle's published component transform to recover the pose the
+/// component had *before* global orientation, given the pose it ended with.
+///
+/// The transform is the least-squares linear map `after = M*before + t` that
+/// `oracle_adapter.cpp` fits across upstream's bestRotation, maybeFlip and
+/// arrangeMultipleMolecules, so this reads a stage the oracle already publishes
+/// rather than needing new instrumentation. A singular map is refused rather
+/// than approximated: a fit that collapsed carries no recoverable pose
+/// (cgz-7v2.4.2.1).
+pub fn invertComponentTransform(
+    transform: [6]f32,
+    final: []const Point,
+    output: []Point,
+) error{ CountMismatch, SingularTransform }!void {
+    if (final.len != output.len) return error.CountMismatch;
+    const m00: f64 = transform[0];
+    const m01: f64 = transform[1];
+    const m10: f64 = transform[2];
+    const m11: f64 = transform[3];
+    const determinant = m00 * m11 - m01 * m10;
+    if (!std.math.isFinite(determinant) or @abs(determinant) < 1e-6) return error.SingularTransform;
+    for (final, output) |point, *destination| {
+        const x = point.x - transform[4];
+        const y = point.y - transform[5];
+        destination.* = .{
+            .x = (m11 * x - m01 * y) / determinant,
+            .y = (m00 * y - m10 * x) / determinant,
+        };
+    }
+}
+
+/// Sign of the transform's determinant. Negative means upstream reflected the
+/// component, which is a divergence the port must reproduce rather than a free
+/// choice of depiction.
+pub fn transformReflects(transform: [6]f32) bool {
+    const determinant = @as(f64, transform[0]) * @as(f64, transform[3]) -
+        @as(f64, transform[1]) * @as(f64, transform[2]);
+    return determinant < 0;
+}
+
 fn reflected(point: Point, enabled: bool) Point {
     return if (enabled) .{ .x = point.x, .y = -point.y } else point;
 }
@@ -579,4 +619,41 @@ test "invariant quality floor rejects a worse native result" {
     var worse = oracle;
     worse.bond_crossings += 1;
     try std.testing.expect(!noWorseThan(oracle, worse, .{}));
+}
+
+test "inverting a published transform recovers the pose that produced it" {
+    // A reflection about x composed with a rotation and a translation, which is
+    // the shape of the transforms upstream's maybeFlip actually produces.
+    const angle: f64 = 0.7;
+    const cosine: f32 = @floatCast(@cos(angle));
+    const sine: f32 = @floatCast(@sin(angle));
+    // R(theta) * diag(1, -1): a reflection about x followed by a rotation.
+    const transform = [6]f32{ cosine, sine, sine, -cosine, 17.5, -4.25 };
+    try std.testing.expect(transformReflects(transform));
+
+    const before = [_]Point{
+        .{ .x = 0, .y = 0 },
+        .{ .x = 50, .y = 0 },
+        .{ .x = 25, .y = 43.3 },
+    };
+    var after: [before.len]Point = undefined;
+    for (before, &after) |point, *destination| destination.* = .{
+        .x = transform[0] * point.x + transform[1] * point.y + transform[4],
+        .y = transform[2] * point.x + transform[3] * point.y + transform[5],
+    };
+
+    var recovered: [before.len]Point = undefined;
+    try invertComponentTransform(transform, &after, &recovered);
+    for (before, recovered) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected.x, actual.x, 0.01);
+        try std.testing.expectApproxEqAbs(expected.y, actual.y, 0.01);
+    }
+
+    // A proper rotation reports no reflection, and a collapsed fit is refused
+    // rather than silently producing a pose.
+    try std.testing.expect(!transformReflects(.{ cosine, -sine, sine, cosine, 0, 0 }));
+    try std.testing.expectError(
+        error.SingularTransform,
+        invertComponentTransform(.{ 0, 0, 0, 0, 0, 0 }, &after, &recovered),
+    );
 }

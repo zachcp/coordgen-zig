@@ -10,10 +10,12 @@
 //! the duplicate-symbol failure cgz-r28 records. The public C entry point has
 //! its own end-to-end coverage in `tests/abi_layout.c`.
 //!
-//! Scope of this runner is the eight public observables. The probe seams
-//! (Morgan ranks, rings, fragments, DOFs, template mappings, components) need
-//! a native probe surface that does not exist yet; they are named in the
-//! parity manifest and remain this bead's outstanding work.
+//! The gate is the eight public observables. Alongside them the runner reports
+//! one probe seam, the pose each side holds immediately before global
+//! orientation, which localises a coordinate divergence to the layout stages or
+//! to orientation (cgz-7v2.4.2.1). The remaining seams (Morgan ranks, rings,
+//! fragments, DOFs, template mappings, components) are named in the parity
+//! manifest and still need native probe records.
 //!
 //! Usage: native-oracle-diff --partition NAME [--count N] --ceiling PATH
 //!        [--tolerance BOND_LENGTHS] [--baseline PATH]
@@ -29,6 +31,14 @@ const comparison = conformance.comparison;
 
 extern fn coordgen_generate(input: *const c_abi.Input, result: *c_abi.Result) u32;
 extern fn coordgen_result_free(result: *c_abi.Result) void;
+/// The oracle's conformance-only surface, linked from the same library. Only
+/// its component transforms are read here: they carry the oracle's own
+/// pre-orientation pose, recoverable by inverting them (cgz-7v2.4.2.1).
+extern fn coordgen_probe_generate(
+    input: *const c_abi.Input,
+    result: *conformance.probe_types.ProbeResult,
+) u32;
+extern fn coordgen_probe_result_free(result: *conformance.probe_types.ProbeResult) void;
 
 /// The published prior from SUCCESS_CRITERIA.md. It bounds the *oracle's* own
 /// float sensitivity, not the port's, and recalibrating it against the first
@@ -64,6 +74,10 @@ const Totals = struct {
     max_deviation_bond_lengths: f64 = 0,
     max_deviation_member: [64]u8 = @splat(0),
     max_deviation_member_len: usize = 0,
+    /// The pre-orientation stage is reported, not gated: it localises a
+    /// divergence the public observables already catch (cgz-7v2.4.2.1).
+    pre_orientation_compared: u32 = 0,
+    pre_orientation_mismatched: u32 = 0,
 
     fn recordDeviation(self: *Totals, member: []const u8, deviation: f64) void {
         if (deviation <= self.max_deviation_bond_lengths) return;
@@ -219,6 +233,7 @@ fn compareMember(
     defer coordgen_result_free(&oracle_result);
 
     const native_input = api.Input{ .atoms = native_atoms, .bonds = native_bonds };
+    const native_probe_input = native_input;
     var native_value = api.generate(gpa, native_input) catch |err| {
         const native_status = @backingInt(core.errors.code(err));
         if (oracle_status == native_status) {
@@ -250,6 +265,8 @@ fn compareMember(
         );
         return;
     }
+
+    try comparePreOrientation(gpa, report, native_probe_input, oracle_input, oracle_result, native_value, member, tolerance, totals);
 
     for (public_observables, 0..) |observable, slot| {
         const row = ceiling.find(member, observable) catch |err|
@@ -307,6 +324,122 @@ fn compareMember(
             }
         }
     }
+}
+
+/// Compare the two implementations one stage earlier than the final
+/// coordinates, at the pose each holds immediately before global orientation.
+///
+/// Neither side needs new instrumentation: native reports the stage through its
+/// own probe surface, and the oracle's is recovered by inverting the transform
+/// its hook already publishes. Reported, never gating — the gate remains the
+/// public observables, and this exists so that a failure there says *which*
+/// stage diverged instead of only that one did (cgz-7v2.4.2.1).
+///
+/// Reflection is reported at both stages rather than tolerated at either. A
+/// mirrored pose is a divergence under COMPARISON_SEMANTICS.md, and knowing
+/// whether it arrived before orientation or was introduced by it is the whole
+/// point of splitting the comparison.
+fn comparePreOrientation(
+    gpa: std.mem.Allocator,
+    report: *std.Io.Writer,
+    native_input: api.Input,
+    oracle_input: c_abi.Input,
+    oracle_result: c_abi.Result,
+    native_value: api.Result,
+    member: []const u8,
+    tolerance: f64,
+    totals: *Totals,
+) !void {
+    var probe: conformance.probe_types.ProbeResult = undefined;
+    if (coordgen_probe_generate(&oracle_input, &probe) != 0) return;
+    defer coordgen_probe_result_free(&probe);
+
+    const components = probe.componentSlice();
+    // One component is the case the reconstruction is defined for: with several,
+    // each carries its own transform and the atom-to-component mapping would
+    // have to be applied per atom before inverting. Reported as skipped rather
+    // than silently omitted.
+    if (components.len != 1 or
+        components[0].transform_status != .observed)
+    {
+        try report.print(
+            "{s}/pre_orientation: not reconstructible ({d} components)\n",
+            .{ member, components.len },
+        );
+        return;
+    }
+
+    var stages = conformance.native_probe.generateStages(gpa, native_input) catch |err| {
+        try report.print("{s}/pre_orientation: native probe failed ({t})\n", .{ member, err });
+        return;
+    };
+    defer stages.deinit();
+
+    // One generation feeding two readings is only sound if it agrees with the
+    // public entry point. Checked, not assumed: a disagreement is a
+    // nondeterminism finding and it fails the run.
+    if (stages.coordinates.len != native_value.coordinates.len) return error.NativeProbeLengthMismatch;
+    for (stages.coordinates, native_value.coordinates) |probe_point, public_point| {
+        if (probe_point.x != public_point.x or probe_point.y != public_point.y) {
+            totals.status_mismatches += 1;
+            try report.print(
+                "{s}/pre_orientation: the probe and public entry points disagree on the final pose\n",
+                .{member},
+            );
+            return;
+        }
+    }
+
+    const len: usize = @intCast(oracle_result.coordinates.len);
+    if (len != stages.pre_orientation.len) return error.NativeProbeLengthMismatch;
+    const oracle_final = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(oracle_final);
+    const oracle_before = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(oracle_before);
+    const native_before = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(native_before);
+    const raw = oracle_result.coordinates.ptr.?;
+    for (oracle_final, native_before, stages.pre_orientation, 0..) |*reference, *candidate, point, i| {
+        reference.* = .{ .x = raw[i].x, .y = raw[i].y };
+        candidate.* = .{ .x = point.x, .y = point.y };
+    }
+    comparison.invertComponentTransform(components[0].transform, oracle_final, oracle_before) catch |err| {
+        try report.print("{s}/pre_orientation: {t}\n", .{ member, err });
+        return;
+    };
+
+    const direct = try comparison.compareCoordinates(oracle_before, native_before, tolerance, .{});
+    totals.pre_orientation_compared += 1;
+    const orientation = if (comparison.transformReflects(components[0].transform)) "reflects" else "rotates";
+    if (direct.matches) {
+        try report.print(
+            "{s}/pre_orientation: {d:.4}, matched; oracle orientation {s}\n",
+            .{ member, direct.max_deviation_bond_lengths, orientation },
+        );
+        return;
+    }
+    totals.pre_orientation_mismatched += 1;
+    // Only once the direct reading has failed is a reflected one worth taking,
+    // and it is diagnosis alone: it never decides whether anything matched, it
+    // says whether the residual is a mirror. Note that it answers that
+    // reliably only when the residual is small — this runner aligns on two
+    // anchor atoms rather than by best fit, so a large residual makes the two
+    // readings a weak comparison rather than a verdict.
+    const mirrored = try comparison.compareCoordinates(
+        oracle_before,
+        native_before,
+        tolerance,
+        .{ .achiral_proof = "diagnostic only, never a pass" },
+    );
+    try report.print(
+        "{s}/pre_orientation: {d:.4} direct, {d:.4} reflected; oracle orientation {s}\n",
+        .{
+            member,
+            direct.max_deviation_bond_lengths,
+            mirrored.max_deviation_bond_lengths,
+            orientation,
+        },
+    );
 }
 
 fn compareCoordinateObservable(
@@ -404,6 +537,15 @@ fn writeSummary(
         }
         try report.print("\n", .{});
     }
+    if (totals.pre_orientation_compared != 0) {
+        try report.print(
+            "  pre-orientation stage: {d}/{d} matched (reported, not gated)\n",
+            .{
+                totals.pre_orientation_compared - totals.pre_orientation_mismatched,
+                totals.pre_orientation_compared,
+            },
+        );
+    }
     if (totals.max_deviation_member_len != 0) {
         try report.print(
             "  max coordinate deviation: {d:.6} bond lengths ({s})\n",
@@ -430,6 +572,12 @@ fn writeBaseline(
         "# max_deviation_bond_lengths\t{d:.6}\t{s}\n",
         .{ totals.max_deviation_bond_lengths, totals.worstMember() },
     );
+    // A header line rather than an observable row: the stage is reported, not
+    // gated, and the row schema is what the gate reads.
+    try writer.print("# pre_orientation_compared\t{d}\t{d}\n", .{
+        totals.pre_orientation_compared,
+        totals.pre_orientation_mismatched,
+    });
     try writer.print("observable\tcompared\tmismatched\tceiling_applied\n", .{});
     for (public_observables, counters) |observable, counter| {
         try writer.print("{t}\t{d}\t{d}\t{d}\n", .{

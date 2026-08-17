@@ -47,6 +47,12 @@ pub const Outputs = struct {
     effective_bond_orders: ?[]core.chemistry.BondOrder = null,
     bond_displays: ?[]core.chemistry.BondDisplay = null,
     atom_stereo: ?[]core.chemistry.AtomStereo = null,
+    /// The pose as it stands immediately before global orientation, in caller
+    /// input order. Conformance-only: the oracle publishes the same stage
+    /// through its probe hook, and comparing there separates a layout
+    /// divergence from an orientation one, which the final coordinates alone
+    /// cannot (cgz-7v2.4.2.1). No production caller requests it.
+    pre_orientation: ?[]core.math.Vec2 = null,
 };
 
 /// Compose validated safe-API-shaped input through native preparation,
@@ -73,6 +79,9 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
     }
     if (outputs.bond_displays) |slice| {
         if (slice.len != input.bonds.len) return error.InvalidMapping;
+    }
+    if (outputs.pre_orientation) |slice| {
+        if (slice.len != input.atoms.len) return error.InvalidMapping;
     }
     try rejectOutOfScope(input);
     var prepared = try topology.prepareInput(allocator, input);
@@ -144,6 +153,12 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
             fragmentation,
             input.options.even_angles,
         );
+    }
+    if (outputs.pre_orientation) |slice| {
+        for (prepared.working.atoms, prepared.working.order.internal_to_input) |atom, input_index| {
+            if (input_index >= slice.len) return error.InvalidMapping;
+            slice[input_index] = atom.coordinates;
+        }
     }
     try components.orientComponents(
         allocator,

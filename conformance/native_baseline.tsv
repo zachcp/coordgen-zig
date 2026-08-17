@@ -3,6 +3,7 @@
 # members	7
 # tolerance_bond_lengths	0.100000
 # max_deviation_bond_lengths	5.088188	drug_like/1
+# pre_orientation_compared	7	3
 observable	compared	mismatched	ceiling_applied
 clean_pose	7	1	0
 coordinates	7	3	0
