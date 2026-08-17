@@ -301,14 +301,6 @@ fn optimizeDiscrete(
         }
         scoring_interactions = filtered_interactions[0..filtered_count];
     }
-    if (dofs.items.len == 0) {
-        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
-        defer allocator.free(coordinates);
-        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
-        const clash_energy = try optimize.discrete.scoreClashInteractions(scoring_interactions, coordinates);
-        return clash_energy < optimize.discrete.clash_energy_threshold;
-    }
-
     const bond_views = allocator.alloc(optimize.discrete.BondScoreView, bonds.len) catch return error.OutOfMemory;
     defer allocator.free(bond_views);
     for (bonds, bond_views) |bond, *view| {
@@ -335,6 +327,22 @@ fn optimizeDiscrete(
         .fragment = fragmentation.atom_fragment[rings.atoms(ring.id)[0].index()],
     };
 
+    var score_context = DiscreteScoreContext{
+        .interactions = scoring_interactions,
+        .bonds = bond_views,
+        .rings = ring_views,
+        .atom_fragments = fragmentation.atom_fragment,
+        .fragmentation = fragmentation,
+    };
+    {
+        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
+        defer allocator.free(coordinates);
+        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+        const initial = try scoreDiscretePose(&score_context, coordinates, dofs.items);
+        if (initial < optimize.discrete.clash_energy_threshold) return true;
+    }
+    if (dofs.items.len == 0) return false;
+
     var frame_data = try layout.captureFragmentFrames(allocator, atoms, bonds, fragmentation);
     defer frame_data.deinit();
     const local_atoms = allocator.dupe(core.math.Vec2, frame_data.atom_coordinates) catch return error.OutOfMemory;
@@ -343,13 +351,6 @@ fn optimizeDiscrete(
     defer allocator.free(local_attachments);
     const global = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(global);
-    var score_context = DiscreteScoreContext{
-        .interactions = scoring_interactions,
-        .bonds = bond_views,
-        .rings = ring_views,
-        .atom_fragments = fragmentation.atom_fragment,
-        .fragmentation = fragmentation,
-    };
     var evaluator = optimize.discrete.FramePoseEvaluator{
         .dofs = dofs.items,
         .affected_atoms = dofs.affected_atoms,
