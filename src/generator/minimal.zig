@@ -145,12 +145,13 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
             input.options.even_angles,
         );
     }
-    try components.orientAcyclicComponents(
+    try components.orientComponents(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
         prepared.graph,
         prepared.rings,
+        fragmentation,
     );
     if (proximity_relations.len == 0 and residue_atoms.len == 0) {
         try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);

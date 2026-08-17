@@ -123,6 +123,29 @@ fn isCipFirst(
     return false;
 }
 
+/// `CoordgenMinimizer::getChetoCs`' membership test for one atom: a carbon
+/// carrying a double bond to an oxygen. Shared with the global orientation
+/// stage, which classifies peptides from the same three predicates without the
+/// two-of-each-class guard this file's constraint builder applies (cgz-r31.1).
+pub fn isChetoCarbon(
+    atom: core.ids.AtomId,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+) core.errors.Error!bool {
+    if (atom.index() >= atoms.len) return error.InvalidMapping;
+    if (atoms[atom.index()].atomic_number != .carbon) return false;
+    for (graph.neighbors(atom)) |neighbor| {
+        if (neighbor.index() >= atoms.len) return error.InvalidMapping;
+        if (atoms[neighbor.index()].atomic_number != .oxygen) continue;
+        const bond_id = bondBetween(graph, atom, neighbor) orelse continue;
+        if (bond_id.index() >= bonds.len) return error.InvalidMapping;
+        if (bonds[bond_id.index()].effective_order != .double) continue;
+        return true;
+    }
+    return false;
+}
+
 fn bondBetween(
     graph: topology.Graph,
     first: core.ids.AtomId,
@@ -265,15 +288,9 @@ pub fn buildPeptideBondInversionConstraints(
             continue;
         }
         if (atom.atomic_number != .carbon) continue;
-        for (graph.neighbors(atom.id)) |neighbor| {
-            if (neighbor.index() >= atoms.len) return error.InvalidMapping;
-            if (atoms[neighbor.index()].atomic_number != .oxygen) continue;
-            const bond_id = bondBetween(graph, atom.id, neighbor) orelse continue;
-            if (bond_id.index() >= bonds.len) return error.InvalidMapping;
-            if (bonds[bond_id.index()].effective_order != .double) continue;
+        if (try isChetoCarbon(atom.id, atoms, bonds, graph)) {
             cheto_carbons[index] = true;
             cheto_count += 1;
-            break;
         }
     }
     if (cheto_count < 2 or amino_count < 2) return allocator.alloc(core.interaction.EzConstraint, 0) catch
