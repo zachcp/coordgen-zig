@@ -370,10 +370,29 @@ fn optimizeDiscrete(
     const atom_fragments = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_fragments);
     for (fragmentation.atom_fragment, atom_fragments) |fragment, *output| output.* = fragment.index();
-    var interactions = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
+    var base = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
         .intrafragment_clashes = false,
         .atom_fragments = atom_fragments,
         .atom_has_dofs = atom_has_dofs,
+    });
+    defer base.deinit();
+    // Upstream's discrete pass is addClashInteractionsOfMolecule followed by
+    // addPeptideBondInversionConstraintsOfMolecule, and only then scoreClashes
+    // and flipFragments (CoordgenMinimizer.cpp:1254-1263). The peptide
+    // constraints therefore influence the clean-pose verdict, not just the
+    // geometry.
+    const peptide_constraints = try inversions.buildPeptideBondInversionConstraints(
+        allocator,
+        atoms,
+        bonds,
+        graph,
+    );
+    defer allocator.free(peptide_constraints);
+    var peptide_interactions = try optimize.buildEzInteractions(allocator, peptide_constraints);
+    defer peptide_interactions.deinit();
+    var interactions = try optimize.combineInteractions(allocator, &.{
+        base.items,
+        peptide_interactions.items,
     });
     defer interactions.deinit();
     var filtered_interactions: []core.interaction.Interaction = &.{};

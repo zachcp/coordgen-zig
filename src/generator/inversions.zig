@@ -226,3 +226,182 @@ test "a small ring contributes nothing even with a stereo bond" {
     defer testing.allocator.free(constraints);
     try testing.expectEqual(@as(usize, 0), constraints.len);
 }
+
+/// Peptide bond inversion constraints for the DISCRETE pass
+/// (`addPeptideBondInversionConstraintsOfMolecule`). Upstream adds these to
+/// the interaction set that `scoreClashes` and therefore `flipFragments` read,
+/// not to the minimization set, so they influence the clean-pose verdict.
+///
+/// Upstream walks `std::set<sketcherMinimizerAtom*>`, whose iteration order is
+/// pointer order and therefore allocation-address order. This walks atoms in
+/// index order instead. That is a correction rather than an emulation, in the
+/// same family as the other heap-order corrections this port makes: the
+/// emitted set is identical, only its order is made deterministic.
+pub fn buildPeptideBondInversionConstraints(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+) core.errors.Error![]core.interaction.EzConstraint {
+    const cheto_carbons = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(cheto_carbons);
+    const amino_nitrogens = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(amino_nitrogens);
+    const alpha_carbons = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(alpha_carbons);
+    @memset(cheto_carbons, false);
+    @memset(amino_nitrogens, false);
+    @memset(alpha_carbons, false);
+
+    var cheto_count: usize = 0;
+    var amino_count: usize = 0;
+    var alpha_count: usize = 0;
+
+    for (atoms) |atom| {
+        const index = atom.id.index();
+        if (atom.atomic_number == .nitrogen) {
+            amino_nitrogens[index] = true;
+            amino_count += 1;
+            continue;
+        }
+        if (atom.atomic_number != .carbon) continue;
+        for (graph.neighbors(atom.id)) |neighbor| {
+            if (neighbor.index() >= atoms.len) return error.InvalidMapping;
+            if (atoms[neighbor.index()].atomic_number != .oxygen) continue;
+            const bond_id = bondBetween(graph, atom.id, neighbor) orelse continue;
+            if (bond_id.index() >= bonds.len) return error.InvalidMapping;
+            if (bonds[bond_id.index()].effective_order != .double) continue;
+            cheto_carbons[index] = true;
+            cheto_count += 1;
+            break;
+        }
+    }
+    if (cheto_count < 2 or amino_count < 2) return allocator.alloc(core.interaction.EzConstraint, 0) catch
+        return error.OutOfMemory;
+
+    for (atoms) |atom| {
+        const index = atom.id.index();
+        if (atom.atomic_number != .carbon or cheto_carbons[index]) continue;
+        var bonded_to_cheto = false;
+        var bonded_to_amino = false;
+        for (graph.neighbors(atom.id)) |neighbor| {
+            if (cheto_carbons[neighbor.index()]) bonded_to_cheto = true;
+            if (amino_nitrogens[neighbor.index()]) bonded_to_amino = true;
+        }
+        if (bonded_to_cheto and bonded_to_amino) {
+            alpha_carbons[index] = true;
+            alpha_count += 1;
+        }
+    }
+    if (alpha_count < 2) return allocator.alloc(core.interaction.EzConstraint, 0) catch
+        return error.OutOfMemory;
+
+    var constraints: std.ArrayList(core.interaction.EzConstraint) = .empty;
+    defer constraints.deinit(allocator);
+    const sequences = [_][4][]const bool{
+        .{ cheto_carbons, amino_nitrogens, alpha_carbons, cheto_carbons },
+        .{ amino_nitrogens, alpha_carbons, cheto_carbons, amino_nitrogens },
+        .{ alpha_carbons, cheto_carbons, amino_nitrogens, alpha_carbons },
+    };
+    for (sequences) |sequence| {
+        try appendSequenceMatches(allocator, &constraints, atoms, graph, sequence);
+    }
+    return constraints.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+/// Four bonded atoms drawn from the four sets in order, with no distinctness
+/// requirement - upstream imposes none.
+fn appendSequenceMatches(
+    allocator: std.mem.Allocator,
+    constraints: *std.ArrayList(core.interaction.EzConstraint),
+    atoms: []const model.Atom,
+    graph: topology.Graph,
+    sets: [4][]const bool,
+) core.errors.Error!void {
+    for (atoms) |atom| {
+        if (!sets[0][atom.id.index()]) continue;
+        for (graph.neighbors(atom.id)) |second| {
+            if (!sets[1][second.index()]) continue;
+            for (graph.neighbors(second)) |third| {
+                if (!sets[2][third.index()]) continue;
+                for (graph.neighbors(third)) |fourth| {
+                    if (!sets[3][fourth.index()]) continue;
+                    constraints.append(allocator, .{
+                        .side_a = atom.id,
+                        .double_a = second,
+                        .double_b = third,
+                        .side_b = fourth,
+                        // Upstream passes cis = false for every peptide group.
+                        .is_z = false,
+                    }) catch return error.OutOfMemory;
+                }
+            }
+        }
+    }
+}
+
+test "a dipeptide backbone yields peptide constraints and a plain chain yields none" {
+    // C(=O)-N-C(alpha)-C(=O)-N-C(alpha): two cheto carbons, two nitrogens,
+    // two alpha carbons.
+    const atoms = [_]model.Atom{
+        .{ .id = core.ids.AtomId.fromIndex(0), .input_index = 0, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(1), .input_index = 1, .atomic_number = .oxygen },
+        .{ .id = core.ids.AtomId.fromIndex(2), .input_index = 2, .atomic_number = .nitrogen },
+        .{ .id = core.ids.AtomId.fromIndex(3), .input_index = 3, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(4), .input_index = 4, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(5), .input_index = 5, .atomic_number = .oxygen },
+        .{ .id = core.ids.AtomId.fromIndex(6), .input_index = 6, .atomic_number = .nitrogen },
+        .{ .id = core.ids.AtomId.fromIndex(7), .input_index = 7, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(8), .input_index = 8, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(9), .input_index = 9, .atomic_number = .oxygen },
+    };
+    const bonds = [_]model.Bond{
+        peptideBond(0, 0, 1, .double),
+        peptideBond(1, 0, 2, .single),
+        peptideBond(2, 2, 3, .single),
+        peptideBond(3, 3, 4, .single),
+        peptideBond(4, 4, 5, .double),
+        peptideBond(5, 4, 6, .single),
+        peptideBond(6, 6, 7, .single),
+        peptideBond(7, 7, 8, .single),
+        peptideBond(8, 8, 9, .double),
+    };
+    var graph = try topology.Graph.init(testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+
+    const constraints = try buildPeptideBondInversionConstraints(
+        testing.allocator,
+        &atoms,
+        &bonds,
+        graph,
+    );
+    defer testing.allocator.free(constraints);
+    try testing.expect(constraints.len > 0);
+    for (constraints) |constraint| try testing.expect(!constraint.is_z);
+
+    // The same skeleton without nitrogens has no peptide backbone at all.
+    var carbons = atoms;
+    carbons[2].atomic_number = .carbon;
+    carbons[6].atomic_number = .carbon;
+    var plain_graph = try topology.Graph.init(testing.allocator, &carbons, &bonds);
+    defer plain_graph.deinit();
+    const none = try buildPeptideBondInversionConstraints(
+        testing.allocator,
+        &carbons,
+        &bonds,
+        plain_graph,
+    );
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+fn peptideBond(index: u32, start: u32, end: u32, order: core.chemistry.BondOrder) model.Bond {
+    return .{
+        .id = core.ids.BondId.fromIndex(index),
+        .input_index = index,
+        .start = core.ids.AtomId.fromIndex(start),
+        .end = core.ids.AtomId.fromIndex(end),
+        .input_order = order,
+        .effective_order = order,
+    };
+}
