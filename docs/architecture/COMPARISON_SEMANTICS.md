@@ -27,14 +27,13 @@ in [`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md). Note that the tier assignment
 inputs (`conformance/parity_expectations.tsv`) bound oracle against *perturbed
 oracle*; they are not native-vs-oracle tolerances.
 
-`SUCCESS_CRITERIA.md`'s tier-3 section still reads "on this corpus, coordinates
-on the 1414 arch-divergent adversarial members". That sentence predates
-`cgz-r13`, which rejected exactly that reading: demoting 70.7% of the
-adversarial corpus to the invariant tier would leave the port proving almost
-nothing about the observable it exists to produce, and the same-build rule means
-the runner never sees the architecture axis at all. `cgz-r13` governs. The
-invariant/statistical tier is **unpopulated** at the pin. Correcting `cgz-r14`'s
-text is a tightening and needs its own bead.
+`SUCCESS_CRITERIA.md`'s tier-3 section used to read "on this corpus,
+coordinates on the 1414 arch-divergent adversarial members". `cgz-r13` rejected
+exactly that reading: demoting 70.7% of the adversarial corpus to the invariant
+tier would leave the port proving almost nothing about the observable it exists
+to produce, and the same-build rule means the runner never sees the architecture
+axis at all. `cgz-r30` settled it — `cgz-r13` governs, the sentence is
+withdrawn, and the invariant/statistical tier is **unpopulated** at the pin.
 
 ## The differential runner's per-pair rule
 

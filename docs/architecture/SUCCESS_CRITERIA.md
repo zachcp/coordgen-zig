@@ -79,9 +79,38 @@ pass no longer means the layout matched.
 
 ## Tier 3 — invariant / statistical
 
-For input × observable pairs the oracle cannot reproduce under perturbation —
-on this corpus, coordinates on the 1414 arch-divergent adversarial members.
+For input × observable pairs the oracle cannot reproduce under perturbation.
 Aggregated per partition through `comparison.noWorseThan`.
+
+**This tier is unpopulated at the pin** (`cgz-r30`, applying `cgz-r13`).
+
+An earlier draft of this section read "on this corpus, coordinates on the 1414
+arch-divergent adversarial members". That is withdrawn. It was written the same
+afternoon as `cgz-r13`, on a parallel branch, and merged fifteen seconds after
+it; the two were never reconciled, so it is a merge race rather than a
+considered disagreement.
+
+Two independent reasons it cannot stand:
+
+1. **The runner cannot observe that axis.** Oracle and native execute in one
+   process, build, and target, enforced by `RunIdentity.requireSameBuild()`.
+   Both sides of every differential comparison therefore share an architecture,
+   so architecture divergence is not a difference the runner can see, let alone
+   excuse. This is structural, not a policy preference.
+2. **It would surrender the observable the port exists to produce.** 1414 of
+   2000 is 70.7% of the adversarial corpus. Demoting that to "no worse than the
+   oracle on aggregate quality metrics" would mean the port never proves its
+   coordinates match on the majority of its own corpus.
+
+The ceiling that *is* real is the heap-address-order axis, enumerated per
+(member, observable) in [`conformance/parity_ceiling.tsv`](../../conformance/parity_ceiling.tsv)
+(`cgz-r26`) — nine rows at the pin. Those members are held to a **tolerant**
+comparison against a published per-member bound, not excused to statistics:
+`adversarial/1695`'s 0.580 bond lengths sits inside a tolerant band, which is
+precisely why `cgz-r13` left this tier empty.
+
+The margins below remain the mechanism if a future measurement ever populates
+this tier. Nothing populates it today.
 
 **All five margins in `QualityMargins` stay at their zero defaults**:
 `clash_score`, `bond_length_rms`, `bond_angle_deviation`, `bond_crossings`,

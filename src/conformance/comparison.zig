@@ -63,6 +63,17 @@ pub fn baseTier(observable: Observable) Tier {
 /// Structural values are exact whenever their own stability record is exact.
 /// Coordinates and derived floats use normalized/tolerant comparisons only if
 /// the oracle is stable, otherwise they use the aggregate quality tier.
+///
+/// **Superseded for the differential runner; use `differentialComparison`.**
+/// This reads `Stability.exact()`, which is both axes, so it predates
+/// `cgz-r13`'s finding that the runner never observes the architecture axis
+/// (both sides share a build). Feeding it a member that is arch-unstable but
+/// order-stable yields `.invariant_statistical`, and `cgz-r30` records that
+/// the invariant tier is unpopulated at the pin — so that answer is wrong for
+/// any real comparison.
+///
+/// Kept rather than deleted because `cgz-r06` froze this tier vocabulary and
+/// the test below encodes its meaning; nothing on a live path calls it.
 pub fn tierFor(observable: Observable, stability: Stability) Tier {
     if (!stability.exact()) return .invariant_statistical;
     return baseTier(observable);
