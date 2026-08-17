@@ -4,6 +4,7 @@ const model = @import("model");
 const topology = @import("topology");
 const fragments = @import("fragments.zig");
 const macrocycle = @import("macrocycle.zig");
+const templates = @import("templates.zig");
 
 pub const bond_length: f32 = 50;
 const pi: f32 = std.math.pi;
@@ -11,6 +12,15 @@ const pi: f32 = std.math.pi;
 /// Generate deterministic local coordinates for ordinary rigid fragments.
 /// Template and macrocycle dispatch are deliberately owned by their later
 /// layers; this seam covers regular rings and the acyclic fallback.
+/// Placement controls that reach the ring path. `templates` is passed
+/// straight through to templates.findRingSet, which is where
+/// `load_templates` and the rejection of a runtime template directory are
+/// enforced.
+pub const Options = struct {
+    force_open_macrocycles: bool = false,
+    templates: templates.Options = .{},
+};
+
 pub fn initializeCoordinates(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
@@ -19,7 +29,7 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, false);
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, .{});
 }
 
 pub fn initializeCoordinatesWithOptions(
@@ -29,9 +39,9 @@ pub fn initializeCoordinatesWithOptions(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
-    force_open_macrocycles: bool,
+    options: Options,
 ) core.errors.Error!void {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, force_open_macrocycles);
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, options);
 }
 
 fn initializeCoordinatesInternal(
@@ -41,7 +51,7 @@ fn initializeCoordinatesInternal(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
-    force_open_macrocycles: bool,
+    options: Options,
 ) core.errors.Error!void {
     const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(placed);
@@ -50,7 +60,7 @@ fn initializeCoordinatesInternal(
     defer allocator.free(queue);
 
     for (fragmentation.fragments) |fragment| {
-        try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, force_open_macrocycles);
+        try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, options);
 
         const members = fragmentation.members(fragment.id);
         var head: usize = 0;
@@ -108,8 +118,18 @@ fn placeFragmentRings(
     fragmentation: fragments.Fragmentation,
     fragment: fragments.Fragment,
     placed: []bool,
-    force_open_macrocycles: bool,
+    options: Options,
 ) core.errors.Error!void {
+    // Upstream tries the template database for the whole ring system before
+    // placing any ring individually (CoordgenFragmentBuilder.cpp:211, inside
+    // generateCoordinatesCentralRings, which only reaches the per-ring
+    // buildRing loop when findTemplate returns false). Omitting this call was
+    // cgz-r35: every entry point of the template layer was unreachable, so a
+    // bridged bicyclic that upstream lays out from template 79 fell through to
+    // generic fused-ring placement and came out with crossing bonds.
+    if (try matchFragmentTemplate(allocator, atoms, bonds, membership, fragmentation, fragment, options, placed)) {
+        return;
+    }
     var remaining: usize = fragment.ring_count;
     while (remaining != 0) {
         var selected: ?model.Ring = null;
@@ -143,7 +163,7 @@ fn placeFragmentRings(
                 graph,
                 membership,
                 placed,
-                force_open_macrocycles,
+                options.force_open_macrocycles,
             ) == .matched) {
                 remaining -= 1;
                 continue;
@@ -187,6 +207,48 @@ fn placeFragmentRings(
     }
 }
 
+/// Collect this fragment's rings in ring order and try the template database
+/// against the whole system, mirroring findTemplate's first upstream call
+/// site. Returns true when the fragment was placed from a template, in which
+/// case no per-ring placement runs for it.
+///
+/// templates.findRingSet already declines a system of fewer than two rings and
+/// already honours `load_templates`, so both of upstream's guards live there
+/// rather than being restated here.
+fn matchFragmentTemplate(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+    options: Options,
+    placed: []bool,
+) core.errors.Error!bool {
+    var ring_ids: std.ArrayList(core.ids.RingId) = .empty;
+    defer ring_ids.deinit(allocator);
+    for (membership.rings) |ring| {
+        const ring_atoms = membership.atoms(ring.id);
+        if (ring_atoms.len < 3) continue;
+        if (fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
+        ring_ids.append(allocator, ring.id) catch return error.OutOfMemory;
+    }
+    if (ring_ids.items.len < 2) return false;
+
+    var match = (try templates.findRingSet(
+        allocator,
+        options.templates,
+        atoms.len,
+        bonds,
+        membership,
+        ring_ids.items,
+    )) orelse return false;
+    defer match.deinit();
+    try match.apply(atoms);
+    for (match.atoms) |atom_id| placed[atom_id.index()] = true;
+    return true;
+}
+
 fn openCycleAndGenerateCoordinates(
     allocator: std.mem.Allocator,
     ring: core.ids.RingId,
@@ -221,7 +283,7 @@ fn openCycleAndGenerateCoordinates(
         temporary_graph,
         temporary_rings,
         temporary_fragments,
-        true,
+        .{ .force_open_macrocycles = true },
     );
     for (atoms, temporary_atoms, placed) |*atom, temporary_atom, *is_placed| {
         if (graph.component(atom.id) != component) continue;
@@ -664,7 +726,7 @@ test "macrocycles dispatch through native polyomino placement" {
     try std.testing.expect(hex_edges > 0);
 
     const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
-    try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, true);
+    try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, .{ .force_open_macrocycles = true });
     for (bonds) |bond| {
         if (bond.id == opened) continue;
         try std.testing.expectApproxEqAbs(
@@ -718,7 +780,7 @@ fn layoutWithOptionsAndDiscard(
 ) !void {
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
-    try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, force_open_macrocycles);
+    try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, .{ .force_open_macrocycles = force_open_macrocycles });
 }
 
 fn captureFramesAndDiscard(

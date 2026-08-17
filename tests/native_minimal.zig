@@ -409,7 +409,7 @@ test "minimal native generation runs discrete search for macrocycle substituents
         const dy = first.coordinates[bond.start].y - first.coordinates[bond.end].y;
         try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(dx * dx + dy * dy), 0.01);
     }
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+    try checkStableProteinAllocations(std.testing.allocator, input);
 }
 
 test "minimal native generation arranges disconnected neutral components" {

@@ -4,8 +4,8 @@
 # tolerance_bond_lengths	0.100000
 # max_deviation_bond_lengths	8.113738	drug_like/3
 observable	compared	mismatched	ceiling_applied
-clean_pose	7	2	0
-coordinates	7	5	0
+clean_pose	7	1	0
+coordinates	7	4	0
 input_to_internal	7	0	0
 internal_to_input	7	0	0
 effective_bond_orders	7	0	0

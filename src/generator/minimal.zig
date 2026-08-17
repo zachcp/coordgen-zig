@@ -105,7 +105,13 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.graph,
         prepared.rings,
         fragmentation,
-        input.options.force_open_macrocycles,
+        .{
+            .force_open_macrocycles = input.options.force_open_macrocycles,
+            .templates = .{
+                .load_templates = input.options.load_templates,
+                .template_directory = input.options.template_directory,
+            },
+        },
     );
     const clean_pose = try optimizeDiscrete(
         allocator,
