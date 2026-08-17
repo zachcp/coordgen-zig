@@ -9,12 +9,31 @@ contracts in the existing architecture documents remain authoritative.
 
 The Phase 1 geometry and graph foundations landed as `cgz-7v2.9` and
 `cgz-7v2.10`, but the Phase 2–5 implementation beads promised by `cgz-7v2`
-were never created. The `layout`, `optimize`, and `generator` build modules are
-still empty-module stubs, and a structurally valid call to
-`coordgen_generate` returns `unsupported`. This document closes that planning
-gap. It maps the pinned C++ implementation to one native owner per component,
-defines the integration order, and names the conformance evidence required at
-each seam.
+were never created. When this document was written the `layout`, `optimize`,
+and `generator` build modules were empty-module stubs. This document closes
+that planning gap. It maps the pinned C++ implementation to one native owner
+per component, defines the integration order, and names the conformance
+evidence required at each seam.
+
+## Current state (2026-08-16)
+
+Every module this plan decomposes is implemented and merged. `cgz-7v2.12`
+through `cgz-7v2.20` all landed in PRs #19 and #20 and are closed; `src/` is
+~19,400 lines and CI is green on `main`.
+
+What has not happened is integration. A structurally valid call to
+`coordgen_generate` still returns `unsupported`
+(`src/c_abi/exports.zig`), `src/api.zig` exposes no public `generate`, and the
+only caller of the pipeline is `generator.minimal.generateValidated`. That
+wiring is `cgz-7v2.21`, and until it lands **no native output has ever been
+compared against the oracle** — the tolerance `T` in
+[`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md) is still a prior taken from the
+oracle's own float sensitivity, and the performance gate is still deliberately
+red with no threshold.
+
+The beads for this decomposition were created retroactively on 2026-08-16,
+eleven days after the work merged. See `cgz-r29` for why that happened and
+what should prevent the next one.
 
 In the tables below, `P/` means the pinned package root recorded by
 `upstream/coordgenlibs.lock` and materialized by Zig under its content hash.
@@ -280,3 +299,35 @@ previously missing from:
 
 Those dependencies must point to the concrete integration bead. Their existing
 non-generation slices remain valid and must not be reopened.
+
+As of 2026-08-16 that integration bead is `cgz-7v2.21`, it exists, and all six
+edges above are recorded in the database. Each of the five validation beads
+also carries a note distinguishing the slice that already merged from the slice
+that waits on generation, so none of them is reopened wholesale.
+
+## Remaining sequence
+
+1. **`cgz-7v2.21` — wire public generation.** Nothing else can start. The
+   ABI/consumer tests that currently assert `unsupported` are part of this
+   diff, and unsupported domains must return a specific error rather than a
+   silently-empty success.
+2. **`cgz-r26` — give the enumerated parity ceiling a portable home.** Wanted
+   before the differential runner, not after: the runner has to know per member
+   whether an exact claim is owed, and neither existing artifact can tell it
+   portably. This is decidable today and does not wait on step 1.
+3. **`cgz-7v2.4.2` — differential runner, then the first native baseline.**
+   That single baseline discharges two deferred numbers: it recalibrates `T`
+   (which today bounds the *oracle's* float sensitivity, not the port's) and it
+   sets the per-bucket performance ratio for `cgz-7v2.4.7`. Lowering `T` is
+   free; raising it needs a decision bead.
+4. **Fan out the remaining validation slices** — `cgz-7v2.4.3` generation-level
+   property/OOM/concurrency, `cgz-7v2.4.4` fuzzing (which also owns failure 2
+   of `cgz-r27`, the 0-byte crash seed), `cgz-7v2.4.6` installed native
+   generation, `cgz-7v2.4.7` ratios, `cgz-r16` C-entry OOM probes. These are
+   independent of each other once step 3 exists.
+5. **`cgz-7v2.4.8` — final validation audit and scoped parity report.**
+
+Two open items are cheap now and expensive later: `cgz-r25` (the
+`build_from_fragments` slot is frozen in the public option table and step 1
+freezes public generation around it) and `cgz-7v2.3` (owner-controlled mirrors
+for the pinned archives, which every gate above assumes will keep resolving).

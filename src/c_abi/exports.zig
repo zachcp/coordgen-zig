@@ -157,11 +157,12 @@ fn validateResidueInteractionField(
 /// through the C representation. `too_many_items` is not: every span's `len`
 /// is already a `uint32_t` in the ABI, so the u32-overflow case
 /// api.Input.validate() guards against for the wider Zig `usize` slices
-/// cannot occur through this entry point. The discrete/continuous
-/// coordinate-generation pipeline (the topology, layout, optimize, and
-/// generator layers) is not wired yet, so a structurally valid input
-/// deliberately returns `unsupported` rather than a silently-empty result;
-/// see the epic's generator beads under cgz-7v2.4.
+/// cannot occur through this entry point. The topology, layout, optimize, and
+/// generator layers are all implemented, but nothing calls them from here yet,
+/// so a structurally valid input deliberately returns `unsupported` rather
+/// than a silently-empty result. Wiring this entry point to the pipeline is
+/// cgz-7v2.21; the assertions below at `expect = .unsupported` are part of
+/// that bead's diff.
 export fn coordgen_generate(input: *const Input, result: *Result) callconv(.c) core.errors.ErrorCode {
     result.* = .{};
 
