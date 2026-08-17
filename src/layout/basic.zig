@@ -98,6 +98,15 @@ fn initializeCoordinatesInternal(
                 if (fragmentation.atom_fragment[neighbor.index()] == fragment.id and !placed[neighbor.index()]) unplaced_count += 1;
             }
             if (unplaced_count == 0) continue;
+            // Upstream splits on whether the centre is a ring atom
+            // (initializeVariablesForNeighboursCoordinates). The ring-atom
+            // branch is transcribed; the acyclic branch still uses native's
+            // fixed spread and is cgz-7v2.29's remaining half.
+            if (membership.atomRings(center).len != 0 and
+                try placeRingAtomSubstituents(atoms, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail))
+            {
+                continue;
+            }
             const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
             var generated: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
@@ -975,6 +984,174 @@ fn orderRing(allocator: std.mem.Allocator, ring: model.Ring, bonds: []const mode
         result[index] = next;
     }
     return result;
+}
+
+/// `initializeVariablesForNeighboursCoordinatesRingAtom`: place a ring atom's
+/// non-ring substituents inside the widest *scaled* gap between its ring
+/// neighbours, rather than at a fixed offset from an arbitrary one.
+///
+/// Native previously took the first placed neighbour it found, added pi/3, and
+/// spread the rest by 2*pi/3. On a fused quaternary carbon that picks between
+/// two candidate gaps effectively at random, and choosing the wrong one puts a
+/// methyl exactly two bond lengths from where upstream puts it - which is
+/// drug_like/1's whole remaining residual (cgz-7v2.29, cgz-r31).
+///
+/// Returns false when the centre has no ring neighbour with coordinates, so the
+/// caller keeps its own fallback rather than this inventing one.
+fn placeRingAtomSubstituents(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: core.ids.FragmentId,
+    center: core.ids.AtomId,
+    placed: []bool,
+    queue: []core.ids.AtomId,
+    tail: *usize,
+) core.errors.Error!bool {
+    const origin = atoms[center.index()].coordinates;
+    var ring_angles: [16]f32 = undefined;
+    var ring_neighbours: [16]core.ids.AtomId = undefined;
+    var ring_count: usize = 0;
+    // Upstream's orderedNeighbors for this branch is every non-ring neighbour,
+    // visited ones included: they are skipped when placing but still divide the
+    // gap, so the divisor counts them.
+    var substituents: [16]core.ids.AtomId = undefined;
+    var substituent_count: usize = 0;
+    for (graph.neighbors(center)) |neighbor| {
+        if (sharesRing(membership, center, neighbor)) {
+            if (ring_count == ring_angles.len) return false;
+            var angle = std.math.atan2(
+                atoms[neighbor.index()].coordinates.y - origin.y,
+                atoms[neighbor.index()].coordinates.x - origin.x,
+            );
+            if (angle < 0) angle += 2 * pi;
+            ring_angles[ring_count] = angle;
+            ring_neighbours[ring_count] = neighbor;
+            ring_count += 1;
+        } else {
+            if (substituent_count == substituents.len) return false;
+            substituents[substituent_count] = neighbor;
+            substituent_count += 1;
+        }
+    }
+    if (ring_count == 0 or substituent_count == 0) return false;
+
+    // Stable insertion sort by angle. Upstream stable_sorts pairs, whose
+    // secondary key is the atom pointer; sorting on the angle alone and keeping
+    // insertion order for exact ties is the order-stable reading of that
+    // (cgz-r13), and two ring bonds at an identical angle is degenerate anyway.
+    var i: usize = 1;
+    while (i < ring_count) : (i += 1) {
+        var j = i;
+        while (j > 0 and ring_angles[j - 1] > ring_angles[j]) : (j -= 1) {
+            std.mem.swap(f32, &ring_angles[j - 1], &ring_angles[j]);
+            std.mem.swap(core.ids.AtomId, &ring_neighbours[j - 1], &ring_neighbours[j]);
+        }
+    }
+
+    var best: usize = 0;
+    var best_scaled: f32 = -1;
+    var best_gap: f32 = 0;
+    for (0..ring_count) |index| {
+        const next = (index + 1) % ring_count;
+        var gap = ring_angles[next] - ring_angles[index];
+        if (gap < 0) gap += 2 * pi;
+        var scaled = gap;
+        if (gap > pi) {
+            // A reflex gap is the outside of the ring system, and upstream
+            // strongly prefers it.
+            scaled *= 10;
+        } else if (gapPointsIntoRing(atoms, membership, fragmentation, fragment, center, ring_angles[index] + gap * 0.5)) {
+            scaled *= 0.2;
+        }
+        // First-wins on a tie, matching upstream's strict `>`.
+        if (scaled > best_scaled) {
+            best_scaled = scaled;
+            best = index;
+            best_gap = gap;
+        }
+    }
+
+    // Upstream starts from the chosen gap's own ring neighbour and steps
+    // counter-clockwise into the gap, one step per substituent slot. A visited
+    // neighbour consumes no step but still counts in the divisor.
+    const step = best_gap / @as(f32, @floatFromInt(substituent_count + 1));
+    const start = std.math.atan2(
+        atoms[ring_neighbours[best].index()].coordinates.y - origin.y,
+        atoms[ring_neighbours[best].index()].coordinates.x - origin.x,
+    );
+    var taken: usize = 0;
+    var placed_any = false;
+    for (substituents[0..substituent_count]) |neighbor| {
+        if (fragmentation.atom_fragment[neighbor.index()] != fragment or placed[neighbor.index()]) continue;
+        taken += 1;
+        const angle = start + step * @as(f32, @floatFromInt(taken));
+        atoms[neighbor.index()].coordinates = .{
+            .x = origin.x + @cos(angle) * bond_length,
+            .y = origin.y + @sin(angle) * bond_length,
+        };
+        placed[neighbor.index()] = true;
+        queue[tail.*] = neighbor;
+        tail.* += 1;
+        placed_any = true;
+    }
+    return placed_any;
+}
+
+fn sharesRing(membership: topology.RingMembership, left: core.ids.AtomId, right: core.ids.AtomId) bool {
+    for (membership.atomRings(left)) |ring| {
+        for (membership.atomRings(right)) |other| {
+            if (ring == other) return true;
+        }
+    }
+    return false;
+}
+
+/// Upstream's SKETCHER_EPSILON, the guard against dividing by a horizontal edge.
+const sketcher_epsilon: f32 = 1.0e-5;
+
+/// Upstream probes a point a tenth of a bond length along the gap's midpoint and
+/// asks whether it falls inside any non-macrocyclic ring of the fragment
+/// (`sketcherMinimizerRing::contains`, an even-odd crossing count).
+fn gapPointsIntoRing(
+    atoms: []const model.Atom,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: core.ids.FragmentId,
+    center: core.ids.AtomId,
+    midpoint_angle: f32,
+) bool {
+    const origin = atoms[center.index()].coordinates;
+    const probe: core.math.Vec2 = .{
+        .x = origin.x + @cos(midpoint_angle) * bond_length * 0.1,
+        .y = origin.y + @sin(midpoint_angle) * bond_length * 0.1,
+    };
+    for (membership.rings) |ring| {
+        const members = membership.atoms(ring.id);
+        if (members.len == 0) continue;
+        if (fragmentation.atom_fragment[members[0].index()] != fragment) continue;
+        if (members.len >= topology.rings.macrocycle_size) continue;
+        if (ringContainsPoint(atoms, members, probe)) return true;
+    }
+    return false;
+}
+
+fn ringContainsPoint(atoms: []const model.Atom, members: []const core.ids.AtomId, probe: core.math.Vec2) bool {
+    var crossings: usize = 0;
+    for (members, 0..) |member, index| {
+        const next = members[(index + 1) % members.len];
+        const a = atoms[member.index()].coordinates;
+        const b = atoms[next.index()].coordinates;
+        // Upstream's strict inequalities, so a vertex exactly at the probe's
+        // height is not counted from either side.
+        if (!((probe.y < a.y and probe.y > b.y) or (probe.y > a.y and probe.y < b.y))) continue;
+        const dy = b.y - a.y;
+        if (dy <= sketcher_epsilon and dy >= -sketcher_epsilon) continue;
+        const t = (probe.y - a.y) / dy;
+        if (probe.x > a.x + (b.x - a.x) * t) crossings += 1;
+    }
+    return crossings % 2 != 0;
 }
 
 fn parentAngle(atoms: []const model.Atom, graph: topology.Graph, fragmentation: fragments.Fragmentation, fragment: core.ids.FragmentId, center: core.ids.AtomId, placed: []const bool) f32 {
