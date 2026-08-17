@@ -903,10 +903,17 @@ fn fragmentHasNan(atoms: []const model.Atom, members: []const core.ids.AtomId) b
     return false;
 }
 
-/// `CoordgenMinimizer::hasValid3DCoordinates`: upstream's 10,000,001 sentinel.
-/// It is a one-sided magnitude ceiling rather than a finiteness test, so a
-/// negative infinity passes it while a positive one does not; the test below
-/// pins that asymmetry rather than tidying it away.
+/// `sketcherMinimizerAtom::hasValid3DCoordinates`: upstream's 10,000,001 test.
+/// The number is not a magnitude policy - INVALID_COORDINATES is the *default*
+/// value upstream assigns m_x3D/y3D/z3D, so `< INVALID_COORDINATES` means "this
+/// atom actually carries 3D data". Native's `?Vec3` encodes that intent
+/// directly, and the null check below is the faithful half.
+///
+/// The ceiling is kept as well because it is one-sided, which makes it more than
+/// a presence test: a coordinate at or above the sentinel reads as absent, and a
+/// negative infinity reads as present. Both follow from comparing against a
+/// sentinel rather than from a decision, and the test below pins them rather
+/// than tidying them away.
 fn fragmentHasValid3dSource(atoms: []const model.Atom, members: []const core.ids.AtomId) bool {
     const invalid_coordinates: f32 = 10_000_001;
     for (members) |atom| {
