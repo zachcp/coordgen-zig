@@ -62,6 +62,10 @@ fn initializeCoordinatesInternal(
     options: Options,
 ) core.errors.Error!Outcome {
     var outcome: Outcome = .{};
+    // Ring fusion structure is needed by the central-ring priority, and is
+    // derived once for the whole molecule rather than per fragment.
+    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds);
+    defer analysis.deinit();
     const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(placed);
     @memset(placed, false);
@@ -69,7 +73,7 @@ fn initializeCoordinatesInternal(
     defer allocator.free(queue);
 
     for (fragmentation.fragments) |fragment| {
-        if (try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, options)) {
+        if (try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, options, analysis)) {
             outcome.minimization_required = true;
         }
 
@@ -131,6 +135,7 @@ fn placeFragmentRings(
     fragment: fragments.Fragment,
     placed: []bool,
     options: Options,
+    analysis: topology.rings.Analysis,
 ) core.errors.Error!bool {
     // Upstream tries the template database for the whole ring system before
     // placing any ring individually (CoordgenFragmentBuilder.cpp:211, inside
@@ -160,7 +165,7 @@ fn placeFragmentRings(
                 shared += @intFromBool(placed[atom.index()]);
             }
             if (already_complete) continue;
-            const score = shared * 10000 + @as(usize, @intFromBool(ring_atoms.len == 6)) * 10 + ring_atoms.len;
+            const score = ringPriority(membership, analysis, ring, shared != 0);
             if (selected == null or score > selected_score) {
                 selected = ring;
                 selected_shared = shared;
@@ -287,6 +292,41 @@ fn matchFragmentTemplate(
     try match.apply(atoms);
     for (match.atoms) |atom_id| placed[atom_id.index()] = true;
     return true;
+}
+
+/// Upstream's CoordgenFragmentBuilder::findCentralRingOfSystem priority, with
+/// its constants (CoordgenFragmentBuilder.cpp:24-27).
+///
+/// The native score used to be `shared * 10000 + (size == 6) * 10 + size`,
+/// which kept the already-built bonus, the six-ring bonus and the size term
+/// but dropped three: the macrocycle bonus, the fused-ring count and the
+/// fusion-atom count. Those decide the order for any system holding a
+/// macrocycle or rings of differing fusion, and the placement order decides
+/// the layout.
+///
+/// `neighbour_built` is a flat bonus upstream, taken once for having any built
+/// fused neighbour rather than scaled by how many atoms are already placed.
+fn ringPriority(
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    ring: model.Ring,
+    neighbour_built: bool,
+) usize {
+    const neighbour_already_built_score: usize = 100000;
+    const macrocycle_score: usize = 1000;
+    const fused_rings_score: usize = 40;
+    const fusion_atoms_score: usize = 15;
+
+    var priority: usize = 0;
+    if (neighbour_built) priority += neighbour_already_built_score;
+    const size = membership.atoms(ring.id).len;
+    if (size >= topology.rings.macrocycle_size) priority += macrocycle_score;
+    if (size == 6) priority += 10;
+    priority += size;
+    const fusions = analysis.fusedWith(ring.id);
+    priority += fused_rings_score * fusions.len;
+    for (fusions) |fusion| priority += fusion_atoms_score * analysis.fusionAtoms(fusion).len;
+    return priority;
 }
 
 fn openCycleAndGenerateCoordinates(
