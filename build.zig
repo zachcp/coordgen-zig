@@ -1242,6 +1242,52 @@ pub fn build(b: *std.Build) !void {
         run_native_macrocycle.addFileArg(oracle.path("test/macrocycle.mae"));
         oracle_step.dependOn(&run_native_macrocycle.step);
 
+        // The differential runner (cgz-7v2.4.2). It imports `api` for the
+        // native side and links the oracle's C ABI for the other, which is
+        // only sound because the native C exports are absent from this module
+        // - see tests/native_oracle_diff.zig and cgz-r28.
+        const native_diff_module = b.createModule(.{
+            .root_source_file = b.path("tests/native_oracle_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "api", .module = api },
+                .{ .name = "core", .module = core },
+                .{ .name = "conformance", .module = conformance },
+                .{ .name = "c_abi", .module = c_abi },
+            },
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        native_diff_module.linkLibrary(oracle_abi);
+        const native_diff = b.addExecutable(.{
+            .name = "native-oracle-diff",
+            .root_module = native_diff_module,
+        });
+        const run_native_diff = b.addRunArtifact(native_diff);
+        run_native_diff.expectExitCode(0);
+        // drug_like first: it is the partition the Phase 3 gate in
+        // SUCCESS_CRITERIA.md is stated over, and every member is
+        // coordinate-stable on both axes, so a mismatch here is the port's.
+        run_native_diff.addArgs(&.{ "--partition", "drug_like" });
+        run_native_diff.addArg("--ceiling");
+        run_native_diff.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        run_native_diff.addArg("--baseline");
+        const native_diff_baseline = run_native_diff.addOutputFileArg("native_baseline.tsv");
+        const publish_baseline = b.addUpdateSourceFiles();
+        publish_baseline.addCopyFileToSource(native_diff_baseline, "conformance/native_baseline.tsv");
+        const native_diff_step = b.step(
+            "native-diff",
+            "Compare native against the pinned oracle over a corpus partition",
+        );
+        native_diff_step.dependOn(&run_native_diff.step);
+        const native_baseline_step = b.step(
+            "native-baseline",
+            "Regenerate the published native-vs-oracle baseline from this build",
+        );
+        native_baseline_step.dependOn(&publish_baseline.step);
+        conformance_step.dependOn(native_diff_step);
+
         conformance_step.dependOn(oracle_step);
     } else {
         const oracle_disabled = b.addFail(
