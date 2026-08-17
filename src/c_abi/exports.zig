@@ -152,12 +152,19 @@ fn validateOptions(options: c_abi.Options) ?core.errors.ErrorCode {
         !validFlag(options.skip_minimization) or
         !validFlag(options.force_open_macrocycles) or
         !validFlag(options.constrain_all_atoms) or
-        !validFlag(options.build_from_fragments) or
+        !validFlag(options.reserved) or
         !validFlag(options.debug_coordinates) or
         !validFlag(options.load_templates))
     {
         return .invalid_option;
     }
+    // The reserved slot has no safe-API counterpart to carry it: cgz-r25
+    // dropped the field from api.Options rather than keep a name for a value
+    // that can only be zero. So the C layer is the only place this can be
+    // rejected, and it must reject it exactly as the oracle adapter does
+    // (conformance/oracle_adapter.cpp:164) - invalid_option for a value that
+    // is not a flag at all, unsupported for a well-formed 1.
+    if (options.reserved != 0) return .unsupported;
     return null;
 }
 
@@ -414,7 +421,6 @@ fn generateThroughSafeApi(
             .skip_minimization = input.options.skip_minimization != 0,
             .force_open_macrocycles = input.options.force_open_macrocycles != 0,
             .constrain_all_atoms = input.options.constrain_all_atoms != 0,
-            .build_from_fragments = input.options.build_from_fragments != 0,
             .debug_coordinates = input.options.debug_coordinates != 0,
             .load_templates = input.options.load_templates != 0,
             // A present-but-empty view is still a request for process-global
@@ -479,6 +485,7 @@ test "coordgen_generate reaches every documented error path that api.Input.valid
         residue_interactions: []const ResidueInteractionInput = &.{},
         precision: f32 = 1,
         even_angles: u32 = 0,
+        reserved: u32 = 0,
         expect: core.errors.ErrorCode,
     };
     const cases = [_]Case{
@@ -560,6 +567,21 @@ test "coordgen_generate reaches every documented error path that api.Input.valid
             .expect = .unsupported,
         },
         .{
+            // cgz-r25's reserved slot. A non-flag value is invalid_option;
+            // a well-formed 1 is unsupported, matching the oracle adapter.
+            // api.Options cannot carry this, so this boundary is the only
+            // place it can be caught.
+            .atoms = &.{.{}},
+            .reserved = 2,
+            .expect = .invalid_option,
+        },
+        .{
+            .atoms = &.{ .{}, .{} },
+            .bonds = &.{.{ .start = 0, .end = 1, .order = 1 }},
+            .reserved = 1,
+            .expect = .unsupported,
+        },
+        .{
             // Structurally sound and in-domain.
             .atoms = &.{ .{}, .{} },
             .bonds = &.{.{ .start = 0, .end = 1, .order = 1 }},
@@ -569,7 +591,11 @@ test "coordgen_generate reaches every documented error path that api.Input.valid
 
     for (cases) |case| {
         const input: Input = .{
-            .options = .{ .precision = case.precision, .even_angles = case.even_angles },
+            .options = .{
+                .precision = case.precision,
+                .even_angles = case.even_angles,
+                .reserved = case.reserved,
+            },
             .atoms = .{ .ptr = case.atoms.ptr, .len = @intCast(case.atoms.len) },
             .bonds = .{ .ptr = case.bonds.ptr, .len = @intCast(case.bonds.len) },
             .residues = .{ .ptr = case.residues.ptr, .len = @intCast(case.residues.len) },

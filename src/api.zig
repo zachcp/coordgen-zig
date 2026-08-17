@@ -278,8 +278,9 @@ pub const Result = struct {
 /// and the discrete pose search. Rejected today: extra bonds, hidden, fixed,
 /// constrained, template-positioned, or 3D-seeded atoms, caller-specified
 /// atom and bond stereo, skipped bonds, caller bond displays, and the
-/// `even_angles`, `constrain_all_atoms`, `build_from_fragments`,
-/// `debug_coordinates`, and `template_directory` options.
+/// `even_angles`, `constrain_all_atoms`, `debug_coordinates`, and
+/// `template_directory` options. The C ABI's `reserved` slot is rejected at
+/// that boundary instead, since cgz-r25 removed it from this option table.
 ///
 /// On any error the result is released before returning, so a failed call
 /// leaks nothing and leaves the caller nothing to free.
