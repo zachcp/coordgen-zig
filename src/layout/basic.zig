@@ -203,7 +203,14 @@ fn placeFragmentRings(
         const local = try regularRingCoordinates(allocator, ordered.len);
         defer allocator.free(local);
         if (selected_shared >= 2) {
-            try alignFusedRing(atoms, ordered, local, placed);
+            // Upstream scores the two mirror candidates against the center of
+            // the one already-drawn parent ring, not against everything placed
+            // so far (CoordgenFragmentBuilder.cpp:513). The distinction only
+            // appears from the third ring of a fused system onwards, which is
+            // where the two disagree and where the wrong mirror gets picked.
+            const parent = selectParentRing(membership, analysis, ring.id, placed) orelse
+                return error.InvalidMapping;
+            try alignFusedRing(atoms, ordered, local, placed, membership.atoms(parent));
         } else if (selected_shared == 1) {
             var pivot: usize = 0;
             for (ordered, 0..) |atom, index| if (placed[atom.index()]) {
@@ -394,13 +401,57 @@ fn regularRingCoordinates(allocator: std.mem.Allocator, count: usize) core.error
     return result;
 }
 
-fn alignFusedRing(atoms: []model.Atom, ordered: []const core.ids.AtomId, local: []const core.math.Vec2, placed: []bool) core.errors.Error!void {
+/// Upstream's `getSharedAtomsWithAlreadyDrawnRing`
+/// (CoordgenFragmentBuilder.cpp): among this ring's fused neighbours that are
+/// already drawn, walk them in fusion order and keep the last one that is
+/// neither less fused with this ring nor smaller than the current pick. The
+/// disjunction is upstream's, and it makes the choice order-dependent rather
+/// than a maximum — preserved here for that reason.
+fn selectParentRing(
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    ring: core.ids.RingId,
+    placed: []const bool,
+) ?core.ids.RingId {
+    var parent: ?core.ids.RingId = null;
+    var parent_shared: usize = 0;
+    for (analysis.fusedWith(ring)) |fusion| {
+        if (!ringIsDrawn(membership, fusion.other, placed)) continue;
+        if (parent != null) {
+            if (fusion.atom_count < parent_shared or
+                membership.atoms(fusion.other).len < membership.atoms(parent.?).len) continue;
+        }
+        parent = fusion.other;
+        parent_shared = fusion.atom_count;
+    }
+    return parent;
+}
+
+fn ringIsDrawn(membership: topology.RingMembership, ring: core.ids.RingId, placed: []const bool) bool {
+    for (membership.atoms(ring)) |atom| {
+        if (!placed[atom.index()]) return false;
+    }
+    return true;
+}
+
+fn alignFusedRing(
+    atoms: []model.Atom,
+    ordered: []const core.ids.AtomId,
+    local: []const core.math.Vec2,
+    placed: []bool,
+    parent_atoms: []const core.ids.AtomId,
+) core.errors.Error!void {
     var first: ?usize = null;
     var last: usize = 0;
-    for (ordered, 0..) |atom, index| if (placed[atom.index()]) {
+    // The anchors and the excluded set are the atoms shared with the parent,
+    // upstream's `fusionAtoms`, not every atom already placed: a ring fused to
+    // two drawn rings shares atoms with both, and only the parent's pair
+    // defines the axis the two candidates differ across.
+    for (ordered, 0..) |atom, index| {
+        if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) == null) continue;
         if (first == null) first = index;
         last = index;
-    };
+    }
     const first_index = first orelse return error.InvalidMapping;
     if (first_index == last) return error.InvalidMapping;
     const target_first = atoms[ordered[first_index].index()].coordinates;
@@ -412,13 +463,13 @@ fn alignFusedRing(atoms: []model.Atom, ordered: []const core.ids.AtomId, local: 
     const rotation = target_angle - source_angle;
     var first_score: f32 = 0;
     var mirror_score: f32 = 0;
-    const existing_center = placedCenter(atoms, placed);
+    const parent_center = ringAtomCenter(atoms, parent_atoms);
     for (ordered, local) |atom, coordinate| {
-        if (placed[atom.index()]) continue;
+        if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) != null) continue;
         const candidate = transformFromPivot(coordinate, source_first, target_first, rotation);
         const mirror = reflectAcrossLine(candidate, target_first, target_last);
-        first_score += distance(candidate, existing_center);
-        mirror_score += distance(mirror, existing_center);
+        first_score += distance(candidate, parent_center);
+        mirror_score += distance(mirror, parent_center);
     }
     const use_mirror = mirror_score > first_score;
     for (ordered, local) |atom, coordinate| if (!placed[atom.index()]) {
@@ -456,6 +507,13 @@ fn placedCenter(atoms: []const model.Atom, placed: []const bool) core.math.Vec2 
         count += 1;
     };
     return if (count == 0) center else scale(center, 1 / @as(f32, @floatFromInt(count)));
+}
+
+/// `sketcherMinimizerRing::findCenter`: the mean of one ring's atoms.
+fn ringAtomCenter(atoms: []const model.Atom, members: []const core.ids.AtomId) core.math.Vec2 {
+    var center: core.math.Vec2 = .{};
+    for (members) |atom| center = add(center, atoms[atom.index()].coordinates);
+    return if (members.len == 0) center else scale(center, 1 / @as(f32, @floatFromInt(members.len)));
 }
 
 fn coordinateCenter(coordinates: []const core.math.Vec2) core.math.Vec2 {
@@ -919,6 +977,79 @@ test "fused rings align on their shared edge and extend outward" {
         layoutAndDiscard,
         .{ &atoms, &bonds, graph, rings, split },
     );
+}
+
+test "the third ring of a linear acene mirrors away from its parent ring, not from everything drawn" {
+    // A linear tricyclic is the smallest case where upstream's two mirror
+    // references disagree: when the third ring is placed, the centroid of the
+    // ten atoms already drawn sits well outside its parent ring's own centre.
+    // Upstream scores against the parent ring (CoordgenFragmentBuilder.cpp:513),
+    // so this pins that reference rather than the placed centroid (cgz-r31).
+    var atoms: [14]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    const pairs = [_][2]u32{
+        .{ 0, 1 },  .{ 1, 2 },   .{ 2, 3 },   .{ 3, 4 },  .{ 4, 5 },   .{ 5, 0 },
+        .{ 3, 6 },  .{ 6, 7 },   .{ 7, 8 },   .{ 8, 9 },  .{ 9, 4 },   .{ 8, 10 },
+        .{ 10, 11 }, .{ 11, 12 }, .{ 12, 13 }, .{ 13, 7 },
+    };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    try layoutFixture(&atoms, &bonds);
+    try expectBondLengths(&atoms, &bonds);
+
+    // The middle ring is the outer ring's parent, and the outer ring's own
+    // atoms must sit further from that centre than their mirror images across
+    // the shared 7-8 edge would.
+    const middle = [_]u32{ 3, 4, 6, 7, 8, 9 };
+    var parent_center: core.math.Vec2 = .{};
+    for (middle) |index| parent_center = add(parent_center, atoms[index].coordinates);
+    parent_center = scale(parent_center, 1.0 / @as(f32, @floatFromInt(middle.len)));
+
+    const axis_start = atoms[7].coordinates;
+    const axis_end = atoms[8].coordinates;
+    var direct: f32 = 0;
+    var mirrored: f32 = 0;
+    for ([_]u32{ 10, 11, 12, 13 }) |index| {
+        const point = atoms[index].coordinates;
+        direct += distance(point, parent_center);
+        mirrored += distance(reflectAcrossLine(point, axis_start, axis_end), parent_center);
+    }
+    try std.testing.expect(direct >= mirrored);
+
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    defer analysis.deinit();
+
+    // And the parent chosen for the outer ring is the ring it shares an edge
+    // with, not the far one it shares nothing with.
+    var placed: [14]bool = @splat(true);
+    var outer: ?core.ids.RingId = null;
+    for (rings.rings) |ring| {
+        if (std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(ring.id), core.ids.AtomId.fromIndex(11)) != null) {
+            outer = ring.id;
+            break;
+        }
+    }
+    const outer_ring = outer orelse return error.TestUnexpectedResult;
+    // Its shared edge is already drawn as part of the parent, which is exactly
+    // the state the placement loop is in when it reaches this ring.
+    for ([_]u32{ 10, 11, 12, 13 }) |index| placed[index] = false;
+    const parent = selectParentRing(rings, analysis, outer_ring, &placed) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(parent), core.ids.AtomId.fromIndex(6)) != null);
+    try std.testing.expect(std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(parent), core.ids.AtomId.fromIndex(0)) == null);
 }
 
 test "spiro rings sharing one atom are placed on opposite sides" {
