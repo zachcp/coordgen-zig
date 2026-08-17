@@ -149,6 +149,7 @@ fn placeFragmentRings(
         // call lives in the not-found branch.
         return false;
     }
+    var pentagon_minimization = false;
     var remaining: usize = fragment.ring_count;
     while (remaining != 0) {
         var selected: ?model.Ring = null;
@@ -174,7 +175,7 @@ fn placeFragmentRings(
         }
         const ring = selected orelse break;
         if (membership.atoms(ring.id).len >= topology.rings.macrocycle_size) {
-            if (try macrocycle.generateRingShape(
+            const shape_result = try macrocycle.generateRingShape(
                 allocator,
                 ring.id,
                 atoms,
@@ -183,7 +184,12 @@ fn placeFragmentRings(
                 membership,
                 placed,
                 options.force_open_macrocycles,
-            ) == .matched) {
+            );
+            if (shape_result.placed()) {
+                // A polyomino with pentagon vertices leaves the ring off the
+                // hexagonal lattice, and upstream requires minimization for
+                // exactly that case.
+                if (shape_result == .matched_needs_minimization) pentagon_minimization = true;
                 remaining -= 1;
                 continue;
             }
@@ -224,7 +230,7 @@ fn placeFragmentRings(
         }
         remaining -= 1;
     }
-    return maybeMinimizeRings(membership, fragmentation, fragment);
+    return pentagon_minimization or maybeMinimizeRings(membership, fragmentation, fragment);
 }
 
 /// Upstream's CoordgenMinimizer::maybeMinimizeRings, evaluated over the rings

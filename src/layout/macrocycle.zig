@@ -541,7 +541,17 @@ pub const PathData = struct {
 
 pub const GenerateResult = enum {
     matched,
+    /// A shape was applied, and it carries pentagon vertices. Upstream calls
+    /// requireMinimization in exactly this case
+    /// (CoordgenMacrocycleBuilder.cpp, after writePolyominoCoordinates),
+    /// because a pentagon vertex leaves the ring off the hexagonal lattice
+    /// and the geometry needs relaxing.
+    matched_needs_minimization,
     no_shape,
+
+    pub fn placed(self: GenerateResult) bool {
+        return self != .no_shape;
+    }
 };
 
 /// Extract the ordered path and every hard/soft macrocycle condition from the
@@ -719,7 +729,10 @@ pub fn generateShape(
     }
     if (found) if (chosen) |shape| {
         try writeCoordinates(shape, chosen_start, coordinates, coordinates_set);
-        return .matched;
+        return if (shape.pentagon_vertices.items.len != 0)
+            .matched_needs_minimization
+        else
+            .matched;
     };
     return .no_shape;
 }
@@ -749,7 +762,7 @@ pub fn generateRingShape(
         is_set.* = coordinates_set[atom.index()];
     }
     const result = try generateShape(allocator, data, coordinates, path_set, force_open_macrocycles);
-    if (result == .matched) for (data.ordered_atoms, coordinates) |atom, coordinate| {
+    if (result.placed()) for (data.ordered_atoms, coordinates) |atom, coordinate| {
         atoms[atom.index()].coordinates = coordinate;
         coordinates_set[atom.index()] = true;
     };
@@ -1492,7 +1505,10 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
     const coordinates_set = try allocator.alloc(bool, ring_size);
     defer allocator.free(coordinates_set);
     @memset(coordinates_set, false);
-    try std.testing.expectEqual(GenerateResult.matched, try generateShape(allocator, data, coordinates, coordinates_set, false));
+    // Asserts a shape was applied. The pentagon-vertex distinction is a
+    // separate fact reported by the same result, and this fixture does not
+    // pin which of the two it lands on.
+    try std.testing.expect((try generateShape(allocator, data, coordinates, coordinates_set, false)).placed());
     for (coordinates, 0..) |coordinate, index| {
         const following = coordinates[(index + 1) % coordinates.len];
         const dx = coordinate.x - following.x;
