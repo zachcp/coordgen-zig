@@ -89,7 +89,10 @@ ASSERT_OFFSET(coordgen_options_t, even_angles, 12);
 ASSERT_OFFSET(coordgen_options_t, skip_minimization, 16);
 ASSERT_OFFSET(coordgen_options_t, force_open_macrocycles, 20);
 ASSERT_OFFSET(coordgen_options_t, constrain_all_atoms, 24);
-ASSERT_OFFSET(coordgen_options_t, build_from_fragments, 28);
+/* cgz-r25 renamed this slot from build_from_fragments to reserved. The
+ * offset is unchanged, which is the whole point of asserting it here: the
+ * rename is a name-only amendment to the frozen layout. */
+ASSERT_OFFSET(coordgen_options_t, reserved, 28);
 ASSERT_OFFSET(coordgen_options_t, debug_coordinates, 32);
 ASSERT_OFFSET(coordgen_options_t, load_templates, 36);
 ASSERT_OFFSET(coordgen_options_t, template_directory, 40);

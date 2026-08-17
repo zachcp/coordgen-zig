@@ -102,8 +102,80 @@ size, alignment, and offset. All reserved fields must be zero on input.
 | `constrainAtoms(vector<bool>)` | per-atom `constrained` | `COORDGEN_ATOM_CONSTRAINED` | false | lossless atom DTO test |
 | `fixAtoms(vector<bool>)` | per-atom `fixed` | `COORDGEN_ATOM_FIXED` | false | lossless atom DTO test |
 | `addExtraBond` | `Input.extra_bonds` | `extra_bonds` span | empty | normal validation and caller-index rules |
-| `buildFromFragments` | `build_from_fragments` | same | false; only 0 accepted, nonzero is `Unsupported` | options default/layout; oracle rejects nonzero (cgz-7v2.8) |
 | `DEBUG_MINIMIZATION_COORDINATES` / review `DEBUG_COORDS` | `debug_coordinates` | same | false | accepted only by builds that provide the debug sink; otherwise `Unsupported` |
+
+### cgz-r25 — `buildFromFragments` is not an option; the slot is reserved
+
+This amends the option table `cgz-r07` froze. The table above previously
+carried a `buildFromFragments` row. It does not any more, because there is no
+upstream option to normalize.
+
+`cgz-7v2.8` established against the pin that `sketcherMinimizer::
+buildFromFragments(bool)` forwards to `CoordgenMinimizer::buildFromFragments
+(bool firstTime) const`, an imperative pipeline step. The parameter means "is
+this the first pass", not "is this mode enabled". Nothing stores it, and every
+upstream call site — `sketcherMinimizer.cpp:300`, `1160`, `2287` — passes
+`true` from inside a sequence `runGenerateCoordinates()` already performs
+unconditionally. `cgz-7v2.8` therefore made the oracle adapter reject nonzero
+with `COORDGEN_ERROR_UNSUPPORTED` instead of accepting a value it could not
+honor, which left the public field accepting exactly one value: `0`.
+
+A field that accepts exactly one value is a reserved field. `coordgen_abi.h`
+already gives every other DTO — `coordgen_atom_input_t`,
+`coordgen_bond_input_t`, `coordgen_residue_input_t`, `coordgen_string_view_t`,
+`coordgen_index_span_t`, `coordgen_result_t` — a field named `reserved`, and
+this document already states the rule those fields obey: all reserved fields
+must be zero on input. The amendment puts the slot in the category it already
+belongs to rather than inventing one.
+
+**The decision, applied per layer according to which constraint binds there:**
+
+| Layer | Outcome | Why |
+|---|---|---|
+| `coordgen_options_t` (`include/coordgen_abi.h`) | `uint32_t build_from_fragments` → `uint32_t reserved`, same offset, must be zero | Layout-frozen; the slot cannot be deleted |
+| `c_abi.Options` (`src/c_abi_types.zig`) | Same rename | `extern`, bound to the same frozen layout |
+| `api.Options` (`src/api.zig`) | Field removed outright | Plain Zig, no layout obligation, nothing to preserve |
+
+Candidates 2 and 3 of the bead — rename to reserved, versus drop from the
+table and treat the bytes as padding — converge wherever a layout binds. The
+four bytes at offset 28 cannot be removed without moving `debug_coordinates`,
+`load_templates`, and `template_directory` and changing `sizeof
+(coordgen_options_t)`, so at the C layer "drop" can only mean "stop describing
+it as an option", which is what the rename accomplishes. Naming the slot
+rather than leaving it anonymous padding is what keeps `abi-check` able to
+detect drift: `ASSERT_OFFSET` and `_Static_assert(offsetof(...))` can only
+reference a named field, so anonymous padding would delete an assertion the
+gate makes today. Under `cgz-r21` that is not an acceptable way to describe
+the same bytes. The two candidates diverge only at `api.Options`, which has no
+byte layout at all — there, keeping a placeholder would be invented surface
+area with nothing forcing it to exist, so it is removed.
+
+Candidate 1, keeping the name, is rejected. The name promises a toggle that
+cannot be exercised, and the mismatch is sharper than a documentation gap: since
+fragments are always built during generation, the value that describes the
+pipeline is `1`, and the ABI accepts `0` and rejects `1`. That is coherent only
+by reading `0` as "nothing requested in this slot" — which is what a reserved
+field means and what a toggle does not. Once the slot is reserved the question
+does not arise.
+
+**ABI compatibility consequence.** None. The amendment changes one identifier
+and no bytes. `coordgen_options_t` stays 56 bytes with 8-byte alignment, the
+slot stays at offset 28, and `debug_coordinates` (32), `load_templates` (36),
+and `template_directory` (40) do not move — asserted in `tests/abi_layout.c`
+and by `expectOffset` in `src/c_abi_types.zig`, with unchanged values. An
+already-compiled consumer is unaffected: it passes the same 56 bytes with the
+same zero at offset 28, and observes the same `COORDGEN_ERROR_UNSUPPORTED` for
+a nonzero value. A consumer that recompiles against the amended header and
+names the field must rename it, which is a source break with no binary
+component. `COORDGEN_ABI_VERSION` stays at 1; it is unreleased, and this is the
+window in which a source break costs nothing.
+
+Removing the field from `api.Options` also removes it from
+`generator/minimal.zig`'s out-of-scope rejection and from the matching
+`tests/native_minimal.zig` case. That is not a relaxation under `cgz-r21`: the
+check tested a state a caller can no longer construct. The C-side rejection is
+unchanged and still exercised, by `conformance/oracle_adapter.cpp` and the
+`reserved_field_rejected_smoke` regression in `tests/oracle_abi_smoke.c`.
 
 The static utilities audited as public (`canonicalOrdering`, `morganScores`,
 `RMSD`, `svd`, `alignmentMatrix`, `compare`, `sameRing`, `getBond`) are future

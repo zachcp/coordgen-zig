@@ -221,7 +221,9 @@ static int fragment_parent_probe_smoke(void) {
     return probe.owner == 0 ? 0 : 30;
 }
 
-/* cgz-7v2.8 regression: build_from_fragments must not be silently ignored.
+/* cgz-7v2.8 regression, field renamed by cgz-r25: the slot formerly named
+ * build_from_fragments, now coordgen_options_t.reserved, must not be
+ * silently ignored.
  * Upstream's sketcherMinimizer::buildFromFragments(bool) is an imperative
  * pipeline step (forwards to CoordgenMinimizer::buildFromFragments(bool
  * firstTime) const), not a stored option; runGenerateCoordinates() already
@@ -233,7 +235,7 @@ static int fragment_parent_probe_smoke(void) {
  * guaranteed no-op, since m_molecules is empty at that point) and returned
  * COORDGEN_OK regardless of the flag; this check fails against that code
  * because it observes COORDGEN_OK instead of COORDGEN_ERROR_UNSUPPORTED. */
-static int build_from_fragments_rejected_smoke(void) {
+static int reserved_field_rejected_smoke(void) {
     coordgen_atom_input_t atoms[3] = {0};
     coordgen_bond_input_t bonds[3] = {0};
     coordgen_input_t input = {0};
@@ -254,7 +256,7 @@ static int build_from_fragments_rejected_smoke(void) {
     bonds[2] = (coordgen_bond_input_t){2, 0, COORDGEN_BOND_SINGLE, 0, 0,
                                         COORDGEN_INVALID_INDEX, COORDGEN_INVALID_INDEX, 0, 1.0f, 0};
     input.options = coordgen_default_options();
-    input.options.build_from_fragments = 1;
+    input.options.reserved = 1;
     input.atoms = (coordgen_atom_span_t){atoms, 3, 0};
     input.bonds = (coordgen_bond_span_t){bonds, 3, 0};
 
@@ -268,7 +270,7 @@ static int build_from_fragments_rejected_smoke(void) {
 
     /* The default (0/false) must remain accepted: it matches actual pinned
      * behavior, since fragments are always built during generation. */
-    input.options.build_from_fragments = 0;
+    input.options.reserved = 0;
     if (coordgen_generate(&input, &result) != COORDGEN_OK) return 33;
     coordgen_result_free(&result);
     return 0;
@@ -279,5 +281,5 @@ int main(void) {
     const int probe = stable != 0 ? stable : probe_api_smoke();
     const int no_template = probe != 0 ? probe : no_template_probe_smoke();
     const int fragment_parent = no_template != 0 ? no_template : fragment_parent_probe_smoke();
-    return fragment_parent != 0 ? fragment_parent : build_from_fragments_rejected_smoke();
+    return fragment_parent != 0 ? fragment_parent : reserved_field_rejected_smoke();
 }

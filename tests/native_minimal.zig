@@ -165,7 +165,6 @@ test "minimal native generation explicitly rejects domains owned by later phases
     inline for (.{
         api.Options{ .even_angles = true },
         api.Options{ .constrain_all_atoms = true },
-        api.Options{ .build_from_fragments = true },
         api.Options{ .debug_coordinates = true },
         api.Options{ .template_directory = "fixtures" },
     }) |options| try expectUnsupported(.{ .atoms = &atoms, .bonds = &path, .options = options });

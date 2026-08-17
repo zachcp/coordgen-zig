@@ -175,7 +175,21 @@ typedef struct coordgen_options {
     uint32_t skip_minimization;
     uint32_t force_open_macrocycles;
     uint32_t constrain_all_atoms;
-    uint32_t build_from_fragments;
+    /*
+     * Formerly `build_from_fragments`, renamed by cgz-r25 as an amendment to
+     * the option table cgz-r07 froze. cgz-7v2.8 established against the
+     * pinned upstream source that sketcherMinimizer::buildFromFragments(bool)
+     * is not a stored option: it forwards to
+     * CoordgenMinimizer::buildFromFragments(bool firstTime) const, an
+     * imperative pipeline step runGenerateCoordinates() already performs
+     * unconditionally, and every upstream call site passes true. There is no
+     * upstream conditional a public flag could gate, so the slot accepts
+     * exactly one value and is a reserved field rather than an option. Must
+     * be zero on input, per the reserved-field rule this header applies to
+     * every other DTO. The offset (28) and the struct's size are unchanged
+     * by the rename.
+     */
+    uint32_t reserved;
     uint32_t debug_coordinates;
     uint32_t load_templates;
     coordgen_string_view_t template_directory;
