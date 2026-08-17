@@ -8,11 +8,13 @@ const optimize = @import("optimize");
 pub const components = @import("components.zig");
 pub const residues = @import("residues.zig");
 pub const bends = @import("bends.zig");
+pub const inversions = @import("inversions.zig");
 
 test {
     _ = components;
     _ = residues;
     _ = bends;
+    _ = inversions;
 }
 
 /// Restricted proof result. Coordinates and both maps are allocator-owned;
