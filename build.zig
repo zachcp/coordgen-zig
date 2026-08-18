@@ -1288,21 +1288,37 @@ pub fn build(b: *std.Build) !void {
         run_native_diff.addArgs(&.{ "--partition", "drug_like" });
         run_native_diff.addArg("--ceiling");
         run_native_diff.addFileArg(b.path("conformance/parity_ceiling.tsv"));
-        run_native_diff.addArg("--baseline");
-        const native_diff_baseline = run_native_diff.addOutputFileArg("native_baseline.tsv");
-        const publish_baseline = b.addUpdateSourceFiles();
-        publish_baseline.addCopyFileToSource(native_diff_baseline, "conformance/native_baseline.tsv");
         const native_diff_step = b.step(
             "native-diff",
             "Compare native against the pinned oracle over a corpus partition",
         );
         native_diff_step.dependOn(&run_native_diff.step);
+
+        // Publishing the baseline is a second run of the same binary over the
+        // same partition, in the mode that reports a mismatch instead of
+        // failing on it (cgz-7v2.4.2). It is deliberately not the gate's run:
+        // making the record of a red measurement depend on the measurement
+        // being green is what left conformance/native_baseline.tsv to be
+        // copied out of the build cache by hand.
+        const record_baseline = b.addRunArtifact(native_diff);
+        record_baseline.expectExitCode(0);
+        record_baseline.addArgs(&.{ "--partition", "drug_like" });
+        record_baseline.addArg("--ceiling");
+        record_baseline.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        record_baseline.addArgs(&.{ "--on-mismatch", "record" });
+        record_baseline.addArg("--baseline");
+        const native_diff_baseline = record_baseline.addOutputFileArg("native_baseline.tsv");
+        const publish_baseline = b.addUpdateSourceFiles();
+        publish_baseline.addCopyFileToSource(native_diff_baseline, "conformance/native_baseline.tsv");
         const native_baseline_step = b.step(
             "native-baseline",
             "Regenerate the published native-vs-oracle baseline from this build",
         );
         native_baseline_step.dependOn(&publish_baseline.step);
-        conformance_step.dependOn(native_diff_step);
+        // `conformance` deliberately does not depend on the gate: while the
+        // differential is expected red, attaching it here would report every
+        // other conformance failure underneath a failure everyone is already
+        // waiting on. The gate keeps its own step and its own exit code.
 
         conformance_step.dependOn(oracle_step);
     } else {
