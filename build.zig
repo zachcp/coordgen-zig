@@ -426,6 +426,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "api", .module = api },
+            .{ .name = "core", .module = core },
             .{ .name = "generator", .module = generator },
         },
         .link_libc = false,

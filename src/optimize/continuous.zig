@@ -661,7 +661,7 @@ fn baseInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "base interaction construction preserves clash-stretch order and cleans allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
 }
 
 fn bendInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
@@ -689,7 +689,7 @@ fn bendInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "bend construction redistributes ring angles and cleans allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, bendInteractionsAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, bendInteractionsAndDiscard, .{});
 }
 
 fn remainingInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
@@ -717,7 +717,7 @@ fn remainingInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "constraint and E/Z construction combine with complete allocation cleanup" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, remainingInteractionsAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, remainingInteractionsAndDiscard, .{});
 }
 
 test "force application caps movement, clears movable force, and retains fixed force" {
@@ -799,7 +799,7 @@ fn minimizeMoleculeAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "molecule minimization rolls back invalid stereo and cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, minimizeMoleculeAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, minimizeMoleculeAndDiscard, .{});
 }
 
 test {

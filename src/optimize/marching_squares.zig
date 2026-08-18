@@ -226,6 +226,6 @@ test "marching squares has deterministic point creation and checkerboard topolog
 test "marching squares rejects nonfinite grids and cleans allocation failures" {
     try std.testing.expectError(error.InvalidCoordinate, run(std.testing.allocator, &.{ 0, 1, 0, std.math.nan(f32) }, 2, 2, .{}, .{ .x = 1, .y = 1 }, 0.5));
     const values = [_]f32{ 0, 1, 0, 1, 0, 1, 0, 1, 0 };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, runAndDiscard, .{&values});
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, runOrderAndDiscard, .{&values});
+    try core.oom.checkAllocationFailures(std.testing.allocator, runAndDiscard, .{&values});
+    try core.oom.checkAllocationFailures(std.testing.allocator, runOrderAndDiscard, .{&values});
 }

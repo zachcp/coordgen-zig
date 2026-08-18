@@ -420,7 +420,7 @@ test "preparation rejects malformed endpoints and cleans every allocation failur
             prepared.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ &test_atoms, &test_bonds });
+    try core.oom.checkAllocationFailures(std.testing.allocator, Runner.run, .{ &test_atoms, &test_bonds });
 }
 
 test "preparation owns residues, extra bonds, interaction ranges, and proximity records" {

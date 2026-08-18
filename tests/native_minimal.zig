@@ -1,5 +1,6 @@
 const std = @import("std");
 const api = @import("api");
+const core = @import("core");
 const minimal = @import("generator");
 
 fn generate(allocator: std.mem.Allocator, input: api.Input) !minimal.Result {
@@ -463,7 +464,7 @@ test "minimal native generation places an acyclic proximity child from a large c
     const dx = result.coordinates[7].x - result.coordinates[8].x;
     const dy = result.coordinates[7].y - result.coordinates[8].y;
     try std.testing.expect(@sqrt(dx * dx + dy * dy) >= api.bond_length * 2);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
+    try core.oom.checkAllocationFailures(std.testing.allocator, generateAndDiscard, .{input});
 }
 
 test "minimal native generation uses general placement for a small proximity pair" {
