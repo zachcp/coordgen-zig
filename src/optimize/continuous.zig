@@ -181,9 +181,17 @@ pub fn buildBendInteractions(
         var ring_total: f32 = 0;
 
         for (group.candidates) |candidate| {
+            // `atom_a == atom_b` is deliberately NOT rejected. A duplicated
+            // bond between the same pair - which upstream's own
+            // test/macrocycle.mae contains, as `0-1` and `1-0` - puts that
+            // neighbour in the incidence list twice, and the clockwise pairing
+            // then hands the same atom to both ends of one bend.
+            // `CoordgenMinimizer::addBendInteractionsOfMolecule` builds that
+            // interaction without checking, so rejecting it here was stricter
+            // than upstream and failed a fixture upstream lays out (cgz-hez).
             if (!candidate.atom_a.isValid() or candidate.atom_a.index() >= atoms.len or
                 !candidate.atom_b.isValid() or candidate.atom_b.index() >= atoms.len or
-                candidate.atom_a == group.center or candidate.atom_b == group.center or candidate.atom_a == candidate.atom_b)
+                candidate.atom_a == group.center or candidate.atom_b == group.center)
             {
                 return error.InvalidAtomIndex;
             }
