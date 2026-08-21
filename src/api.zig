@@ -424,7 +424,7 @@ test "public generation reports and cleans up every allocation failure" {
     try std.testing.expectEqual(baseline.alloc_index, repeated.alloc_index);
     try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
 
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         generateAndDiscard,
         .{input},
@@ -497,7 +497,7 @@ test "result reports and cleans up every allocation failure" {
     // One independently-fallible allocation for each owned output slice. A
     // decrease means an output stopped participating in the OOM sweep.
     try std.testing.expectEqual(@as(usize, 6), counting_allocator.alloc_index);
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         allocateAndDiscardResult,
         .{ 3, 2 },

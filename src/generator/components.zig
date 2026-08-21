@@ -1581,7 +1581,7 @@ test "neutral component placement cleans every allocation failure" {
     }};
     var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
     defer graph.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeAndDiscard, .{ &atoms, graph });
+    try core.oom.checkAllocationFailures(std.testing.allocator, arrangeAndDiscard, .{ &atoms, graph });
 }
 
 test "component arrangement ignores residue-only components" {
@@ -1631,7 +1631,7 @@ test "proximity arrangement compacts excluded residue components and cleans allo
         .end = core.ids.AtomId.fromIndex(2),
     }};
     const excluded = [_]bool{ false, false, false, true };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeProximityExcludingAndDiscard, .{
+    try core.oom.checkAllocationFailures(std.testing.allocator, arrangeProximityExcludingAndDiscard, .{
         &source_atoms,
         &bonds,
         &relations,

@@ -1184,7 +1184,7 @@ test "residue crown placement is deterministic and allocation-clean" {
     try placeAroundLigand(std.testing.allocator, &second, &bonds, &residue_input, "A", &interactions);
     try std.testing.expectEqual(first[2].coordinates, second[2].coordinates);
     try std.testing.expect(distance(first[2].coordinates, first[1].coordinates) > 40);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, placeAroundAndDiscard, .{
+    try core.oom.checkAllocationFailures(std.testing.allocator, placeAroundAndDiscard, .{
         &source_atoms,
         &bonds,
         &residue_input,

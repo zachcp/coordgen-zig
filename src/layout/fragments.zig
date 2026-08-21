@@ -379,7 +379,7 @@ test "acyclic rotatable bonds split stable fragments and assign a parent tree" {
     try std.testing.expectEqual(core.ids.FragmentId.fromIndex(0), result.fragments[1].parent);
     try std.testing.expectEqual(core.ids.FragmentId.fromIndex(1), result.fragments[2].parent);
     try std.testing.expect(result.fragments[0].flags.chain);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, fragmentAndDiscard, .{ &atoms, &bonds, graph, rings });
+    try core.oom.checkAllocationFailures(std.testing.allocator, fragmentAndDiscard, .{ &atoms, &bonds, graph, rings });
 }
 
 test "ordinary rings remain one rigid fragment" {

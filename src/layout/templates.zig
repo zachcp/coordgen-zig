@@ -509,7 +509,7 @@ test "template matching rejects nonmatching and malformed graphs" {
 
 test "template matching cleans every injected allocation failure" {
     const edges = comptime fixtureEdges(80);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, findAndDiscard, .{&edges});
+    try core.oom.checkAllocationFailures(std.testing.allocator, findAndDiscard, .{&edges});
 }
 
 test "all 82 immutable templates are structurally matchable" {
@@ -678,7 +678,7 @@ test "ring-set matching cleans every injected allocation failure" {
     defer graph.deinit();
     defer rings.deinit();
     const ring_ids = [_]core.ids.RingId{ core.ids.RingId.fromIndex(0), core.ids.RingId.fromIndex(1) };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, findRingSetAndDiscard, .{ &bonds, rings, &ring_ids });
+    try core.oom.checkAllocationFailures(std.testing.allocator, findRingSetAndDiscard, .{ &bonds, rings, &ring_ids });
 }
 
 const ThreadResult = struct {

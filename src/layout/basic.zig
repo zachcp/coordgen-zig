@@ -71,6 +71,15 @@ fn initializeCoordinatesInternal(
     @memset(placed, false);
     const queue = allocator.alloc(core.ids.AtomId, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(queue);
+    // Upstream snapshots each fragment's pose into its own frame the moment the
+    // fragment is built (`sketcherMinimizerFragment::storeCoordinateInformation`),
+    // and assembles the molecule from those frames afterwards. The snapshot is
+    // what lets a fragment's build write on atoms outside it - which upstream's
+    // neighbour placement does, and which is how a child fragment learns the
+    // direction its attachment atom was given - without a later fragment's
+    // build trampling an earlier one's finished pose.
+    var frames = try FragmentFrames.init(allocator, atoms.len, fragmentation.fragments.len);
+    defer frames.deinit();
 
     for (fragmentation.fragments) |fragment| {
         if (try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, options, analysis)) {
@@ -85,7 +94,15 @@ fn initializeCoordinatesInternal(
             tail += 1;
         };
         if (tail == 0) {
-            const start = members[0];
+            // `CoordgenFragmentBuilder::buildNonRingAtoms`: a fragment with no
+            // ring atoms starts from its bond to the parent, not from whichever
+            // atom happens to be first. The parent-side atom is seeded one bond
+            // length along -x, which is also the direction the neighbour
+            // placement starts rotating from.
+            const start = attachmentAtom(bonds, fragmentation, fragment) orelse members[0];
+            if (parentEndpoint(bonds, fragmentation, fragment)) |parent_atom| {
+                atoms[parent_atom.index()].coordinates = .{ .x = -bond_length, .y = 0 };
+            }
             atoms[start.index()].coordinates = .{};
             placed[start.index()] = true;
             queue[0] = start;
@@ -93,49 +110,206 @@ fn initializeCoordinatesInternal(
         }
         while (head < tail) : (head += 1) {
             const center = queue[head];
-            var unplaced_count: usize = 0;
+            var fallback_count: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
-                if (fragmentation.atom_fragment[neighbor.index()] == fragment.id and !placed[neighbor.index()]) unplaced_count += 1;
+                if (!placed[neighbor.index()] or fragmentation.atom_fragment[neighbor.index()] != fragment.id) fallback_count += 1;
             }
-            if (unplaced_count == 0) continue;
+            // No early exit when every in-fragment neighbour is already placed:
+            // a centre can still owe a position to a neighbour in a child
+            // fragment, and that position is the only record of which direction
+            // the child leaves in.
             // Upstream splits on whether the centre is a ring atom
-            // (initializeVariablesForNeighboursCoordinates). The ring-atom
-            // branch is transcribed; the acyclic branch still uses native's
-            // fixed spread and is cgz-7v2.29's remaining half.
-            if (membership.atomRings(center).len != 0 and
-                try placeRingAtomSubstituents(atoms, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail))
-            {
+            // (initializeVariablesForNeighboursCoordinates). Both branches are
+            // transcribed; each falls through to the fixed spread below only
+            // when its own neighbour buffer would overflow.
+            if (membership.atomRings(center).len != 0) {
+                if (try placeRingAtomSubstituents(atoms, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail)) continue;
+            } else if (try placeAcyclicNeighbours(allocator, atoms, bonds, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail)) {
                 continue;
             }
             const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
             var generated: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
-                if (fragmentation.atom_fragment[neighbor.index()] != fragment.id or placed[neighbor.index()]) continue;
-                const spread = if (unplaced_count == 1)
+                if (placed[neighbor.index()] and fragmentation.atom_fragment[neighbor.index()] == fragment.id) continue;
+                const spread = if (fallback_count == 1)
                     @as(f32, 0)
                 else
-                    (@as(f32, @floatFromInt(generated)) - @as(f32, @floatFromInt(unplaced_count - 1)) * 0.5) * (2 * pi / 3);
+                    (@as(f32, @floatFromInt(generated)) - @as(f32, @floatFromInt(fallback_count - 1)) * 0.5) * (2 * pi / 3);
                 const angle = base_angle + spread;
                 atoms[neighbor.index()].coordinates = .{
                     .x = atoms[center.index()].coordinates.x + @cos(angle) * bond_length,
                     .y = atoms[center.index()].coordinates.y + @sin(angle) * bond_length,
                 };
+                generated += 1;
+                if (fragmentation.atom_fragment[neighbor.index()] != fragment.id) continue;
                 placed[neighbor.index()] = true;
                 queue[tail] = neighbor;
                 tail += 1;
-                generated += 1;
+            }
+        }
+        // Upstream's order inside buildFragment is fallbackIfNanCoordinates,
+        // then rotateMainFragment for a constrained root, then the
+        // fixed-coordinate reset (CoordgenFragmentBuilder.cpp:858-866), and
+        // only then the snapshot. All three ran once at the end of the molecule
+        // here, after assembly, which is a different function of a different
+        // pose.
+        fallbackOnValid3dCoordinates(atoms, members);
+        alignConstrainedMainFragment(atoms, fragmentation, fragment);
+        restoreFixedFragmentCoordinates(atoms, fragmentation, fragment);
+        frames.store(atoms, bonds, fragmentation, fragment);
+    }
+    try placeFragmentsFromFrames(allocator, atoms, bonds, graph, fragmentation, frames);
+    restoreFixedCoordinates(atoms);
+    return outcome;
+}
+
+/// Each fragment's own pose in its own frame, plus the position its children's
+/// attachment atoms were given in it. Upstream's `_coordinates` map, which
+/// holds exactly those two sets (`storeCoordinateInformation`).
+const FragmentFrames = struct {
+    allocator: std.mem.Allocator,
+    /// Every atom, in the frame of the fragment that owns it.
+    own: []core.math.Vec2,
+    /// Indexed by child fragment: that child's attachment atom, in the frame of
+    /// its parent.
+    attachment: []core.math.Vec2,
+
+    /// One allocation for both slices: the frames are pure scratch, and the
+    /// layout's allocation count is asserted to be stable
+    /// (`checkAllAllocationFailures` in tests/native_minimal.zig).
+    storage: []core.math.Vec2,
+
+    fn init(allocator: std.mem.Allocator, atom_count: usize, fragment_count: usize) core.errors.Error!FragmentFrames {
+        const storage = allocator.alloc(core.math.Vec2, atom_count + fragment_count) catch return error.OutOfMemory;
+        @memset(storage, .{});
+        return .{
+            .allocator = allocator,
+            .storage = storage,
+            .own = storage[0..atom_count],
+            .attachment = storage[atom_count..],
+        };
+    }
+
+    fn deinit(self: *FragmentFrames) void {
+        self.allocator.free(self.storage);
+        self.* = undefined;
+    }
+
+    /// The frame is centred on the fragment's attachment atom and turned so the
+    /// bond to the parent lies along it; a root fragment is centred on its
+    /// first atom and not turned, and a constrained or fixed root is left where
+    /// it is so its template alignment survives.
+    fn store(
+        self: FragmentFrames,
+        atoms: []const model.Atom,
+        bonds: []const model.Bond,
+        fragmentation: fragments.Fragmentation,
+        fragment: fragments.Fragment,
+    ) void {
+        const members = fragmentation.members(fragment.id);
+        var origin: core.math.Vec2 = .{};
+        var angle: f32 = 0;
+        if (attachmentAtom(bonds, fragmentation, fragment)) |attachment_atom| {
+            origin = atoms[attachment_atom.index()].coordinates;
+            const parent_atom = parentEndpoint(bonds, fragmentation, fragment).?;
+            const parent_position = atoms[parent_atom.index()].coordinates;
+            angle = std.math.atan2(parent_position.y - origin.y, origin.x - parent_position.x);
+        } else if (!fragment.flags.constrained and !fragment.flags.fixed) {
+            origin = atoms[members[0].index()].coordinates;
+        }
+        for (members) |atom| {
+            self.own[atom.index()] = rotateClockwise(subtract(atoms[atom.index()].coordinates, origin), -angle);
+        }
+        for (fragmentation.fragments) |candidate| {
+            if (candidate.parent != fragment.id) continue;
+            const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+            self.attachment[candidate.id.index()] =
+                rotateClockwise(subtract(atoms[child_attachment.index()].coordinates, origin), -angle);
+        }
+    }
+};
+
+/// `CoordgenMinimizer::buildMoleculeFromFragments` with firstTime true, minus
+/// the side choice it also makes there (cgz-7v2.27). A child is placed at the
+/// position its parent's own layout gave its attachment atom, turned to the
+/// direction of the bond it arrived on - so two children of one atom take the
+/// two directions that layout chose for them.
+///
+/// The port previously synthesised that direction instead, from the mean of the
+/// parent atom's already-placed bonds. That mean does not depend on which child
+/// is being placed, so every child of one atom was sent the same way and landed
+/// on top of its siblings (measured on drug_like/4: five pairs or triples of
+/// exactly coincident atoms).
+fn placeFragmentsFromFrames(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    fragmentation: fragments.Fragmentation,
+    frames: FragmentFrames,
+) core.errors.Error!void {
+    var scratch = try SideChoiceScratch.init(allocator, bonds.len, fragmentation.fragments.len);
+    defer scratch.deinit();
+    assignLongestChains(fragmentation, frames, scratch.longest_chain);
+    // A parent must be placed before its children, because the child reads the
+    // attachment position the parent's placement just wrote.
+    for (0..fragmentation.fragments.len) |depth| {
+        for (fragmentation.fragments) |fragment| {
+            if (fragmentDepth(fragmentation.fragments, fragment.id) != depth) continue;
+            var position: core.math.Vec2 = .{};
+            var angle: f32 = 0;
+            if (attachmentAtom(bonds, fragmentation, fragment)) |attachment_atom| {
+                const parent_atom = parentEndpoint(bonds, fragmentation, fragment) orelse return error.InvalidMapping;
+                position = atoms[attachment_atom.index()].coordinates;
+                const direction = subtract(position, atoms[parent_atom.index()].coordinates);
+                angle = std.math.atan2(-direction.y, direction.x);
+                // `buildMoleculeFromFragments` decides the side here, between
+                // computing the angle and applying the frame, and only on the
+                // first build (cgz-7v2.27).
+                // `buildMoleculeFromFragments` decides the side here, between
+                // computing the angle and applying the frame, and only on the
+                // first build (cgz-7v2.27).
+                if (!fragment.flags.fixed and !fragment.flags.constrained and
+                    shouldInvertAgainstParent(atoms, bonds, graph, fragmentation, frames, fragment, angle, scratch))
+                {
+                    mirrorFragmentFrame(bonds, fragmentation, frames, fragment);
+                }
+            } else if (fragment.parent.isValid()) {
+                return error.InvalidMapping;
+            }
+            for (fragmentation.members(fragment.id)) |atom| {
+                atoms[atom.index()].coordinates = add(rotateClockwise(frames.own[atom.index()], angle), position);
+            }
+            for (fragmentation.fragments) |candidate| {
+                if (candidate.parent != fragment.id) continue;
+                const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+                atoms[child_attachment.index()].coordinates =
+                    add(rotateClockwise(frames.attachment[candidate.id.index()], angle), position);
             }
         }
     }
-    // Upstream's order inside buildFragment is fallbackIfNanCoordinates, then
-    // rotateMainFragment for a constrained root, then the fixed-coordinate
-    // reset (CoordgenFragmentBuilder.cpp:858-866). The fallback ran last here,
-    // after assembly had already propagated a NaN parent into its children.
-    fallbackOnValid3dCoordinates(atoms, fragmentation);
-    try assembleFragments(atoms, bonds, graph, fragmentation);
-    alignConstrainedMainFragments(atoms, fragmentation);
-    restoreFixedCoordinates(atoms);
-    return outcome;
+}
+
+/// The end of the bond to the parent that lies inside this fragment.
+fn attachmentAtom(
+    bonds: []const model.Bond,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+) ?core.ids.AtomId {
+    if (!fragment.bond_to_parent.isValid()) return null;
+    const bond = bonds[fragment.bond_to_parent.index()];
+    return if (fragmentation.atom_fragment[bond.start.index()] == fragment.id) bond.start else bond.end;
+}
+
+/// The other end of that bond, which lies in the parent fragment.
+fn parentEndpoint(
+    bonds: []const model.Bond,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+) ?core.ids.AtomId {
+    const attachment = attachmentAtom(bonds, fragmentation, fragment) orelse return null;
+    const bond = bonds[fragment.bond_to_parent.index()];
+    return if (attachment == bond.start) bond.end else bond.start;
 }
 
 fn placeFragmentRings(
@@ -762,67 +936,6 @@ fn rotateScreen(value: core.math.Vec2, sine: f32, cosine: f32) core.math.Vec2 {
     return .{ .x = value.x * cosine + value.y * sine, .y = -value.x * sine + value.y * cosine };
 }
 
-fn assembleFragments(atoms: []model.Atom, bonds: []const model.Bond, graph: topology.Graph, fragmentation: fragments.Fragmentation) core.errors.Error!void {
-    for (1..fragmentation.fragments.len) |depth| {
-        for (fragmentation.fragments) |fragment| {
-            if (!fragment.parent.isValid() or fragmentDepth(fragmentation.fragments, fragment.id) != depth) continue;
-            if (!fragment.bond_to_parent.isValid()) return error.InvalidMapping;
-            const bond = bonds[fragment.bond_to_parent.index()];
-            const child_endpoint = if (fragmentation.atom_fragment[bond.start.index()] == fragment.id) bond.start else bond.end;
-            const parent_endpoint = if (child_endpoint == bond.start) bond.end else bond.start;
-            const child_center = fragmentCenter(atoms, fragmentation.members(fragment.id));
-            var outward = openValenceDirection(atoms, graph, fragmentation, fragment.id, parent_endpoint, depth);
-            outward = scale(outward, bond_length / length(outward));
-            const target = add(atoms[parent_endpoint.index()].coordinates, outward);
-            var child_direction = subtract(child_center, atoms[child_endpoint.index()].coordinates);
-            if (length(child_direction) < 0.0001) child_direction = .{ .x = 1 };
-            var desired_child_direction = outward;
-            if (graph.degree(child_endpoint) == 2) {
-                desired_child_direction = rotateVector(scale(outward, -1), 2 * pi / 3);
-            }
-            const angle = std.math.atan2(desired_child_direction.y, desired_child_direction.x) - std.math.atan2(child_direction.y, child_direction.x);
-            const source = atoms[child_endpoint.index()].coordinates;
-            for (fragmentation.members(fragment.id)) |atom| {
-                atoms[atom.index()].coordinates = transformFromPivot(atoms[atom.index()].coordinates, source, target, angle);
-            }
-        }
-    }
-}
-
-fn openValenceDirection(
-    atoms: []const model.Atom,
-    graph: topology.Graph,
-    fragmentation: fragments.Fragmentation,
-    child: core.ids.FragmentId,
-    center: core.ids.AtomId,
-    child_depth: usize,
-) core.math.Vec2 {
-    var direction_sum: core.math.Vec2 = .{};
-    var first_direction: core.math.Vec2 = .{};
-    var count: usize = 0;
-    for (graph.neighbors(center)) |neighbor| {
-        const neighbor_fragment = fragmentation.atom_fragment[neighbor.index()];
-        if (neighbor_fragment == child or !neighbor_fragment.isValid() or
-            fragmentDepth(fragmentation.fragments, neighbor_fragment) >= child_depth) continue;
-        const direction = subtract(atoms[neighbor.index()].coordinates, atoms[center.index()].coordinates);
-        if (length(direction) < 0.0001) continue;
-        const normalized = scale(direction, 1 / length(direction));
-        if (count == 0) first_direction = normalized;
-        direction_sum = add(direction_sum, normalized);
-        count += 1;
-    }
-    if (count == 0) return .{ .x = 1 };
-    if (count == 1) return rotateVector(first_direction, -2 * pi / 3);
-    if (length(direction_sum) < 0.0001) return rotateVector(first_direction, pi);
-    return scale(direction_sum, -1 / length(direction_sum));
-}
-
-fn rotateVector(value: core.math.Vec2, angle: f32) core.math.Vec2 {
-    const cosine = @cos(angle);
-    const sine = @sin(angle);
-    return .{ .x = value.x * cosine - value.y * sine, .y = value.x * sine + value.y * cosine };
-}
-
 fn fragmentDepth(records: []const fragments.Fragment, fragment: core.ids.FragmentId) usize {
     var depth: usize = 0;
     var cursor = fragment;
@@ -834,12 +947,13 @@ fn fragmentDepth(records: []const fragments.Fragment, fragment: core.ids.Fragmen
     return depth;
 }
 
-fn alignConstrainedMainFragments(atoms: []model.Atom, fragmentation: fragments.Fragmentation) void {
-    for (fragmentation.main_fragments) |main| {
-        if (!main.isValid()) continue;
-        const fragment = fragmentation.fragments[main.index()];
-        if (!fragment.flags.constrained or fragment.flags.fixed) continue;
-        const members = fragmentation.members(main);
+/// `CoordgenFragmentBuilder::rotateMainFragment`, which upstream runs on a
+/// constrained root at the end of that root's own build.
+fn alignConstrainedMainFragment(atoms: []model.Atom, fragmentation: fragments.Fragmentation, fragment: fragments.Fragment) void {
+    {
+        if (fragment.parent.isValid()) return;
+        if (!fragment.flags.constrained or fragment.flags.fixed) return;
+        const members = fragmentation.members(fragment.id);
         var source_center: core.math.Vec2 = .{};
         var target_center: core.math.Vec2 = .{};
         var constrained_count: usize = 0;
@@ -849,7 +963,7 @@ fn alignConstrainedMainFragments(atoms: []model.Atom, fragmentation: fragments.F
             target_center = add(target_center, target);
             constrained_count += 1;
         };
-        if (constrained_count == 0) continue;
+        if (constrained_count == 0) return;
         source_center = scale(source_center, 1 / @as(f32, @floatFromInt(constrained_count)));
         target_center = scale(target_center, 1 / @as(f32, @floatFromInt(constrained_count)));
         var dot: f32 = 0;
@@ -868,6 +982,18 @@ fn alignConstrainedMainFragments(atoms: []model.Atom, fragmentation: fragments.F
     }
 }
 
+/// `sketcherMinimizerFragment::setAllCoordinatesToTemplate`, run by upstream on
+/// a fixed fragment at the end of its own build so that the frame the fragment
+/// is stored in is the template's.
+fn restoreFixedFragmentCoordinates(atoms: []model.Atom, fragmentation: fragments.Fragmentation, fragment: fragments.Fragment) void {
+    if (!fragment.flags.fixed) return;
+    for (fragmentation.members(fragment.id)) |atom| {
+        if (atoms[atom.index()].template_coordinates) |coordinate| atoms[atom.index()].coordinates = coordinate;
+    }
+}
+
+/// The same reset once more after assembly: a fixed atom keeps its input
+/// coordinates whatever the layout did with the fragment around it.
 fn restoreFixedCoordinates(atoms: []model.Atom) void {
     for (atoms) |*atom| if (atom.fixed) {
         if (atom.template_coordinates) |coordinate| atom.coordinates = coordinate;
@@ -883,11 +1009,10 @@ fn restoreFixedCoordinates(atoms: []model.Atom) void {
 /// transcription sat unreachable in the optimize layer, and their triggers
 /// disagreed as well. Two implementations of one upstream function is how that
 /// happened, so there is now exactly one, in the layer that calls it.
-fn fallbackOnValid3dCoordinates(atoms: []model.Atom, fragmentation: fragments.Fragmentation) void {
-    for (fragmentation.fragments) |fragment| {
-        const members = fragmentation.members(fragment.id);
-        if (!fragmentHasNan(atoms, members)) continue;
-        if (!fragmentHasValid3dSource(atoms, members)) continue;
+fn fallbackOnValid3dCoordinates(atoms: []model.Atom, members: []const core.ids.AtomId) void {
+    {
+        if (!fragmentHasNan(atoms, members)) return;
+        if (!fragmentHasValid3dSource(atoms, members)) return;
         for (members) |atom| {
             const source = atoms[atom.index()].coordinates_3d.?;
             // The 35x scale and the negated y are upstream's projection, and the
@@ -1082,21 +1207,599 @@ fn placeRingAtomSubstituents(
         atoms[ring_neighbours[best].index()].coordinates.x - origin.x,
     );
     var taken: usize = 0;
-    var placed_any = false;
     for (substituents[0..substituent_count]) |neighbor| {
-        if (fragmentation.atom_fragment[neighbor.index()] != fragment or placed[neighbor.index()]) continue;
+        if (placed[neighbor.index()] and fragmentation.atom_fragment[neighbor.index()] == fragment) continue;
         taken += 1;
         const angle = start + step * @as(f32, @floatFromInt(taken));
         atoms[neighbor.index()].coordinates = .{
             .x = origin.x + @cos(angle) * bond_length,
             .y = origin.y + @sin(angle) * bond_length,
         };
+        // As in the acyclic branch, a substituent belonging to another fragment
+        // takes its slot in the gap and is written there - that write is how its
+        // fragment learns its attachment direction - but it is not this
+        // fragment's atom to visit.
+        if (fragmentation.atom_fragment[neighbor.index()] != fragment) continue;
         placed[neighbor.index()] = true;
         queue[tail.*] = neighbor;
         tail.* += 1;
-        placed_any = true;
     }
-    return placed_any;
+    // The branch is chosen by the centre carrying rings, not by whether it
+    // turned out to place anything: a centre whose substituents were all placed
+    // already must not fall through to the fixed spread and be placed twice.
+    return true;
+}
+
+/// The widest degree this port's neighbour buffers carry. Upstream has no cap;
+/// a centre wider than this falls back to the fixed spread rather than being
+/// laid out from a truncated list.
+const max_neighbours = 16;
+
+/// Upstream's acyclic half of `initializeVariablesForNeighboursCoordinates`,
+/// together with the placement loop of
+/// `generateCoordinatesNeighborsOfFirstAtomInQueue` that consumes it. The two
+/// cannot be split: the angle list is indexed by position in the ordered
+/// neighbour list, so using upstream's angles requires walking upstream's list.
+///
+/// Native previously placed only the same-fragment unplaced neighbours, spread
+/// symmetrically about a single base direction. That dropped three things
+/// upstream does - priority ordering at degree four, the per-centre angles from
+/// `neighborsAnglesAtCenter`, and the cumulative rotation that a skipped
+/// neighbour still displaces - and the error compounded down a chain of joints
+/// (cgz-7v2.30).
+fn placeAcyclicNeighbours(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: core.ids.FragmentId,
+    center: core.ids.AtomId,
+    placed: []bool,
+    queue: []core.ids.AtomId,
+    tail: *usize,
+) core.errors.Error!bool {
+    const neighbours = graph.neighbors(center);
+    if (neighbours.len == 0 or neighbours.len > max_neighbours) return false;
+
+    var ordered: [max_neighbours]core.ids.AtomId = undefined;
+    try orderNeighbours(allocator, atoms, bonds, graph, membership, center, ordered[0..neighbours.len]);
+
+    // Upstream's visited set is fragment-local: it starts as this fragment's
+    // ring atoms, or its single start atom, and only ever gains atoms of this
+    // fragment. An atom another fragment already placed is not visited, so the
+    // test is `placed` narrowed to this fragment.
+    var direction: core.math.Vec2 = .{ .x = -bond_length, .y = 0 };
+    var start: usize = 0;
+    for (ordered[0..neighbours.len], 0..) |neighbor, index| {
+        if (!placed[neighbor.index()] or fragmentation.atom_fragment[neighbor.index()] != fragment) continue;
+        direction = subtract(atoms[neighbor.index()].coordinates, atoms[center.index()].coordinates);
+        start = index;
+        break;
+    }
+    std.mem.rotate(core.ids.AtomId, ordered[0..neighbours.len], start);
+
+    var angles: [max_neighbours]f32 = undefined;
+    neighbourAnglesAtCenter(atoms, bonds, graph, center, angles[0..neighbours.len]);
+
+    for (ordered[0..neighbours.len], angles[0..neighbours.len]) |neighbor, angle| {
+        // A visited neighbour is skipped before the rotation, so it holds its
+        // slot in the angle list without advancing the running direction.
+        if (placed[neighbor.index()] and fragmentation.atom_fragment[neighbor.index()] == fragment) continue;
+        direction = rotateClockwise(direction, angle);
+        atoms[neighbor.index()].coordinates = add(atoms[center.index()].coordinates, direction);
+        // A neighbour outside this fragment is written but neither visited nor
+        // queued: the write is what tells its own fragment where its attachment
+        // atom goes, and `FragmentFrames.store` reads it before the next
+        // fragment's build can overwrite it.
+        if (fragmentation.atom_fragment[neighbor.index()] != fragment) continue;
+        placed[neighbor.index()] = true;
+        queue[tail.*] = neighbor;
+        tail.* += 1;
+    }
+    // Handled, whether or not anything moved: the caller must not also run the
+    // fixed spread over the same centre.
+    return true;
+}
+
+/// Upstream takes the neighbours in input order everywhere except at degree
+/// four, where `sketcherMinimizerAtom::orderAtomPriorities` ranks them.
+fn orderNeighbours(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    center: core.ids.AtomId,
+    out: []core.ids.AtomId,
+) core.errors.Error!void {
+    const neighbours = graph.neighbors(center);
+    @memcpy(out, neighbours);
+    if (neighbours.len != 4) return;
+
+    var weights: [4]f32 = undefined;
+    for (neighbours, 0..) |neighbor, index| {
+        weights[index] = try neighbourPriorityWeight(allocator, atoms, bonds, graph, membership, center, neighbor);
+    }
+
+    // Upstream lifts the lowest weight out, then the lowest of what remains,
+    // and rebuilds the list with those two at the ends: long chains keep
+    // positions 2 and 3, side substituents take 1 and 4. Phosphorus and sulfur
+    // at degree four are the exception and take both lifted atoms up front.
+    var rest: [4]core.ids.AtomId = undefined;
+    var rest_weights: [4]f32 = undefined;
+    var rest_count: usize = 0;
+    for (neighbours, 0..) |neighbor, index| {
+        rest[rest_count] = neighbor;
+        rest_weights[rest_count] = weights[index];
+        rest_count += 1;
+    }
+    const first = takeLowestWeight(rest[0..rest_count], rest_weights[0..rest_count]);
+    rest_count -= 1;
+    const second = takeLowestWeight(rest[0..rest_count], rest_weights[0..rest_count]);
+    rest_count -= 1;
+
+    const center_element = atoms[center.index()].atomic_number;
+    if (center_element != .sulfur and center_element != .phosphorus) {
+        out[0] = first;
+        out[1] = rest[0];
+        out[2] = rest[1];
+        out[3] = second;
+    } else {
+        out[0] = first;
+        out[1] = rest[0];
+        out[2] = second;
+        out[3] = rest[1];
+    }
+}
+
+/// Remove and return the first atom holding the lowest weight, keeping the
+/// order of the rest, which is upstream's `erase` on both parallel vectors.
+fn takeLowestWeight(atoms: []core.ids.AtomId, weights: []f32) core.ids.AtomId {
+    var lowest: usize = 0;
+    for (weights, 0..) |weight, index| {
+        if (weight < weights[lowest]) lowest = index;
+    }
+    const taken = atoms[lowest];
+    var index = lowest;
+    while (index + 1 < atoms.len) : (index += 1) {
+        atoms[index] = atoms[index + 1];
+        weights[index] = weights[index + 1];
+    }
+    return taken;
+}
+
+/// The weight `sketcherMinimizerAtom::orderAtomPriorities` scores a neighbour
+/// by: the size of the branch behind it, adjusted by bond order, ring
+/// membership, element, and neighbouring stereochemistry.
+///
+/// One term of upstream's is absent: the -2000 for a neighbour that is
+/// `isSharedAndInner` while the centre is not. That flag is set only on the
+/// fusion atoms of a ring system whose every neighbour lies in both fused
+/// rings (CoordgenFragmentBuilder.cpp:975-995), and this port does not model
+/// it at all - inventing a value for it here would be a guess, not a
+/// transcription (cgz-7v2.31).
+fn neighbourPriorityWeight(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    center: core.ids.AtomId,
+    neighbor: core.ids.AtomId,
+) core.errors.Error!f32 {
+    const branch = try graph.reachableExcluding(allocator, neighbor, center);
+    defer allocator.free(branch);
+    var weight: f32 = @floatFromInt(branch.len);
+
+    const bond_id = bondBetween(graph, center, neighbor);
+    if (bond_id) |id| {
+        const order = bonds[id.index()].effective_order;
+        // So that =O gets lower priority than -OH in a phosphate.
+        if (order == .double) weight -= 0.25;
+        // Forcing the wedge away from the double bond in a sulphoxide.
+        if (atoms[center.index()].atomic_number == .sulfur and order == .double) weight += 2000;
+        // Upstream's test is sameRing on the bond's two atoms, not on the
+        // bond, so a bridging bond between two atoms of one ring counts.
+        if (sharesRing(membership, center, neighbor)) weight += 500;
+    }
+    if (atoms[neighbor.index()].atomic_number == .carbon) weight += 0.5;
+    if (atoms[neighbor.index()].atomic_number == .hydrogen) weight -= 0.5;
+    if (atoms[neighbor.index()].stereo != .unspecified) weight += 10000;
+    if (atoms[center.index()].cross_layout and graph.degree(neighbor) > 1) weight += 200;
+    for (graph.incidentBonds(neighbor)) |incident| if (bonds[incident.index()].effective_order == .double) {
+        weight += 100;
+        break;
+    };
+    return weight;
+}
+
+fn bondBetween(graph: topology.Graph, atom: core.ids.AtomId, other: core.ids.AtomId) ?core.ids.BondId {
+    for (graph.neighbors(atom), graph.incidentBonds(atom)) |neighbor, bond| {
+        if (neighbor == other) return bond;
+    }
+    return null;
+}
+
+/// `CoordgenFragmentBuilder::neighborsAnglesAtCenter`. `m_evenAngles` is
+/// upstream's constructor default of false and nothing in this port sets it,
+/// so only the uneven branch is transcribed.
+fn neighbourAnglesAtCenter(
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    center: core.ids.AtomId,
+    out: []f32,
+) void {
+    const neighbours = graph.neighbors(center);
+    var division = neighbours.len;
+    if (neighbours.len == 2) {
+        if (atoms[center.index()].atomic_number == .carbon or
+            !atoms[neighbours[0].index()].cross_layout or
+            !atoms[neighbours[1].index()].cross_layout) division = 3;
+        const incident = graph.incidentBonds(center);
+        const total = @intFromEnum(bonds[incident[0].index()].effective_order) +
+            @intFromEnum(bonds[incident[1].index()].effective_order);
+        if (total >= 4) division = 2;
+    } else if (neighbours.len == 4 and !atoms[center.index()].cross_layout) {
+        // Upstream's 60-90-120-90 around a tetracoordinated centre.
+        out[0] = pi / 3;
+        out[1] = pi * 0.5;
+        out[2] = 2 * pi / 3;
+        out[3] = pi * 0.5;
+        return;
+    }
+    for (out) |*angle| angle.* = 2 * pi / @as(f32, @floatFromInt(division));
+}
+
+/// `sketcherMinimizerPointF::rotate(sin a, cos a)` for a caller holding an
+/// angle rather than its sine and cosine.
+fn rotateClockwise(value: core.math.Vec2, angle: f32) core.math.Vec2 {
+    return rotateScreen(value, @sin(angle), @cos(angle));
+}
+
+// --- cgz-7v2.27: the child fragment's side choice -------------------------
+
+/// `sketcherMinimizer.cpp`'s three scoring multipliers, at their upstream
+/// values.
+const score_multiplier_for_double_bonds: f32 = 0.82;
+const score_multiplier_for_single_bonded_heteroatoms: f32 = 0.9;
+const score_multiplier_for_fragments: f32 = 0.1;
+
+/// Scratch for the side choice, sized once for the whole molecule rather than
+/// per fragment: `getAllTerminalBonds` can return at most every bond plus one
+/// per child plus the bond to the parent.
+const SideChoiceScratch = struct {
+    allocator: std.mem.Allocator,
+    /// Terminal bonds of the fragment being placed, and of its parent.
+    own_bonds: []OrientedBond,
+    parent_bonds: []OrientedBond,
+    /// One direction and score per surviving parent terminal bond.
+    directions: []core.math.Vec2,
+    scores: []f32,
+    /// `longestChainFromHere`, indexed by fragment.
+    longest_chain: []f32,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        bond_count: usize,
+        fragment_count: usize,
+    ) core.errors.Error!SideChoiceScratch {
+        const capacity = bond_count + fragment_count + 1;
+        const own_bonds = allocator.alloc(OrientedBond, capacity) catch return error.OutOfMemory;
+        errdefer allocator.free(own_bonds);
+        const parent_bonds = allocator.alloc(OrientedBond, capacity) catch return error.OutOfMemory;
+        errdefer allocator.free(parent_bonds);
+        const directions = allocator.alloc(core.math.Vec2, capacity) catch return error.OutOfMemory;
+        errdefer allocator.free(directions);
+        const scores = allocator.alloc(f32, capacity) catch return error.OutOfMemory;
+        errdefer allocator.free(scores);
+        const longest_chain = allocator.alloc(f32, fragment_count) catch return error.OutOfMemory;
+        return .{
+            .allocator = allocator,
+            .own_bonds = own_bonds,
+            .parent_bonds = parent_bonds,
+            .directions = directions,
+            .scores = scores,
+            .longest_chain = longest_chain,
+        };
+    }
+
+    fn deinit(self: *SideChoiceScratch) void {
+        self.allocator.free(self.longest_chain);
+        self.allocator.free(self.scores);
+        self.allocator.free(self.directions);
+        self.allocator.free(self.parent_bonds);
+        self.allocator.free(self.own_bonds);
+        self.* = undefined;
+    }
+};
+
+/// A terminal bond with its endpoints oriented the way upstream's scoring
+/// reads them: `start` on the side of the fragment whose list this is, `end`
+/// on the far side.
+///
+/// Upstream can use `bond->startAtom` and `bond->endAtom` directly because a
+/// fragment's `_bondToParent` is built parent-first. Native stores bonds in
+/// canonical input order, which on the drug-like corpus is child-first
+/// (`3-2`, `5-2`, ...), so reading `bond.start` here selects the wrong atom.
+/// It is not a latent difference: taking the stored direction made
+/// `scoreDirections` skip every child bond, which left single-atom fragments
+/// with nothing to score and no side choice at all - measured as centres 2 and
+/// 5 of drug_like/4 coming out mirrored.
+const OrientedBond = struct {
+    id: core.ids.BondId,
+    start: core.ids.AtomId,
+    end: core.ids.AtomId,
+};
+
+/// `sketcherMinimizer::getAllTerminalBonds`: every bond of the fragment with a
+/// degree-one endpoint, then one bond per child, then the bond to the parent.
+///
+/// Upstream walks `fragment->getBonds()` in the fragment's own stored order.
+/// This walks the molecule's bonds in index order and keeps those with both
+/// endpoints in the fragment, which is the order-stable reading of that
+/// (cgz-r13); the scoring below takes a strict maximum, so the order is
+/// observable only through ties.
+///
+/// Residue interactions are skipped upstream. Native models them outside
+/// `bonds` entirely, so there is nothing here to skip.
+fn collectTerminalBonds(
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+    out: []OrientedBond,
+) []OrientedBond {
+    var count: usize = 0;
+    for (bonds) |bond| {
+        if (fragmentation.atom_fragment[bond.start.index()] != fragment.id or
+            fragmentation.atom_fragment[bond.end.index()] != fragment.id) continue;
+        if (graph.degree(bond.start) != 1 and graph.degree(bond.end) != 1) continue;
+        if (count == out.len) return out[0..count];
+        // Both endpoints are inside the fragment, so either orientation reads
+        // the same: the midpoint, the degree test and the heteroatom test are
+        // all symmetric.
+        out[count] = .{ .id = bond.id, .start = bond.start, .end = bond.end };
+        count += 1;
+    }
+    for (fragmentation.fragments) |candidate| {
+        if (candidate.parent != fragment.id or !candidate.bond_to_parent.isValid()) continue;
+        const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+        const parent_side = parentEndpoint(bonds, fragmentation, candidate) orelse continue;
+        if (count == out.len) return out[0..count];
+        out[count] = .{ .id = candidate.bond_to_parent, .start = parent_side, .end = child_attachment };
+        count += 1;
+    }
+    if (fragment.bond_to_parent.isValid() and count != out.len) {
+        // Oriented outward, so `scoreDirections`'s "starts in this fragment"
+        // test skips it exactly as upstream's does.
+        if (attachmentAtom(bonds, fragmentation, fragment)) |inside| {
+            if (parentEndpoint(bonds, fragmentation, fragment)) |outside| {
+                out[count] = .{ .id = fragment.bond_to_parent, .start = outside, .end = inside };
+                count += 1;
+            }
+        }
+    }
+    return out[0..count];
+}
+
+/// `sketcherMinimizer::assignLongestChainFromHere`, computed for every fragment
+/// at once. The recursion is replaced by a walk from the deepest fragments
+/// upward, which visits every child before its parent and needs no stack.
+///
+/// `positionFromParent` upstream is the fragment's attachment atom read out of
+/// its parent's own frame, which is exactly what `FragmentFrames.attachment`
+/// holds.
+fn assignLongestChains(
+    fragmentation: fragments.Fragmentation,
+    frames: FragmentFrames,
+    longest_chain: []f32,
+) void {
+    @memset(longest_chain, 0);
+    var depth = fragmentation.fragments.len;
+    while (depth > 0) {
+        depth -= 1;
+        for (fragmentation.fragments) |fragment| {
+            if (fragmentDepth(fragmentation.fragments, fragment.id) != depth) continue;
+            var longest: f32 = 0;
+            for (fragmentation.fragments) |candidate| {
+                if (candidate.parent != fragment.id) continue;
+                longest = @max(longest, longest_chain[candidate.id.index()]);
+            }
+            const offset = frames.attachment[fragment.id.index()];
+            const from_parent = if (fragment.parent.isValid())
+                @sqrt(offset.x * offset.x + offset.y * offset.y)
+            else
+                0;
+            longest_chain[fragment.id.index()] = longest + from_parent;
+        }
+    }
+}
+
+/// The position an atom holds in `fragment`'s own frame. Upstream's
+/// `_coordinates` map covers the fragment's own atoms and, additionally, the
+/// attachment atom of each of its children; both are stored here, in the two
+/// halves of `FragmentFrames`.
+fn frameCoordinate(
+    bonds: []const model.Bond,
+    fragmentation: fragments.Fragmentation,
+    frames: FragmentFrames,
+    fragment: fragments.Fragment,
+    atom: core.ids.AtomId,
+) core.math.Vec2 {
+    if (fragmentation.atom_fragment[atom.index()] == fragment.id) return frames.own[atom.index()];
+    for (fragmentation.fragments) |candidate| {
+        if (candidate.parent != fragment.id) continue;
+        const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+        if (child_attachment == atom) return frames.attachment[candidate.id.index()];
+    }
+    return frames.own[atom.index()];
+}
+
+fn normalized(value: core.math.Vec2) core.math.Vec2 {
+    const magnitude = @sqrt(value.x * value.x + value.y * value.y);
+    if (magnitude == 0) return value;
+    return .{ .x = value.x / magnitude, .y = value.y / magnitude };
+}
+
+/// The shared part of both scoring loops: a double bond is worth less, and a
+/// bond to a terminal heteroatom is worth less again.
+fn terminalBondScoreModifier(
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    bond: OrientedBond,
+) f32 {
+    var score: f32 = 1;
+    if (bonds[bond.id.index()].effective_order == .double) score *= score_multiplier_for_double_bonds;
+    if ((graph.degree(bond.start) == 1 and atoms[bond.start.index()].atomic_number != .carbon) or
+        (graph.degree(bond.end) == 1 and atoms[bond.end.index()].atomic_number != .carbon))
+    {
+        score *= score_multiplier_for_single_bonded_heteroatoms;
+    }
+    return score;
+}
+
+/// `sketcherMinimizer::findDirectionsToAlignWith`: the directions, in the
+/// molecule's own placed coordinates, that point from the parent's terminal
+/// bonds toward the bond this fragment hangs off. These are what the fragment's
+/// own terminal bonds are then asked to line up with.
+fn findDirectionsToAlignWith(
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+    scratch: SideChoiceScratch,
+) usize {
+    const parent = fragmentation.fragments[fragment.parent.index()];
+    const attachment = attachmentAtom(bonds, fragmentation, fragment) orelse return 0;
+    const parent_atom = parentEndpoint(bonds, fragmentation, fragment) orelse return 0;
+    const origin = scale(add(
+        atoms[parent_atom.index()].coordinates,
+        atoms[attachment.index()].coordinates,
+    ), 0.5);
+
+    var count: usize = 0;
+    for (collectTerminalBonds(bonds, graph, fragmentation, parent, scratch.parent_bonds)) |bond| {
+        if (fragmentation.atom_fragment[bond.end.index()] == fragment.id) continue;
+        const midpoint = scale(add(
+            atoms[bond.start.index()].coordinates,
+            atoms[bond.end.index()].coordinates,
+        ), 0.5);
+        var score = terminalBondScoreModifier(atoms, bonds, graph, bond);
+        // A bond that leaves the parent is scored by how much molecule hangs
+        // off it rather than by what it is, and a bond running back toward the
+        // grandparent outranks everything.
+        if (fragmentation.atom_fragment[bond.end.index()] != parent.id or
+            fragmentation.atom_fragment[bond.start.index()] != parent.id)
+        {
+            const end_fragment = fragmentation.atom_fragment[bond.end.index()];
+            score = scratch.longest_chain[end_fragment.index()] * score_multiplier_for_fragments;
+            if (parent.parent.isValid() and
+                fragmentation.atom_fragment[bond.start.index()] == parent.parent) score *= 100;
+        }
+        if (count == scratch.directions.len) break;
+        scratch.directions[count] = normalized(subtract(origin, midpoint));
+        scratch.scores[count] = score;
+        count += 1;
+    }
+    return count;
+}
+
+/// `sketcherMinimizer::testAlignment`: how well one direction lines up with one
+/// target, squared, with a large bonus for an exact match.
+fn testAlignment(direction: core.math.Vec2, target: core.math.Vec2, weight: f32) f32 {
+    var dot = direction.x * target.x + direction.y * target.y;
+    if (dot < 0) dot = 0;
+    var score = dot * dot;
+    if (dot > 1 - sketcher_epsilon) score += 1000;
+    return score * weight;
+}
+
+/// `sketcherMinimizer::scoreDirections`, reduced to the one thing its caller
+/// uses: whether the fragment should be flipped about its bond to the parent.
+///
+/// Each of the fragment's own terminal bonds is taken in its frame, both as it
+/// stands and mirrored in y, turned by the angle the fragment is about to be
+/// placed at, and scored against every direction found above. The better of the
+/// two readings wins, and if that is the mirrored one the fragment is flipped.
+fn shouldInvertAgainstParent(
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    fragmentation: fragments.Fragmentation,
+    frames: FragmentFrames,
+    fragment: fragments.Fragment,
+    angle: f32,
+    scratch: SideChoiceScratch,
+) bool {
+    const direction_count = findDirectionsToAlignWith(atoms, bonds, graph, fragmentation, fragment, scratch);
+    if (direction_count == 0) return false;
+
+    var best_score: f32 = 0;
+    var invert = false;
+    for (collectTerminalBonds(bonds, graph, fragmentation, fragment, scratch.own_bonds)) |bond| {
+        if (fragmentation.atom_fragment[bond.start.index()] != fragment.id) continue;
+        const midpoint = scale(add(
+            frameCoordinate(bonds, fragmentation, frames, fragment, bond.start),
+            frameCoordinate(bonds, fragmentation, frames, fragment, bond.end),
+        ), 0.5);
+        // The frame's own origin for this purpose is half a bond length back
+        // along -x, which is where the bond to the parent enters it.
+        const plain = normalized(subtract(midpoint, .{ .x = -bond_length * 0.5, .y = 0 }));
+        const inverted: core.math.Vec2 = .{ .x = plain.x, .y = -plain.y };
+        const turned_plain = rotateClockwise(plain, angle);
+        const turned_inverted = rotateClockwise(inverted, angle);
+
+        var modifier = terminalBondScoreModifier(atoms, bonds, graph, bond);
+        if (fragmentation.atom_fragment[bond.end.index()] != fragment.id) {
+            const end_fragment = fragmentation.atom_fragment[bond.end.index()];
+            modifier = scratch.longest_chain[end_fragment.index()] * score_multiplier_for_fragments;
+        }
+        for (scratch.directions[0..direction_count], scratch.scores[0..direction_count]) |target, weight| {
+            // Strict `>`, so the first reading to reach a score keeps it.
+            if (testAlignment(turned_plain, target, weight) * modifier > best_score) {
+                best_score = testAlignment(turned_plain, target, weight) * modifier;
+                invert = false;
+            }
+            if (testAlignment(turned_inverted, target, weight) * modifier > best_score) {
+                best_score = testAlignment(turned_inverted, target, weight) * modifier;
+                invert = true;
+            }
+        }
+    }
+    return invert;
+}
+
+/// `sketcherMinimizer::alignWithParentDirection`'s effect on the pose: mirror
+/// the fragment's stored frame in y, which rotates it 180 degrees about the
+/// bond it hangs off once the frame is placed. The children's attachment
+/// positions live in this frame too and are mirrored with it, so a whole
+/// subtree follows.
+///
+/// Upstream also inverts the wedge/hash of any stereo bond on a flipped atom.
+/// Native does not, deliberately: bond displays are assigned after layout by
+/// `topology.stereo.writeAtomBondDisplays`, from the geometry this function has
+/// already settled, so the inversion happens on its own. That path is exact on
+/// the drug-like partition (`bond_displays` 7/7), and flipping here as well
+/// would invert it twice.
+fn mirrorFragmentFrame(
+    bonds: []const model.Bond,
+    fragmentation: fragments.Fragmentation,
+    frames: FragmentFrames,
+    fragment: fragments.Fragment,
+) void {
+    for (fragmentation.members(fragment.id)) |atom| {
+        frames.own[atom.index()].y = -frames.own[atom.index()].y;
+    }
+    for (fragmentation.fragments) |candidate| {
+        if (candidate.parent != fragment.id) continue;
+        if (attachmentAtom(bonds, fragmentation, candidate) == null) continue;
+        frames.attachment[candidate.id.index()].y = -frames.attachment[candidate.id.index()].y;
+    }
 }
 
 fn sharesRing(membership: topology.RingMembership, left: core.ids.AtomId, right: core.ids.AtomId) bool {
@@ -1233,7 +1936,7 @@ test "macrocycles dispatch through native polyomino placement" {
         atoms[bonds[opened.index()].start.index()].coordinates,
         atoms[bonds[opened.index()].end.index()].coordinates,
     ) - bond_length) > 0.001);
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         layoutWithOptionsAndDiscard,
         .{ &atoms, &bonds, graph, rings, split, true },
@@ -1322,7 +2025,7 @@ test "fused rings align on their shared edge and extend outward" {
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         layoutAndDiscard,
         .{ &atoms, &bonds, graph, rings, split },
@@ -1464,7 +2167,7 @@ test "fragment assembly preserves every acyclic parent bond length" {
         }
         try std.testing.expect(found);
     }
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         captureFramesAndDiscard,
         .{ &atoms, &bonds, split },
@@ -1485,6 +2188,40 @@ test "fragment assembly preserves every acyclic parent bond length" {
             0.001,
         );
     };
+}
+
+test "wide acyclic centers preserve child attachment bond lengths" {
+    const branch_count = max_neighbours + 1;
+    var atoms: [1 + branch_count * 2]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    var bonds: [branch_count * 2]model.Bond = undefined;
+    for (0..branch_count) |branch_index| {
+        const branch = 1 + branch_index;
+        const terminal = 1 + branch_count + branch_index;
+        bonds[branch_index] = .{
+            .id = core.ids.BondId.fromIndex(@intCast(branch_index)),
+            .input_index = @intCast(branch_index),
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(@intCast(branch)),
+            .input_order = .single,
+            .effective_order = .single,
+        };
+        bonds[branch_count + branch_index] = .{
+            .id = core.ids.BondId.fromIndex(@intCast(branch_count + branch_index)),
+            .input_index = @intCast(branch_count + branch_index),
+            .start = core.ids.AtomId.fromIndex(@intCast(branch)),
+            .end = core.ids.AtomId.fromIndex(@intCast(terminal)),
+            .input_order = .single,
+            .effective_order = .single,
+        };
+    }
+
+    try layoutFixture(&atoms, &bonds);
+    try expectBondLengths(&atoms, &bonds);
 }
 
 test "constrained alignment and fixed reset are deterministic" {
@@ -1539,7 +2276,7 @@ test "the 3D fallback applies upstream's scaled, mirrored projection" {
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
 
-    fallbackOnValid3dCoordinates(&atoms, split);
+    for (split.fragments) |fragment| fallbackOnValid3dCoordinates(&atoms, split.members(fragment.id));
     // 35x, y negated, rounded to two decimals - not the raw 3D x/y a hand-rolled
     // version used to copy through.
     for (atoms, 0..) |atom, index| {
@@ -1550,7 +2287,7 @@ test "the 3D fallback applies upstream's scaled, mirrored projection" {
 
     // An infinity is not NaN, so it does not trigger the fallback at all.
     for (&atoms) |*atom| atom.coordinates = .{ .x = std.math.inf(f32), .y = 0 };
-    fallbackOnValid3dCoordinates(&atoms, split);
+    for (split.fragments) |fragment| fallbackOnValid3dCoordinates(&atoms, split.members(fragment.id));
     for (atoms) |atom| try std.testing.expectEqual(std.math.inf(f32), atom.coordinates.x);
 
     // A missing 3D source declines; and the sentinel is a one-sided ceiling, so
@@ -1559,7 +2296,7 @@ test "the 3D fallback applies upstream's scaled, mirrored projection" {
         atom.coordinates = .{ .x = std.math.nan(f32), .y = 0 };
         atom.coordinates_3d = null;
     }
-    fallbackOnValid3dCoordinates(&atoms, split);
+    for (split.fragments) |fragment| fallbackOnValid3dCoordinates(&atoms, split.members(fragment.id));
     for (atoms) |atom| try std.testing.expect(std.math.isNan(atom.coordinates.x));
 
     for (&atoms) |*atom| atom.coordinates_3d = .{ .x = -std.math.inf(f32), .y = 0, .z = 0 };
