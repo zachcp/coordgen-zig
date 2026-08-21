@@ -1,10 +1,9 @@
 //! Out-of-memory coverage for the port's fallible paths (cgz-5q6).
 //!
 //! `checkAllocationFailures` replaces `std.testing.checkAllAllocationFailures`
-//! at every call site in this tree. It asserts the same two things the port
-//! actually wants - that every allocation failure propagates out, and that no
-//! path leaks on the way - and drops a third that std also asserts and that
-//! this codebase never intended to.
+//! at every call site in this tree. It asserts that every allocation failure
+//! propagates out, that no path leaks on the way, and that every measured run
+//! reaches the allocation index it is meant to exercise.
 //!
 //! ## What std also asserts, and why it does not hold here
 //!
@@ -24,24 +23,15 @@
 //! covered paths, several with combinatorial counts where a counting pass
 //! means running the enumeration twice.
 //!
-//! ## Why this is not a weakened gate (cgz-r21)
+//! ## Making the count stable
 //!
-//! The property being dropped was never the subject. It held by luck, and its
-//! failure mode is actively harmful: a genuine leak introduced alongside any
-//! allocation-count change is reported as `NondeterministicMemoryUsage`, which
-//! is indistinguishable from the accidental case, so the real finding is the
-//! one that gets dismissed.
-//!
-//! Both real assertions are kept unchanged, and exactly one is dropped: a run
-//! that completes without inducing its failure is skipped rather than failed.
-//! Note what that costs, because it is a real cost and not nothing. A run only
-//! completes without inducing when it allocated fewer times than the run that
-//! set the range, so those allocations of the LONGER run go untried. Extending
-//! the range from such a run cannot recover them - on the failing path the
-//! count reached equals the index being failed, and on the succeeding path it
-//! is below it, so an observed count is never above the range. Covering them
-//! needs the counts to be stable, which is the underlying fix this helper
-//! defers rather than performs.
+//! The allocator presented to the tested function deliberately declines every
+//! in-place `resize` and `remap`. Growable containers therefore take their
+//! specified allocate-copy-free fallback instead of depending on whether the
+//! backing heap happens to extend a block in place. A count that still varies
+//! is a property of the tested function, not of heap placement, and remains a
+//! hard failure: silently skipping that index would leave later allocation
+//! sites untested.
 //!
 //! The tests at the bottom of this file plant each violation the helper must
 //! still catch: a leak on an OOM path, a swallowed OOM, and a propagated
@@ -50,6 +40,43 @@
 //! build-step gates.
 
 const std = @import("std");
+
+/// Preserve allocation and free while declining in-place growth, whose success
+/// depends on the backing heap's current shape. Allocator clients must already
+/// support this; `realloc` falls back to allocating and copying.
+const NoInPlaceAllocator = struct {
+    backing: std.mem.Allocator,
+
+    fn allocator(self: *NoInPlaceAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const self: *NoInPlaceAllocator = @ptrCast(@alignCast(context));
+        return self.backing.rawAlloc(len, alignment, return_address);
+    }
+
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const self: *NoInPlaceAllocator = @ptrCast(@alignCast(context));
+        self.backing.rawFree(memory, alignment, return_address);
+    }
+};
 
 /// Run `test_fn` once per allocation it makes, failing that allocation, and
 /// require that the failure propagates out as `error.OutOfMemory` with every
@@ -63,50 +90,63 @@ pub fn checkAllocationFailures(
     comptime test_fn: anytype,
     extra_args: anytype,
 ) !void {
+    return checkAllocationFailuresInternal(backing_allocator, test_fn, extra_args, true);
+}
+
+fn checkAllocationFailuresInternal(
+    backing_allocator: std.mem.Allocator,
+    comptime test_fn: anytype,
+    extra_args: anytype,
+    report_leak: bool,
+) !void {
+    var no_in_place = NoInPlaceAllocator{ .backing = backing_allocator };
+    const stable_allocator = no_in_place.allocator();
     // The unconstrained run has to succeed before failing anything is
     // meaningful, and it establishes how many indices there are to try.
     const total: usize = count: {
-        var counting = std.testing.FailingAllocator.init(backing_allocator, .{});
+        var counting = std.testing.FailingAllocator.init(stable_allocator, .{});
         try @call(.auto, test_fn, .{counting.allocator()} ++ extra_args);
         break :count counting.alloc_index;
     };
 
     var fail_index: usize = 0;
     while (fail_index < total) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(backing_allocator, .{
+        var failing = std.testing.FailingAllocator.init(stable_allocator, .{
             .fail_index = fail_index,
         });
         if (@call(.auto, test_fn, .{failing.allocator()} ++ extra_args)) |_| {
             // Succeeding after being denied an allocation means the failure was
             // caught and hidden. That is a real defect and still fails here.
             if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
-            // Otherwise this run simply allocated fewer times than the run that
-            // set the range, and never reached the index being failed. Nothing
-            // was tested and nothing is wrong; carry on.
-            continue;
+            // The no-in-place wrapper removes heap-layout-dependent variation.
+            // A remaining count change belongs to the tested function and
+            // means this allocation index was not exercised.
+            return error.NondeterministicMemoryUsage;
         } else |err| switch (err) {
             error.OutOfMemory => {
                 if (failing.allocated_bytes != failing.freed_bytes) {
-                    std.debug.print(
-                        "\nleak on the out-of-memory path" ++
-                            "\n  fail_index: {d} of {d}" ++
-                            "\n  allocated bytes: {d}" ++
-                            "\n  freed bytes: {d}" ++
-                            "\n  allocations: {d}" ++
-                            "\n  deallocations: {d}" ++
-                            "\n  allocation that was made to fail: {f}\n",
-                        .{
-                            fail_index,
-                            total,
-                            failing.allocated_bytes,
-                            failing.freed_bytes,
-                            failing.allocations,
-                            failing.deallocations,
-                            std.debug.FormatStackTrace{
-                                .stack_trace = failing.getStackTrace(),
+                    if (report_leak) {
+                        std.debug.print(
+                            "\nleak on the out-of-memory path" ++
+                                "\n  fail_index: {d} of {d}" ++
+                                "\n  allocated bytes: {d}" ++
+                                "\n  freed bytes: {d}" ++
+                                "\n  allocations: {d}" ++
+                                "\n  deallocations: {d}" ++
+                                "\n  allocation that was made to fail: {f}\n",
+                            .{
+                                fail_index,
+                                total,
+                                failing.allocated_bytes,
+                                failing.freed_bytes,
+                                failing.allocations,
+                                failing.deallocations,
+                                std.debug.FormatStackTrace{
+                                    .stack_trace = failing.getStackTrace(),
+                                },
                             },
-                        },
-                    );
+                        );
+                    }
                     return error.MemoryLeakDetected;
                 }
             },
@@ -169,7 +209,7 @@ test "a leak on the out-of-memory path is still caught" {
     defer arena.deinit();
     try std.testing.expectError(
         error.MemoryLeakDetected,
-        checkAllocationFailures(arena.allocator(), leaksTheFirstAllocation, .{}),
+        checkAllocationFailuresInternal(arena.allocator(), leaksTheFirstAllocation, .{}, false),
     );
 }
 
@@ -187,20 +227,14 @@ test "an unrelated error propagates rather than being read as a memory finding" 
     );
 }
 
-test "an allocation count that varies between runs is tolerated, not reported" {
-    // This is exactly what std reports as NondeterministicMemoryUsage, and the
-    // one assertion this helper drops. Asserted rather than described, so the
-    // difference between the two is a test rather than a comment.
+test "an allocation count that varies after in-place growth is disabled is rejected" {
     var calls: usize = 0;
-    try checkAllocationFailures(std.testing.allocator, allocatesFewerTimesAfterTheFirstCall, .{&calls});
-
-    var std_calls: usize = 0;
     try std.testing.expectError(
         error.NondeterministicMemoryUsage,
-        std.testing.checkAllAllocationFailures(
+        checkAllocationFailures(
             std.testing.allocator,
             allocatesFewerTimesAfterTheFirstCall,
-            .{&std_calls},
+            .{&calls},
         ),
     );
 }

@@ -110,9 +110,9 @@ fn initializeCoordinatesInternal(
         }
         while (head < tail) : (head += 1) {
             const center = queue[head];
-            var unplaced_count: usize = 0;
+            var fallback_count: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
-                if (fragmentation.atom_fragment[neighbor.index()] == fragment.id and !placed[neighbor.index()]) unplaced_count += 1;
+                if (!placed[neighbor.index()] or fragmentation.atom_fragment[neighbor.index()] != fragment.id) fallback_count += 1;
             }
             // No early exit when every in-fragment neighbour is already placed:
             // a centre can still owe a position to a neighbour in a child
@@ -130,20 +130,21 @@ fn initializeCoordinatesInternal(
             const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
             var generated: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
-                if (fragmentation.atom_fragment[neighbor.index()] != fragment.id or placed[neighbor.index()]) continue;
-                const spread = if (unplaced_count == 1)
+                if (placed[neighbor.index()] and fragmentation.atom_fragment[neighbor.index()] == fragment.id) continue;
+                const spread = if (fallback_count == 1)
                     @as(f32, 0)
                 else
-                    (@as(f32, @floatFromInt(generated)) - @as(f32, @floatFromInt(unplaced_count - 1)) * 0.5) * (2 * pi / 3);
+                    (@as(f32, @floatFromInt(generated)) - @as(f32, @floatFromInt(fallback_count - 1)) * 0.5) * (2 * pi / 3);
                 const angle = base_angle + spread;
                 atoms[neighbor.index()].coordinates = .{
                     .x = atoms[center.index()].coordinates.x + @cos(angle) * bond_length,
                     .y = atoms[center.index()].coordinates.y + @sin(angle) * bond_length,
                 };
+                generated += 1;
+                if (fragmentation.atom_fragment[neighbor.index()] != fragment.id) continue;
                 placed[neighbor.index()] = true;
                 queue[tail] = neighbor;
                 tail += 1;
-                generated += 1;
             }
         }
         // Upstream's order inside buildFragment is fallbackIfNanCoordinates,
@@ -2187,6 +2188,40 @@ test "fragment assembly preserves every acyclic parent bond length" {
             0.001,
         );
     };
+}
+
+test "wide acyclic centers preserve child attachment bond lengths" {
+    const branch_count = max_neighbours + 1;
+    var atoms: [1 + branch_count * 2]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    var bonds: [branch_count * 2]model.Bond = undefined;
+    for (0..branch_count) |branch_index| {
+        const branch = 1 + branch_index;
+        const terminal = 1 + branch_count + branch_index;
+        bonds[branch_index] = .{
+            .id = core.ids.BondId.fromIndex(@intCast(branch_index)),
+            .input_index = @intCast(branch_index),
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(@intCast(branch)),
+            .input_order = .single,
+            .effective_order = .single,
+        };
+        bonds[branch_count + branch_index] = .{
+            .id = core.ids.BondId.fromIndex(@intCast(branch_count + branch_index)),
+            .input_index = @intCast(branch_count + branch_index),
+            .start = core.ids.AtomId.fromIndex(@intCast(branch)),
+            .end = core.ids.AtomId.fromIndex(@intCast(terminal)),
+            .input_order = .single,
+            .effective_order = .single,
+        };
+    }
+
+    try layoutFixture(&atoms, &bonds);
+    try expectBondLengths(&atoms, &bonds);
 }
 
 test "constrained alignment and fixed reset are deterministic" {

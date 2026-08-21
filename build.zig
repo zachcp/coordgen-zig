@@ -1315,10 +1315,7 @@ pub fn build(b: *std.Build) !void {
             "Regenerate the published native-vs-oracle baseline from this build",
         );
         native_baseline_step.dependOn(&publish_baseline.step);
-        // `conformance` deliberately does not depend on the gate: while the
-        // differential is expected red, attaching it here would report every
-        // other conformance failure underneath a failure everyone is already
-        // waiting on. The gate keeps its own step and its own exit code.
+        conformance_step.dependOn(native_diff_step);
 
         conformance_step.dependOn(oracle_step);
     } else {
