@@ -27,6 +27,79 @@ in [`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md). Note that the tier assignment
 inputs (`conformance/parity_expectations.tsv`) bound oracle against *perturbed
 oracle*; they are not native-vs-oracle tolerances.
 
+`SUCCESS_CRITERIA.md`'s tier-3 section used to read "on this corpus,
+coordinates on the 1414 arch-divergent adversarial members". `cgz-r13` rejected
+exactly that reading: demoting 70.7% of the adversarial corpus to the invariant
+tier would leave the port proving almost nothing about the observable it exists
+to produce, and the same-build rule means the runner never sees the architecture
+axis at all. `cgz-r30` settled it — `cgz-r13` governs, the sentence is
+withdrawn, and the invariant/statistical tier is **unpopulated** at the pin.
+
+## The differential runner's per-pair rule
+
+`cgz-r26` settles which artifact the runner reads. There are three, and only
+one of them is authoritative for the parity ceiling.
+
+| Artifact | Keyed by | Portable | Authoritative for |
+|---|---|---|---|
+| `conformance/parity_expectations.tsv` | (partition, observable) | yes | how often the *oracle* may disagree with itself, as a fraction |
+| `conformance/parity_manifest.tsv` | corpus member, per build | **no** | published evidence for the build that produced it |
+| `conformance/parity_ceiling.tsv` | (member, observable) | yes | **the parity ceiling** |
+
+The expectations file cannot carry the ceiling: its schema is per-partition
+fractions and a fraction permits *N* failures without naming which *N*, which is
+the budget framing `cgz-r13` rejected. The manifest names members but is a
+per-(architecture, toolchain, optimize-mode) artifact, so a gate reading it
+changes meaning per host. The ceiling file exists because the enumeration needs
+both properties at once: named members *and* the same meaning everywhere.
+
+A member is identified as `{partition}/{index}` — the key
+`tests/oracle_corpus_run.zig` and the manifest already use. That identity is
+portable because `src/conformance/corpus.zig` generates every member from
+nothing but those two values: the xorshift64\* PRNG is pinned by value rather
+than taken from a std default, `generateAdversarial` seeds `Rng.init(index)` so
+no member depends on any other, and every draw is integer arithmetic and modulo
+reduction over a fixed element table. There is no float, no clock, no file, and
+no allocator-ordered iteration in generation, so a toolchain bump, an
+optimize-mode change, and a different architecture all produce the same
+molecule. The one thing the identity does not survive is an edit to the
+generator, which would leave every row parsing while silently naming a
+different molecule — so each row also carries the SHA-256 of the member's
+canonical dump, and `zig build parity-ceiling-check` regenerates the member and
+compares. That gate needs no oracle, which is the point.
+
+`comparison.differentialComparison` is the executable form of the rule:
+
+1. Order-stable pair → its ordinary tier. Exact for structural observables,
+   tolerant at `T` for coordinates and derived floats.
+2. Order-unstable pair with an enumerated row → tolerant, at the row's
+   published bound if it has one and at `T` if it does not. A row without a
+   bound excuses the pair from *exact* comparison and widens nothing.
+3. Order-unstable pair with no row → `error.UnenumeratedOrderInstability`.
+   **Fail closed.** Falling through to the invariant tier would let any newly
+   unstable pair demote itself to the weakest comparison in the policy, which
+   is exactly what enumerating the ceiling prevents.
+
+Stability here means the **heap-address-order axis alone**. The architecture
+axis is not an input: the same-build rule below means both sides of every
+comparison share a target, so architectural divergence is not a difference the
+runner can observe. `tierFor` predates this rule and reads
+`Stability.exact()`, which is both axes; runners must use
+`differentialComparison`.
+
+The file cannot express a weakening. Its loader rejects an observable whose
+normal tier is exact — structural observables stay exact on ceiling members
+too — rejects a bound on any observable but `coordinates`, since that is the
+only one the classifier measures a per-member magnitude for, and rejects a
+bound at or above 1.0 bond lengths, the boundary above which a "tolerant" pass
+no longer means the layout matched. Admitting a member is a review event with a
+recorded measurement, the same standing as regenerating the manifest.
+
+`zig build corpus-check` enforces the same rule against the measurement:
+any (member, observable) pair the classifier finds order-unstable and the
+enumeration does not name fails the build by name. A row whose pair is stable
+on some host is not a failure — a row is permission, not obligation.
+
 ## Geometry and chirality
 
 Coordinate normalization may translate and rotate. It must not reflect by

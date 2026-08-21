@@ -7,10 +7,14 @@ const optimize = @import("optimize");
 
 pub const components = @import("components.zig");
 pub const residues = @import("residues.zig");
+pub const bends = @import("bends.zig");
+pub const inversions = @import("inversions.zig");
 
 test {
     _ = components;
     _ = residues;
+    _ = bends;
+    _ = inversions;
 }
 
 /// Restricted proof result. Coordinates and both maps are allocator-owned;
@@ -30,10 +34,55 @@ pub const Result = struct {
     }
 };
 
+/// Caller-owned destinations for one generation. Every slice is indexed by
+/// caller input order; `coordinates`, `input_to_internal`, and `atom_stereo`
+/// are atom-indexed, the two bond slices are bond-indexed, and
+/// `internal_to_input` is the permutation itself. The three optional slices
+/// exist because `generateValidated` does not need them; the public API
+/// (cgz-7v2.21) does, and both go through one pipeline rather than two.
+pub const Outputs = struct {
+    coordinates: []core.math.Vec2,
+    input_to_internal: []u32,
+    internal_to_input: []core.ids.InputIndex,
+    effective_bond_orders: ?[]core.chemistry.BondOrder = null,
+    bond_displays: ?[]core.chemistry.BondDisplay = null,
+    atom_stereo: ?[]core.chemistry.AtomStereo = null,
+    /// The pose as it stands immediately before global orientation, in caller
+    /// input order. Conformance-only: the oracle publishes the same stage
+    /// through its probe hook, and comparing there separates a layout
+    /// divergence from an orientation one, which the final coordinates alone
+    /// cannot (cgz-7v2.4.2.1). No production caller requests it.
+    pre_orientation: ?[]core.math.Vec2 = null,
+};
+
 /// Compose validated safe-API-shaped input through native preparation,
-/// fragmentation, and basic/macrocycle layout. This intentionally rejects
-/// every domain whose owning native phase is not integrated yet.
-pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.errors.Error!Result {
+/// fragmentation, and basic/macrocycle layout, writing every observable into
+/// caller-owned storage and returning the clean-pose verdict. This
+/// intentionally rejects every domain whose owning native phase is not
+/// integrated yet.
+///
+/// Output storage is borrowed, never retained: on any error the destinations
+/// hold unspecified values and the caller frees them, which is what lets the
+/// public entry point own its result allocation in one place.
+pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outputs) core.errors.Error!bool {
+    if (outputs.coordinates.len != input.atoms.len or
+        outputs.input_to_internal.len != input.atoms.len or
+        outputs.internal_to_input.len != input.atoms.len)
+    {
+        return error.InvalidMapping;
+    }
+    if (outputs.atom_stereo) |slice| {
+        if (slice.len != input.atoms.len) return error.InvalidMapping;
+    }
+    if (outputs.effective_bond_orders) |slice| {
+        if (slice.len != input.bonds.len) return error.InvalidMapping;
+    }
+    if (outputs.bond_displays) |slice| {
+        if (slice.len != input.bonds.len) return error.InvalidMapping;
+    }
+    if (outputs.pre_orientation) |slice| {
+        if (slice.len != input.atoms.len) return error.InvalidMapping;
+    }
     try rejectOutOfScope(input);
     var prepared = try topology.prepareInput(allocator, input);
     defer prepared.deinit();
@@ -62,14 +111,20 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.rings,
     );
     defer fragmentation.deinit();
-    try layout.initializeCoordinatesWithOptions(
+    const layout_outcome = try layout.initializeCoordinatesWithOptions(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
         prepared.graph,
         prepared.rings,
         fragmentation,
-        input.options.force_open_macrocycles,
+        .{
+            .force_open_macrocycles = input.options.force_open_macrocycles,
+            .templates = .{
+                .load_templates = input.options.load_templates,
+                .template_directory = input.options.template_directory,
+            },
+        },
     );
     const clean_pose = try optimizeDiscrete(
         allocator,
@@ -81,12 +136,37 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         input.options.precision,
         residue_atoms,
     );
-    try components.orientAcyclicComponents(
+    // Upstream requires minimization when the discrete search could not reach
+    // a clean pose, and separately when maybeMinimizeRings fired during ring
+    // placement (CoordgenMinimizer.cpp:1272 and :1458). Both feed one
+    // molecule-level flag, and skip_minimization suppresses the run itself
+    // rather than the flag, matching CoordgenMinimizer::run.
+    if ((!clean_pose or layout_outcome.minimization_required) and
+        !input.options.skip_minimization)
+    {
+        try minimizeGenerated(
+            allocator,
+            prepared.working.atoms,
+            prepared.working.bonds,
+            prepared.graph,
+            prepared.rings,
+            fragmentation,
+            input.options.even_angles,
+        );
+    }
+    if (outputs.pre_orientation) |slice| {
+        for (prepared.working.atoms, prepared.working.order.internal_to_input) |atom, input_index| {
+            if (input_index >= slice.len) return error.InvalidMapping;
+            slice[input_index] = atom.coordinates;
+        }
+    }
+    try components.orientComponents(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
         prepared.graph,
         prepared.rings,
+        fragmentation,
     );
     if (proximity_relations.len == 0 and residue_atoms.len == 0) {
         try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
@@ -138,15 +218,57 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         prepared.rings,
     );
 
+    if (prepared.working.order.input_to_internal.len != outputs.input_to_internal.len or
+        prepared.working.order.internal_to_input.len != outputs.internal_to_input.len)
+    {
+        return error.InvalidMapping;
+    }
+    @memcpy(outputs.input_to_internal, prepared.working.order.input_to_internal);
+    @memcpy(outputs.internal_to_input, prepared.working.order.internal_to_input);
+    for (prepared.working.atoms, prepared.working.order.internal_to_input) |atom, input_index| {
+        outputs.coordinates[input_index] = atom.coordinates;
+    }
+    if (outputs.atom_stereo) |slice| {
+        for (prepared.working.atoms) |atom| {
+            if (atom.input_index >= slice.len) return error.InvalidMapping;
+            slice[atom.input_index] = atom.stereo;
+        }
+    }
+    // Bonds are stored in structural-first internal order, so they are
+    // serialized through their own input index rather than the atom
+    // permutation. prepare() emits exactly one internal bond per input bond.
+    if (outputs.effective_bond_orders) |slice| {
+        if (prepared.working.bonds.len != slice.len) return error.InvalidMapping;
+        for (prepared.working.bonds) |bond| {
+            if (bond.input_index >= slice.len) return error.InvalidMapping;
+            slice[bond.input_index] = bond.effective_order;
+        }
+    }
+    if (outputs.bond_displays) |slice| {
+        if (prepared.working.bonds.len != slice.len) return error.InvalidMapping;
+        for (prepared.working.bonds) |bond| {
+            if (bond.input_index >= slice.len) return error.InvalidMapping;
+            slice[bond.input_index] = bond.display;
+        }
+    }
+    return clean_pose;
+}
+
+/// Restricted proof entry point: allocates and owns the three observables it
+/// reports. Retained for the native module tests that predate the public
+/// entry point; new callers should use the public `api.generate`.
+pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.errors.Error!Result {
     const coordinates = allocator.alloc(core.math.Vec2, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(coordinates);
-    const input_to_internal = allocator.dupe(u32, prepared.working.order.input_to_internal) catch return error.OutOfMemory;
+    const input_to_internal = allocator.alloc(u32, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(input_to_internal);
-    const internal_to_input = allocator.dupe(core.ids.InputIndex, prepared.working.order.internal_to_input) catch return error.OutOfMemory;
+    const internal_to_input = allocator.alloc(core.ids.InputIndex, input.atoms.len) catch return error.OutOfMemory;
     errdefer allocator.free(internal_to_input);
-    for (prepared.working.atoms, prepared.working.order.internal_to_input) |atom, input_index| {
-        coordinates[input_index] = atom.coordinates;
-    }
+    const clean_pose = try generateInto(allocator, input, .{
+        .coordinates = coordinates,
+        .input_to_internal = input_to_internal,
+        .internal_to_input = internal_to_input,
+    });
     return .{
         .allocator = allocator,
         .coordinates = coordinates,
@@ -154,6 +276,66 @@ pub fn generateValidated(allocator: std.mem.Allocator, input: anytype) core.erro
         .internal_to_input = internal_to_input,
         .clean_pose = clean_pose,
     };
+}
+
+/// Assemble the four interaction families upstream feeds
+/// addInteractionsOfMolecule - clash and stretch with intrafragment clashes
+/// enabled, bends, and chiral inversion constraints - and run the continuous
+/// minimizer over them.
+///
+/// The clash set differs from the discrete pass on purpose: minimizeMolecule
+/// passes intrafragmentClashes = true where avoidClashesOfMolecule passes
+/// false.
+fn minimizeGenerated(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    fragmentation: layout.Fragmentation,
+    even_angles: bool,
+) core.errors.Error!void {
+    const atom_fragments = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(atom_fragments);
+    for (fragmentation.atom_fragment, atom_fragments) |fragment, *output| output.* = fragment.index();
+
+    var base = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
+        .intrafragment_clashes = true,
+        .atom_fragments = atom_fragments,
+    });
+    defer base.deinit();
+
+    var analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds);
+    defer analysis.deinit();
+    var groups = try bends.build(allocator, atoms, bonds, graph, rings, analysis);
+    defer groups.deinit();
+    var bend_interactions = try optimize.buildBendInteractions(
+        allocator,
+        atoms,
+        groups.groups,
+        .{ .even_angles = even_angles },
+    );
+    defer bend_interactions.deinit();
+
+    const ez_constraints = try inversions.buildChiralInversionConstraints(
+        allocator,
+        atoms,
+        bonds,
+        graph,
+        rings,
+    );
+    defer allocator.free(ez_constraints);
+    var ez_interactions = try optimize.buildEzInteractions(allocator, ez_constraints);
+    defer ez_interactions.deinit();
+
+    var combined = try optimize.combineInteractions(allocator, &.{
+        base.items,
+        bend_interactions.items,
+        ez_interactions.items,
+    });
+    defer combined.deinit();
+
+    _ = try optimize.minimizeMolecule(allocator, atoms, combined.items, .{}, null);
 }
 
 const DiscreteScoreContext = struct {
@@ -204,10 +386,29 @@ fn optimizeDiscrete(
     const atom_fragments = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_fragments);
     for (fragmentation.atom_fragment, atom_fragments) |fragment, *output| output.* = fragment.index();
-    var interactions = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
+    var base = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
         .intrafragment_clashes = false,
         .atom_fragments = atom_fragments,
         .atom_has_dofs = atom_has_dofs,
+    });
+    defer base.deinit();
+    // Upstream's discrete pass is addClashInteractionsOfMolecule followed by
+    // addPeptideBondInversionConstraintsOfMolecule, and only then scoreClashes
+    // and flipFragments (CoordgenMinimizer.cpp:1254-1263). The peptide
+    // constraints therefore influence the clean-pose verdict, not just the
+    // geometry.
+    const peptide_constraints = try inversions.buildPeptideBondInversionConstraints(
+        allocator,
+        atoms,
+        bonds,
+        graph,
+    );
+    defer allocator.free(peptide_constraints);
+    var peptide_interactions = try optimize.buildEzInteractions(allocator, peptide_constraints);
+    defer peptide_interactions.deinit();
+    var interactions = try optimize.combineInteractions(allocator, &.{
+        base.items,
+        peptide_interactions.items,
     });
     defer interactions.deinit();
     var filtered_interactions: []core.interaction.Interaction = &.{};
@@ -223,14 +424,6 @@ fn optimizeDiscrete(
         }
         scoring_interactions = filtered_interactions[0..filtered_count];
     }
-    if (dofs.items.len == 0) {
-        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
-        defer allocator.free(coordinates);
-        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
-        const clash_energy = try optimize.discrete.scoreClashInteractions(scoring_interactions, coordinates);
-        return clash_energy < optimize.discrete.clash_energy_threshold;
-    }
-
     const bond_views = allocator.alloc(optimize.discrete.BondScoreView, bonds.len) catch return error.OutOfMemory;
     defer allocator.free(bond_views);
     for (bonds, bond_views) |bond, *view| {
@@ -257,6 +450,22 @@ fn optimizeDiscrete(
         .fragment = fragmentation.atom_fragment[rings.atoms(ring.id)[0].index()],
     };
 
+    var score_context = DiscreteScoreContext{
+        .interactions = scoring_interactions,
+        .bonds = bond_views,
+        .rings = ring_views,
+        .atom_fragments = fragmentation.atom_fragment,
+        .fragmentation = fragmentation,
+    };
+    {
+        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
+        defer allocator.free(coordinates);
+        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+        const initial = try scoreDiscretePose(&score_context, coordinates, dofs.items);
+        if (initial < optimize.discrete.clash_energy_threshold) return true;
+    }
+    if (dofs.items.len == 0) return false;
+
     var frame_data = try layout.captureFragmentFrames(allocator, atoms, bonds, fragmentation);
     defer frame_data.deinit();
     const local_atoms = allocator.dupe(core.math.Vec2, frame_data.atom_coordinates) catch return error.OutOfMemory;
@@ -265,13 +474,6 @@ fn optimizeDiscrete(
     defer allocator.free(local_attachments);
     const global = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(global);
-    var score_context = DiscreteScoreContext{
-        .interactions = scoring_interactions,
-        .bonds = bond_views,
-        .rings = ring_views,
-        .atom_fragments = fragmentation.atom_fragment,
-        .fragmentation = fragmentation,
-    };
     var evaluator = optimize.discrete.FramePoseEvaluator{
         .dofs = dofs.items,
         .affected_atoms = dofs.affected_atoms,
@@ -310,7 +512,7 @@ fn interactionTouchesExcluded(interaction: core.interaction.Interaction, exclude
 
 fn rejectOutOfScope(input: anytype) core.errors.Error!void {
     if (input.extra_bonds.len != 0) return error.Unsupported;
-    if (input.options.even_angles or input.options.constrain_all_atoms or input.options.build_from_fragments or
+    if (input.options.even_angles or input.options.constrain_all_atoms or
         input.options.debug_coordinates or input.options.template_directory != null) return error.Unsupported;
     for (input.atoms) |atom| {
         if (atom.hidden or atom.fixed or atom.constrained or atom.template_coordinates != null or

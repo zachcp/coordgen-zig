@@ -45,11 +45,10 @@ pub const Stability = struct {
     }
 };
 
-/// Structural values are exact whenever their own stability record is exact.
-/// Coordinates and derived floats use normalized/tolerant comparisons only if
-/// the oracle is stable, otherwise they use the aggregate quality tier.
-pub fn tierFor(observable: Observable, stability: Stability) Tier {
-    if (!stability.exact()) return .invariant_statistical;
+/// The tier an observable is entitled to when nothing perturbs it: structural
+/// values are exact, coordinates and derived floats are tolerant. Stability is
+/// not an input here, so this is the ceiling a pair can never exceed.
+pub fn baseTier(observable: Observable) Tier {
     return switch (observable) {
         .coordinates,
         .dof_penalties,
@@ -61,7 +60,216 @@ pub fn tierFor(observable: Observable, stability: Stability) Tier {
     };
 }
 
+/// Structural values are exact whenever their own stability record is exact.
+/// Coordinates and derived floats use normalized/tolerant comparisons only if
+/// the oracle is stable, otherwise they use the aggregate quality tier.
+///
+/// **Superseded for the differential runner; use `differentialComparison`.**
+/// This reads `Stability.exact()`, which is both axes, so it predates
+/// `cgz-r13`'s finding that the runner never observes the architecture axis
+/// (both sides share a build). Feeding it a member that is arch-unstable but
+/// order-stable yields `.invariant_statistical`, and `cgz-r30` records that
+/// the invariant tier is unpopulated at the pin — so that answer is wrong for
+/// any real comparison.
+///
+/// Kept rather than deleted because `cgz-r06` froze this tier vocabulary and
+/// the test below encodes its meaning; nothing on a live path calls it.
+pub fn tierFor(observable: Observable, stability: Stability) Tier {
+    if (!stability.exact()) return .invariant_statistical;
+    return baseTier(observable);
+}
+
 pub const bond_length: f64 = 50;
+
+// ---------------------------------------------------------------------------
+// The portable parity-ceiling enumeration (cgz-r26)
+// ---------------------------------------------------------------------------
+
+/// Deviation at which a coordinate difference stops being float jitter and
+/// becomes a different layout, taken from the measured bimodal distribution in
+/// SUCCESS_CRITERIA.md: only 2.3% of divergent members land in the [0.1, 1.0)
+/// valley, and 23.6% sit at or above 1.0. A per-pair ceiling at or above this
+/// boundary would excuse a relayout, which `cgz-r13` forbids, so the loader
+/// rejects one.
+pub const relayout_boundary_bond_lengths: f64 = 1.0;
+
+pub const CeilingParseError = error{
+    MalformedCeilingRow,
+    UnknownCeilingObservable,
+    ExactObservableAtCeiling,
+    CeilingBoundOnNonCoordinateObservable,
+    CeilingBoundNotPositive,
+    CeilingBoundReachesRelayoutBoundary,
+    MalformedCeilingDigest,
+    MissingCeilingEvidence,
+    DuplicateCeilingRow,
+};
+
+/// One enumerated (member, observable) pair at the pointer-order parity
+/// ceiling. `member` is the portable corpus identity `{partition}/{index}`;
+/// `input_sha256` pins the bytes that identity generates so the identity keeps
+/// meaning the same molecule across a corpus regeneration.
+pub const CeilingRow = struct {
+    member: []const u8,
+    observable: Observable,
+    /// `null` means the pair keeps its normal tier's tolerance: being at the
+    /// ceiling excuses the pair from *exact* comparison, it does not widen
+    /// anything. A value replaces that tolerance for this pair alone.
+    order_ceiling_bond_lengths: ?f64,
+    input_sha256: []const u8,
+    evidence: []const u8,
+};
+
+/// A borrowed view over `conformance/parity_ceiling.tsv`. The file is small
+/// and read once, so lookup is a linear scan and the table allocates nothing.
+pub const CeilingTable = struct {
+    text: []const u8,
+
+    pub fn iterate(self: CeilingTable) RowIterator {
+        return .{ .lines = std.mem.splitScalar(u8, self.text, '\n') };
+    }
+
+    /// The row governing this pair, or null when the pair is not enumerated.
+    /// A null answer is a failure at every call site: an unenumerated pair
+    /// that measured order-unstable is exactly what the enumeration exists to
+    /// reject.
+    pub fn find(
+        self: CeilingTable,
+        member: []const u8,
+        observable: Observable,
+    ) CeilingParseError!?CeilingRow {
+        var rows = self.iterate();
+        while (try rows.next()) |row| {
+            if (row.observable == observable and std.mem.eql(u8, row.member, member)) {
+                return row;
+            }
+        }
+        return null;
+    }
+
+    /// Rejects a file that repeats a pair, which would otherwise let one row
+    /// shadow a stricter one depending on scan order.
+    pub fn validateUnique(self: CeilingTable) CeilingParseError!void {
+        var outer = self.iterate();
+        var position: usize = 0;
+        while (try outer.next()) |row| : (position += 1) {
+            var inner = self.iterate();
+            var other_position: usize = 0;
+            while (try inner.next()) |other| : (other_position += 1) {
+                if (other_position >= position) break;
+                if (other.observable == row.observable and
+                    std.mem.eql(u8, other.member, row.member))
+                {
+                    return error.DuplicateCeilingRow;
+                }
+            }
+        }
+    }
+
+    pub const RowIterator = struct {
+        lines: std.mem.SplitIterator(u8, .scalar),
+
+        pub fn next(self: *RowIterator) CeilingParseError!?CeilingRow {
+            while (self.lines.next()) |line| {
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len == 0 or trimmed[0] == '#') continue;
+                return try parseCeilingRow(trimmed);
+            }
+            return null;
+        }
+    };
+};
+
+fn parseCeilingRow(line: []const u8) CeilingParseError!CeilingRow {
+    var fields = std.mem.splitScalar(u8, line, '\t');
+    const member = fields.next() orelse return error.MalformedCeilingRow;
+    const observable_name = fields.next() orelse return error.MalformedCeilingRow;
+    const bound_text = fields.next() orelse return error.MalformedCeilingRow;
+    const digest = fields.next() orelse return error.MalformedCeilingRow;
+    const evidence = fields.next() orelse return error.MalformedCeilingRow;
+    if (fields.next() != null) return error.MalformedCeilingRow;
+    if (member.len == 0 or std.mem.indexOfScalar(u8, member, '/') == null) {
+        return error.MalformedCeilingRow;
+    }
+    if (evidence.len == 0) return error.MissingCeilingEvidence;
+
+    const observable = std.meta.stringToEnum(Observable, observable_name) orelse
+        return error.UnknownCeilingObservable;
+    // cgz-r13: structural observables stay exact requirements on ceiling
+    // members too. Admitting one here would be that weakening, so it is not
+    // representable rather than merely discouraged.
+    if (baseTier(observable) == .exact) return error.ExactObservableAtCeiling;
+
+    var bound: ?f64 = null;
+    if (!std.mem.eql(u8, bound_text, "-")) {
+        // Only `coordinates` carries a published per-member magnitude; the
+        // classifier measures no deviation for any other observable, so a
+        // number on one would be invented rather than measured.
+        if (observable != .coordinates) return error.CeilingBoundOnNonCoordinateObservable;
+        const value = std.fmt.parseFloat(f64, bound_text) catch
+            return error.MalformedCeilingRow;
+        if (!std.math.isFinite(value) or value <= 0) return error.CeilingBoundNotPositive;
+        if (value >= relayout_boundary_bond_lengths) {
+            return error.CeilingBoundReachesRelayoutBoundary;
+        }
+        bound = value;
+    }
+
+    if (digest.len != 64) return error.MalformedCeilingDigest;
+    for (digest) |character| {
+        const hexadecimal = (character >= '0' and character <= '9') or
+            (character >= 'a' and character <= 'f');
+        if (!hexadecimal) return error.MalformedCeilingDigest;
+    }
+
+    return .{
+        .member = member,
+        .observable = observable,
+        .order_ceiling_bond_lengths = bound,
+        .input_sha256 = digest,
+        .evidence = evidence,
+    };
+}
+
+pub const Comparison = struct {
+    tier: Tier,
+    /// Zero for the exact tier. For the tolerant tier this is the tolerance the
+    /// runner must use for this pair — the global `T` unless the enumeration
+    /// published a wider per-pair bound.
+    tolerance_bond_lengths: f64,
+};
+
+pub const DifferentialError = error{UnenumeratedOrderInstability};
+
+/// The differential runner's per-pair rule.
+///
+/// `order_stable` is the only stability input, and deliberately so: the runner
+/// executes oracle and native in one process, build, and target
+/// (`RunIdentity.requireSameBuild`), so the architecture axis is not a
+/// difference it can observe. `cgz-r13` scopes the ceiling to the heap-address
+/// order axis for that reason.
+///
+/// A pair that is order-unstable with no enumerated row fails. Falling through
+/// to the invariant tier instead would let a real defect hide behind an axis
+/// nobody enumerated, which is the budget framing `cgz-r13` rejected.
+pub fn differentialComparison(
+    observable: Observable,
+    order_stable: bool,
+    ceiling: ?CeilingRow,
+    tolerance_bond_lengths: f64,
+) DifferentialError!Comparison {
+    const base = baseTier(observable);
+    if (order_stable) return .{
+        .tier = base,
+        .tolerance_bond_lengths = if (base == .exact) 0 else tolerance_bond_lengths,
+    };
+    const row = ceiling orelse return error.UnenumeratedOrderInstability;
+    if (row.observable != observable) return error.UnenumeratedOrderInstability;
+    return .{
+        .tier = .tolerant,
+        .tolerance_bond_lengths = row.order_ceiling_bond_lengths orelse tolerance_bond_lengths,
+    };
+}
 
 pub const Point = struct { x: f64, y: f64 };
 
@@ -140,6 +348,46 @@ fn alignedDeviation(reference: []const Point, candidate: []const Point, reflect:
         max_deviation = @max(max_deviation, distance(reference_point, rotated) / bond_length);
     }
     return max_deviation;
+}
+
+/// Invert the oracle's published component transform to recover the pose the
+/// component had *before* global orientation, given the pose it ended with.
+///
+/// The transform is the least-squares linear map `after = M*before + t` that
+/// `oracle_adapter.cpp` fits across upstream's bestRotation, maybeFlip and
+/// arrangeMultipleMolecules, so this reads a stage the oracle already publishes
+/// rather than needing new instrumentation. A singular map is refused rather
+/// than approximated: a fit that collapsed carries no recoverable pose
+/// (cgz-7v2.4.2.1).
+pub fn invertComponentTransform(
+    transform: [6]f32,
+    final: []const Point,
+    output: []Point,
+) error{ CountMismatch, SingularTransform }!void {
+    if (final.len != output.len) return error.CountMismatch;
+    const m00: f64 = transform[0];
+    const m01: f64 = transform[1];
+    const m10: f64 = transform[2];
+    const m11: f64 = transform[3];
+    const determinant = m00 * m11 - m01 * m10;
+    if (!std.math.isFinite(determinant) or @abs(determinant) < 1e-6) return error.SingularTransform;
+    for (final, output) |point, *destination| {
+        const x = point.x - transform[4];
+        const y = point.y - transform[5];
+        destination.* = .{
+            .x = (m11 * x - m01 * y) / determinant,
+            .y = (m00 * y - m10 * x) / determinant,
+        };
+    }
+}
+
+/// Sign of the transform's determinant. Negative means upstream reflected the
+/// component, which is a divergence the port must reproduce rather than a free
+/// choice of depiction.
+pub fn transformReflects(transform: [6]f32) bool {
+    const determinant = @as(f64, transform[0]) * @as(f64, transform[3]) -
+        @as(f64, transform[1]) * @as(f64, transform[2]);
+    return determinant < 0;
 }
 
 fn reflected(point: Point, enabled: bool) Point {
@@ -233,6 +481,107 @@ test "tier selection stays per input and observable" {
     try std.testing.expectEqual(Tier.invariant_statistical, tierFor(.coordinates, unstable_coordinates));
 }
 
+/// Digest-shaped filler: these fixtures exercise parsing and tier
+/// selection, never identity, which tests/parity_ceiling_check.zig owns.
+const test_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+
+const ceiling_fixture =
+    "# member\tobservable\torder_ceiling_bl\tinput_sha256\tevidence\n" ++
+    "adversarial/917\tcomponent_transforms\t-\t" ++ test_digest ++ "\tcgz-r13\n" ++
+    "adversarial/1695\tcoordinates\t0.75\t" ++ test_digest ++ "\tcgz-r13\n";
+
+test "the ceiling table parses, looks up, and rejects a repeated pair" {
+    const table: CeilingTable = .{ .text = ceiling_fixture };
+    try table.validateUnique();
+
+    const found = (try table.find("adversarial/1695", .coordinates)).?;
+    try std.testing.expectEqual(@as(?f64, 0.75), found.order_ceiling_bond_lengths);
+    try std.testing.expectEqualStrings("cgz-r13", found.evidence);
+
+    const unwidened = (try table.find("adversarial/917", .component_transforms)).?;
+    try std.testing.expectEqual(@as(?f64, null), unwidened.order_ceiling_bond_lengths);
+
+    try std.testing.expectEqual(
+        @as(?CeilingRow, null),
+        try table.find("adversarial/1695", .component_transforms),
+    );
+
+    const repeated: CeilingTable = .{ .text = ceiling_fixture ++ ceiling_fixture };
+    try std.testing.expectError(error.DuplicateCeilingRow, repeated.validateUnique());
+}
+
+test "the ceiling file cannot express a weakening" {
+    // A structural observable may never be admitted: cgz-r13 keeps those exact
+    // on ceiling members too.
+    try std.testing.expectError(error.ExactObservableAtCeiling, parseCeilingRow(
+        "adversarial/1695\trings\t-\t" ++ test_digest ++ "\tcgz-r13",
+    ));
+    // A bound at or above the relayout boundary would excuse a different
+    // layout rather than float jitter.
+    try std.testing.expectError(error.CeilingBoundReachesRelayoutBoundary, parseCeilingRow(
+        "adversarial/1695\tcoordinates\t1.0\t" ++ test_digest ++ "\tcgz-r13",
+    ));
+    // No observable but `coordinates` has a published magnitude to bound.
+    try std.testing.expectError(error.CeilingBoundOnNonCoordinateObservable, parseCeilingRow(
+        "adversarial/917\tcomponent_transforms\t0.5\t" ++ test_digest ++ "\tcgz-r13",
+    ));
+    // Identity, provenance, and pinned input bytes are all mandatory.
+    try std.testing.expectError(error.MalformedCeilingDigest, parseCeilingRow(
+        "adversarial/1695\tcoordinates\t0.75\tshort\tcgz-r13",
+    ));
+    try std.testing.expectError(error.MissingCeilingEvidence, parseCeilingRow(
+        "adversarial/1695\tcoordinates\t0.75\t" ++ test_digest ++ "\t",
+    ));
+    try std.testing.expectError(error.MalformedCeilingRow, parseCeilingRow(
+        "adversarial/1695\tcoordinates\t0.75\t" ++ test_digest,
+    ));
+}
+
+test "an order-unstable pair with no enumerated row fails closed" {
+    const table: CeilingTable = .{ .text = ceiling_fixture };
+    const tolerance: f64 = 0.1;
+
+    // Stable pairs keep their ordinary tier and the global tolerance.
+    const stable_rings = try differentialComparison(.rings, true, null, tolerance);
+    try std.testing.expectEqual(Tier.exact, stable_rings.tier);
+    try std.testing.expectEqual(@as(f64, 0), stable_rings.tolerance_bond_lengths);
+
+    // Enumerated with a published bound: tolerant against that bound alone.
+    const widened = try differentialComparison(
+        .coordinates,
+        false,
+        try table.find("adversarial/1695", .coordinates),
+        tolerance,
+    );
+    try std.testing.expectEqual(Tier.tolerant, widened.tier);
+    try std.testing.expectEqual(@as(f64, 0.75), widened.tolerance_bond_lengths);
+
+    // Enumerated without one: excused from exact comparison, nothing widened.
+    const unwidened = try differentialComparison(
+        .component_transforms,
+        false,
+        try table.find("adversarial/917", .component_transforms),
+        tolerance,
+    );
+    try std.testing.expectEqual(Tier.tolerant, unwidened.tier);
+    try std.testing.expectEqual(tolerance, unwidened.tolerance_bond_lengths);
+
+    // Not enumerated, and a row for a different observable does not stand in.
+    try std.testing.expectError(
+        error.UnenumeratedOrderInstability,
+        differentialComparison(.coordinates, false, null, tolerance),
+    );
+    try std.testing.expectError(
+        error.UnenumeratedOrderInstability,
+        differentialComparison(
+            .component_transforms,
+            false,
+            try table.find("adversarial/1695", .coordinates),
+            tolerance,
+        ),
+    );
+}
+
 test "translation and rotation pass while reflection fails by default" {
     const reference = [_]Point{ .{ .x = 0, .y = 0 }, .{ .x = 50, .y = 0 }, .{ .x = 12.5, .y = 37.5 } };
     const rotated = [_]Point{ .{ .x = 200, .y = 300 }, .{ .x = 200, .y = 350 }, .{ .x = 162.5, .y = 312.5 } };
@@ -270,4 +619,41 @@ test "invariant quality floor rejects a worse native result" {
     var worse = oracle;
     worse.bond_crossings += 1;
     try std.testing.expect(!noWorseThan(oracle, worse, .{}));
+}
+
+test "inverting a published transform recovers the pose that produced it" {
+    // A reflection about x composed with a rotation and a translation, which is
+    // the shape of the transforms upstream's maybeFlip actually produces.
+    const angle: f64 = 0.7;
+    const cosine: f32 = @floatCast(@cos(angle));
+    const sine: f32 = @floatCast(@sin(angle));
+    // R(theta) * diag(1, -1): a reflection about x followed by a rotation.
+    const transform = [6]f32{ cosine, sine, sine, -cosine, 17.5, -4.25 };
+    try std.testing.expect(transformReflects(transform));
+
+    const before = [_]Point{
+        .{ .x = 0, .y = 0 },
+        .{ .x = 50, .y = 0 },
+        .{ .x = 25, .y = 43.3 },
+    };
+    var after: [before.len]Point = undefined;
+    for (before, &after) |point, *destination| destination.* = .{
+        .x = transform[0] * point.x + transform[1] * point.y + transform[4],
+        .y = transform[2] * point.x + transform[3] * point.y + transform[5],
+    };
+
+    var recovered: [before.len]Point = undefined;
+    try invertComponentTransform(transform, &after, &recovered);
+    for (before, recovered) |expected, actual| {
+        try std.testing.expectApproxEqAbs(expected.x, actual.x, 0.01);
+        try std.testing.expectApproxEqAbs(expected.y, actual.y, 0.01);
+    }
+
+    // A proper rotation reports no reflection, and a collapsed fit is refused
+    // rather than silently producing a pose.
+    try std.testing.expect(!transformReflects(.{ cosine, -sine, sine, cosine, 0, 0 }));
+    try std.testing.expectError(
+        error.SingularTransform,
+        invertComponentTransform(.{ 0, 0, 0, 0, 0, 0 }, &after, &recovered),
+    );
 }

@@ -440,41 +440,6 @@ pub fn minimizeMolecule(
     return result;
 }
 
-pub fn hasNaNCoordinates(coordinates: []const core.math.Vec2) bool {
-    for (coordinates) |position| {
-        if (std.math.isNan(position.x) or std.math.isNan(position.y)) return true;
-    }
-    return false;
-}
-
-pub fn hasValid3DCoordinates(coordinates: []const ?core.math.Vec3) bool {
-    const invalid_coordinates: f32 = 10_000_001;
-    for (coordinates) |optional| {
-        const position = optional orelse return false;
-        if (!(position.x < invalid_coordinates and position.y < invalid_coordinates and position.z < invalid_coordinates)) return false;
-    }
-    return true;
-}
-
-/// Apply the upstream emergency x/-y projection and two-decimal rounding.
-pub fn fallbackOn3DCoordinates(
-    coordinates: []core.math.Vec2,
-    coordinates_3d: []const ?core.math.Vec3,
-) core.errors.Error!void {
-    if (coordinates.len != coordinates_3d.len or !hasValid3DCoordinates(coordinates_3d)) return error.InvalidCoordinate;
-    for (coordinates, coordinates_3d) |*position, optional| {
-        const source = optional.?;
-        position.* = .{
-            .x = roundToTwoDecimalDigits(source.x * 35),
-            .y = roundToTwoDecimalDigits(-source.y * 35),
-        };
-    }
-}
-
-fn roundToTwoDecimalDigits(value: f32) f32 {
-    return @floor(value * 100 + 0.5) * 0.01;
-}
-
 fn coordinate(state: State, atom: core.ids.AtomId) core.errors.Error!core.math.Vec2 {
     if (!atom.isValid() or atom.index() >= state.coordinates.len) return error.InvalidAtomIndex;
     return state.coordinates[atom.index()];
@@ -813,18 +778,6 @@ test "fixed-center bend minimization agrees with pinned oracle fixture" {
         try std.testing.expectApproxEqAbs(want.x, actual.x, 0.001);
         try std.testing.expectApproxEqAbs(want.y, actual.y, 0.001);
     }
-}
-
-test "nonfinite detection and 3D fallback preserve pinned asymmetries" {
-    try std.testing.expect(hasNaNCoordinates(&.{.{ .x = std.math.nan(f32) }}));
-    try std.testing.expect(!hasNaNCoordinates(&.{.{ .x = std.math.inf(f32) }}));
-    const source = [_]?core.math.Vec3{.{ .x = 1.234, .y = -2.345, .z = 7 }};
-    try std.testing.expect(hasValid3DCoordinates(&source));
-    var coordinates = [_]core.math.Vec2{.{}};
-    try fallbackOn3DCoordinates(&coordinates, &source);
-    try std.testing.expectEqual(core.math.Vec2{ .x = 43.19, .y = 82.08 }, coordinates[0]);
-    try std.testing.expect(hasValid3DCoordinates(&.{.{ .x = -std.math.inf(f32) }}));
-    try std.testing.expect(!hasValid3DCoordinates(&.{null}));
 }
 
 fn rejectStereo(_: []const model.Atom) bool {

@@ -256,7 +256,7 @@ fn initializeChainCenters(
     if (interactions.items.len != 0) {
         _ = try optimize.minimizeMolecule(allocator, meta_atoms, interactions.items, .{}, null);
     }
-    try components.orientAcyclicComponents(allocator, meta_atoms, meta_bonds.items, graph, rings);
+    try components.orientComponents(allocator, meta_atoms, meta_bonds.items, graph, rings, null);
     try components.arrangeComponents(allocator, meta_atoms, graph);
     for (centers, meta_atoms) |*center, atom| {
         center.* = scale(atom.coordinates, 10);

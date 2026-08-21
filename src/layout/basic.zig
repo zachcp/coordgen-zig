@@ -4,6 +4,7 @@ const model = @import("model");
 const topology = @import("topology");
 const fragments = @import("fragments.zig");
 const macrocycle = @import("macrocycle.zig");
+const templates = @import("templates.zig");
 
 pub const bond_length: f32 = 50;
 const pi: f32 = std.math.pi;
@@ -11,6 +12,23 @@ const pi: f32 = std.math.pi;
 /// Generate deterministic local coordinates for ordinary rigid fragments.
 /// Template and macrocycle dispatch are deliberately owned by their later
 /// layers; this seam covers regular rings and the acyclic fallback.
+/// Placement controls that reach the ring path. `templates` is passed
+/// straight through to templates.findRingSet, which is where
+/// `load_templates` and the rejection of a runtime template directory are
+/// enforced.
+pub const Options = struct {
+    force_open_macrocycles: bool = false,
+    templates: templates.Options = .{},
+};
+
+/// What the ring path decided that later phases need to know.
+pub const Outcome = struct {
+    /// Upstream's maybeMinimizeRings fired for at least one ring system that
+    /// was placed without a template. It is molecule-level because
+    /// requireMinimization is.
+    minimization_required: bool = false,
+};
+
 pub fn initializeCoordinates(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
@@ -19,7 +37,7 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, false);
+    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, .{});
 }
 
 pub fn initializeCoordinatesWithOptions(
@@ -29,9 +47,9 @@ pub fn initializeCoordinatesWithOptions(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
-    force_open_macrocycles: bool,
-) core.errors.Error!void {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, force_open_macrocycles);
+    options: Options,
+) core.errors.Error!Outcome {
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, options);
 }
 
 fn initializeCoordinatesInternal(
@@ -41,8 +59,13 @@ fn initializeCoordinatesInternal(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
-    force_open_macrocycles: bool,
-) core.errors.Error!void {
+    options: Options,
+) core.errors.Error!Outcome {
+    var outcome: Outcome = .{};
+    // Ring fusion structure is needed by the central-ring priority, and is
+    // derived once for the whole molecule rather than per fragment.
+    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds);
+    defer analysis.deinit();
     const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(placed);
     @memset(placed, false);
@@ -50,7 +73,9 @@ fn initializeCoordinatesInternal(
     defer allocator.free(queue);
 
     for (fragmentation.fragments) |fragment| {
-        try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, force_open_macrocycles);
+        if (try placeFragmentRings(allocator, atoms, bonds, graph, membership, fragmentation, fragment, placed, options, analysis)) {
+            outcome.minimization_required = true;
+        }
 
         const members = fragmentation.members(fragment.id);
         var head: usize = 0;
@@ -73,6 +98,15 @@ fn initializeCoordinatesInternal(
                 if (fragmentation.atom_fragment[neighbor.index()] == fragment.id and !placed[neighbor.index()]) unplaced_count += 1;
             }
             if (unplaced_count == 0) continue;
+            // Upstream splits on whether the centre is a ring atom
+            // (initializeVariablesForNeighboursCoordinates). The ring-atom
+            // branch is transcribed; the acyclic branch still uses native's
+            // fixed spread and is cgz-7v2.29's remaining half.
+            if (membership.atomRings(center).len != 0 and
+                try placeRingAtomSubstituents(atoms, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail))
+            {
+                continue;
+            }
             const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
             var generated: usize = 0;
             for (graph.neighbors(center)) |neighbor| {
@@ -93,10 +127,15 @@ fn initializeCoordinatesInternal(
             }
         }
     }
+    // Upstream's order inside buildFragment is fallbackIfNanCoordinates, then
+    // rotateMainFragment for a constrained root, then the fixed-coordinate
+    // reset (CoordgenFragmentBuilder.cpp:858-866). The fallback ran last here,
+    // after assembly had already propagated a NaN parent into its children.
+    fallbackOnValid3dCoordinates(atoms, fragmentation);
     try assembleFragments(atoms, bonds, graph, fragmentation);
     alignConstrainedMainFragments(atoms, fragmentation);
-    fallbackOn3dCoordinates(atoms, fragmentation);
     restoreFixedCoordinates(atoms);
+    return outcome;
 }
 
 fn placeFragmentRings(
@@ -108,8 +147,51 @@ fn placeFragmentRings(
     fragmentation: fragments.Fragmentation,
     fragment: fragments.Fragment,
     placed: []bool,
-    force_open_macrocycles: bool,
-) core.errors.Error!void {
+    options: Options,
+    analysis: topology.rings.Analysis,
+) core.errors.Error!bool {
+    // Upstream tries the template database for the whole ring system before
+    // placing any ring individually (CoordgenFragmentBuilder.cpp:211, inside
+    // generateCoordinatesCentralRings, which only reaches the per-ring
+    // buildRing loop when findTemplate returns false). Omitting this call was
+    // cgz-r35: every entry point of the template layer was unreachable, so a
+    // bridged bicyclic that upstream lays out from template 79 fell through to
+    // generic fused-ring placement and came out with crossing bonds.
+    if (try matchFragmentTemplate(allocator, atoms, bonds, membership, fragmentation, fragment, options, placed)) {
+        // A templated system never reaches maybeMinimizeRings upstream: that
+        // call lives in the not-found branch.
+        return false;
+    }
+    // Upstream branches three ways on a planarity score before placing anything
+    // (CoordgenFragmentBuilder.cpp:213-235). Native had no planarity score at
+    // all and always took the first branch, so a system upstream lays out as an
+    // opened macrocycle, or declines to lay out entirely, was placed ring by
+    // ring instead (cgz-r31).
+    const planarity = try scorePlanarity(membership, analysis, bonds, graph, fragmentation, fragment);
+    if (planarity > untreatable_system_planarity_score) {
+        // Upstream returns, leaving the whole ring system unplaced. Faithful:
+        // the caller's `placed` flags stay false and the atoms keep whatever
+        // coordinates they had.
+        return false;
+    }
+    if (planarity >= non_planar_system_score) {
+        // Neither planar enough to place ring by ring nor hopeless: upstream
+        // opens the central ring as a macrocycle and requires minimization.
+        const central = selectCentralRing(membership, analysis, fragmentation, fragment) orelse
+            return false;
+        _ = try openCycleAndGenerateCoordinates(allocator, central, atoms, bonds, graph, membership, placed);
+        return true;
+    }
+    if (planarity > perfectly_planar_system_score) {
+        // Upstream repeats the same findTemplate call on the same ring set here.
+        // It is deterministic, so at the pin the retry can only return what the
+        // first call already returned; kept because the shape of the branch is
+        // upstream's, and measured to change nothing.
+        if (try matchFragmentTemplate(allocator, atoms, bonds, membership, fragmentation, fragment, options, placed)) {
+            return false;
+        }
+    }
+    var pentagon_minimization = false;
     var remaining: usize = fragment.ring_count;
     while (remaining != 0) {
         var selected: ?model.Ring = null;
@@ -126,7 +208,7 @@ fn placeFragmentRings(
                 shared += @intFromBool(placed[atom.index()]);
             }
             if (already_complete) continue;
-            const score = shared * 10000 + @as(usize, @intFromBool(ring_atoms.len == 6)) * 10 + ring_atoms.len;
+            const score = ringPriority(membership, analysis, ring, shared != 0);
             if (selected == null or score > selected_score) {
                 selected = ring;
                 selected_shared = shared;
@@ -135,7 +217,7 @@ fn placeFragmentRings(
         }
         const ring = selected orelse break;
         if (membership.atoms(ring.id).len >= topology.rings.macrocycle_size) {
-            if (try macrocycle.generateRingShape(
+            const shape_result = try macrocycle.generateRingShape(
                 allocator,
                 ring.id,
                 atoms,
@@ -143,8 +225,13 @@ fn placeFragmentRings(
                 graph,
                 membership,
                 placed,
-                force_open_macrocycles,
-            ) == .matched) {
+                options.force_open_macrocycles,
+            );
+            if (shape_result.placed()) {
+                // A polyomino with pentagon vertices leaves the ring off the
+                // hexagonal lattice, and upstream requires minimization for
+                // exactly that case.
+                if (shape_result == .matched_needs_minimization) pentagon_minimization = true;
                 remaining -= 1;
                 continue;
             }
@@ -158,7 +245,14 @@ fn placeFragmentRings(
         const local = try regularRingCoordinates(allocator, ordered.len);
         defer allocator.free(local);
         if (selected_shared >= 2) {
-            try alignFusedRing(atoms, ordered, local, placed);
+            // Upstream scores the two mirror candidates against the center of
+            // the one already-drawn parent ring, not against everything placed
+            // so far (CoordgenFragmentBuilder.cpp:513). The distinction only
+            // appears from the third ring of a fused system onwards, which is
+            // where the two disagree and where the wrong mirror gets picked.
+            const parent = selectParentRing(membership, analysis, ring.id, placed) orelse
+                return error.InvalidMapping;
+            try alignFusedRing(atoms, ordered, local, placed, membership.atoms(parent));
         } else if (selected_shared == 1) {
             var pivot: usize = 0;
             for (ordered, 0..) |atom, index| if (placed[atom.index()]) {
@@ -185,6 +279,202 @@ fn placeFragmentRings(
         }
         remaining -= 1;
     }
+    // Upstream reaches maybeMinimizeRings only after the loop above has drained
+    // its ring vector — `while (!rings.empty()) { ... rings.erase(...); }` —
+    // so the call it makes is over an empty set (CoordgenFragmentBuilder.cpp
+    // :220-227). The function iterates nothing, finds nothing, and returns
+    // before its own `rings.at(0)` would throw on the empty vector. It is dead
+    // code at the pin, and its trigger never fires.
+    //
+    // Native evaluated it over the fragment's real rings and so required
+    // minimization on systems upstream never minimizes (cgz-r31). The
+    // transcription is kept and tested; what is corrected is the ring set the
+    // call site hands it, which upstream leaves empty.
+    const rings_left_after_placement: []const core.ids.RingId = &.{};
+    return pentagon_minimization or maybeMinimizeRings(membership, rings_left_after_placement);
+}
+
+/// `findCentralRingOfSystem` for a system where nothing has been placed yet, so
+/// no ring carries the already-built bonus. Same priority rule the per-ring
+/// placement loop applies, and first-wins on a tie, as there.
+fn selectCentralRing(
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+) ?core.ids.RingId {
+    var selected: ?core.ids.RingId = null;
+    var selected_score: usize = 0;
+    for (membership.rings) |ring| {
+        const ring_atoms = membership.atoms(ring.id);
+        if (ring_atoms.len < 3) continue;
+        if (fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
+        const score = ringPriority(membership, analysis, ring, false);
+        if (selected == null or score > selected_score) {
+            selected = ring.id;
+            selected_score = score;
+        }
+    }
+    return selected;
+}
+
+pub const perfectly_planar_system_score: f32 = 50;
+pub const non_planar_system_score: f32 = 1000;
+pub const untreatable_system_planarity_score: f32 = 200000;
+
+/// Upstream's `CoordgenFragmentBuilder::newScorePlanarity`: how badly a fused
+/// ring system resists being drawn flat. Three conditions each add
+/// `non_planar_system_score`, so a system scoring at or above that has at least
+/// one of them and cannot be placed ring by ring.
+///
+/// A macrocycle with no bond available to open is skipped entirely, before its
+/// own conditions are considered — that is upstream's `continue`, and it is why
+/// the openable check comes first.
+fn scorePlanarity(
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+) core.errors.Error!f32 {
+    var score: f32 = 0;
+    for (membership.rings) |ring| {
+        const ring_atoms = membership.atoms(ring.id);
+        if (ring_atoms.len == 0) continue;
+        if (fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
+        const macrocycle_ring = ring_atoms.len >= topology.rings.macrocycle_size;
+        if (macrocycle_ring and
+            macrocycle.findBondToOpen(ring.id, bonds, graph, membership) == null) continue;
+        if (macrocycle_ring) {
+            for (analysis.fusedWith(ring.id)) |fusion| {
+                if (membership.atoms(fusion.other).len >= topology.rings.macrocycle_size) {
+                    score += non_planar_system_score;
+                }
+            }
+        }
+        for (bonds) |bond| {
+            const shared = membership.bondRings(bond.id);
+            if (std.mem.indexOfScalar(core.ids.RingId, shared, ring.id) == null) continue;
+            if (shared.len > 2) {
+                score += non_planar_system_score * @as(f32, @floatFromInt(shared.len - 2));
+            }
+        }
+        for (ring_atoms) |atom| {
+            if (graph.degree(atom) <= 3) continue;
+            var angle: f32 = 0;
+            for (membership.atomRings(atom)) |other| {
+                const size = membership.atoms(other).len;
+                if (size == 0) return error.InvalidMapping;
+                angle += std.math.pi - 2 * std.math.pi / @as(f32, @floatFromInt(size));
+            }
+            // Upstream's threshold is 1.99 pi, not 2 pi: three ring interior
+            // angles that sum to a full turn leave no room for a fourth
+            // substituent in the plane, and the slack absorbs float error.
+            if (angle >= 1.99 * std.math.pi) score += non_planar_system_score;
+        }
+    }
+    return score;
+}
+
+/// Upstream's CoordgenMinimizer::maybeMinimizeRings: a five-membered ring, or
+/// an odd-sized macrocycle, holding an atom that belongs to more than two rings
+/// requires minimization.
+///
+/// Faithful to the function, which is not the same as reachable — see the call
+/// site above for why upstream's only caller passes it nothing.
+fn maybeMinimizeRings(
+    membership: topology.RingMembership,
+    rings: []const core.ids.RingId,
+) bool {
+    for (rings) |ring| {
+        const ring_atoms = membership.atoms(ring);
+        const five_membered = ring_atoms.len == 5;
+        const odd_macrocycle = ring_atoms.len >= topology.rings.macrocycle_size and
+            ring_atoms.len % 2 != 0;
+        if (!five_membered and !odd_macrocycle) continue;
+        for (ring_atoms) |atom| {
+            if (membership.atomRings(atom).len > 2) return true;
+        }
+    }
+    return false;
+}
+
+/// Collect this fragment's rings in ring order and try the template database
+/// against the whole system, mirroring findTemplate's first upstream call
+/// site. Returns true when the fragment was placed from a template, in which
+/// case no per-ring placement runs for it.
+///
+/// templates.findRingSet already declines a system of fewer than two rings and
+/// already honours `load_templates`, so both of upstream's guards live there
+/// rather than being restated here.
+fn matchFragmentTemplate(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+    options: Options,
+    placed: []bool,
+) core.errors.Error!bool {
+    var ring_ids: std.ArrayList(core.ids.RingId) = .empty;
+    defer ring_ids.deinit(allocator);
+    for (membership.rings) |ring| {
+        const ring_atoms = membership.atoms(ring.id);
+        if (ring_atoms.len < 3) continue;
+        if (fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
+        ring_ids.append(allocator, ring.id) catch return error.OutOfMemory;
+    }
+    if (ring_ids.items.len < 2) return false;
+
+    var match = (try templates.findRingSet(
+        allocator,
+        options.templates,
+        atoms.len,
+        bonds,
+        membership,
+        ring_ids.items,
+    )) orelse return false;
+    defer match.deinit();
+    try match.apply(atoms);
+    for (match.atoms) |atom_id| placed[atom_id.index()] = true;
+    return true;
+}
+
+/// Upstream's CoordgenFragmentBuilder::findCentralRingOfSystem priority, with
+/// its constants (CoordgenFragmentBuilder.cpp:24-27).
+///
+/// The native score used to be `shared * 10000 + (size == 6) * 10 + size`,
+/// which kept the already-built bonus, the six-ring bonus and the size term
+/// but dropped three: the macrocycle bonus, the fused-ring count and the
+/// fusion-atom count. Those decide the order for any system holding a
+/// macrocycle or rings of differing fusion, and the placement order decides
+/// the layout.
+///
+/// `neighbour_built` is a flat bonus upstream, taken once for having any built
+/// fused neighbour rather than scaled by how many atoms are already placed.
+fn ringPriority(
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    ring: model.Ring,
+    neighbour_built: bool,
+) usize {
+    const neighbour_already_built_score: usize = 100000;
+    const macrocycle_score: usize = 1000;
+    const fused_rings_score: usize = 40;
+    const fusion_atoms_score: usize = 15;
+
+    var priority: usize = 0;
+    if (neighbour_built) priority += neighbour_already_built_score;
+    const size = membership.atoms(ring.id).len;
+    if (size >= topology.rings.macrocycle_size) priority += macrocycle_score;
+    if (size == 6) priority += 10;
+    priority += size;
+    const fusions = analysis.fusedWith(ring.id);
+    priority += fused_rings_score * fusions.len;
+    for (fusions) |fusion| priority += fusion_atoms_score * analysis.fusionAtoms(fusion).len;
+    return priority;
 }
 
 fn openCycleAndGenerateCoordinates(
@@ -214,14 +504,14 @@ fn openCycleAndGenerateCoordinates(
     defer temporary_rings.deinit();
     var temporary_fragments = try fragments.Fragmentation.init(allocator, temporary_atoms, temporary_bonds, temporary_graph, temporary_rings);
     defer temporary_fragments.deinit();
-    try initializeCoordinatesInternal(
+    _ = try initializeCoordinatesInternal(
         allocator,
         temporary_atoms,
         temporary_bonds,
         temporary_graph,
         temporary_rings,
         temporary_fragments,
-        true,
+        .{ .force_open_macrocycles = true },
     );
     for (atoms, temporary_atoms, placed) |*atom, temporary_atom, *is_placed| {
         if (graph.component(atom.id) != component) continue;
@@ -246,13 +536,57 @@ fn regularRingCoordinates(allocator: std.mem.Allocator, count: usize) core.error
     return result;
 }
 
-fn alignFusedRing(atoms: []model.Atom, ordered: []const core.ids.AtomId, local: []const core.math.Vec2, placed: []bool) core.errors.Error!void {
+/// Upstream's `getSharedAtomsWithAlreadyDrawnRing`
+/// (CoordgenFragmentBuilder.cpp): among this ring's fused neighbours that are
+/// already drawn, walk them in fusion order and keep the last one that is
+/// neither less fused with this ring nor smaller than the current pick. The
+/// disjunction is upstream's, and it makes the choice order-dependent rather
+/// than a maximum — preserved here for that reason.
+fn selectParentRing(
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    ring: core.ids.RingId,
+    placed: []const bool,
+) ?core.ids.RingId {
+    var parent: ?core.ids.RingId = null;
+    var parent_shared: usize = 0;
+    for (analysis.fusedWith(ring)) |fusion| {
+        if (!ringIsDrawn(membership, fusion.other, placed)) continue;
+        if (parent != null) {
+            if (fusion.atom_count < parent_shared or
+                membership.atoms(fusion.other).len < membership.atoms(parent.?).len) continue;
+        }
+        parent = fusion.other;
+        parent_shared = fusion.atom_count;
+    }
+    return parent;
+}
+
+fn ringIsDrawn(membership: topology.RingMembership, ring: core.ids.RingId, placed: []const bool) bool {
+    for (membership.atoms(ring)) |atom| {
+        if (!placed[atom.index()]) return false;
+    }
+    return true;
+}
+
+fn alignFusedRing(
+    atoms: []model.Atom,
+    ordered: []const core.ids.AtomId,
+    local: []const core.math.Vec2,
+    placed: []bool,
+    parent_atoms: []const core.ids.AtomId,
+) core.errors.Error!void {
     var first: ?usize = null;
     var last: usize = 0;
-    for (ordered, 0..) |atom, index| if (placed[atom.index()]) {
+    // The anchors and the excluded set are the atoms shared with the parent,
+    // upstream's `fusionAtoms`, not every atom already placed: a ring fused to
+    // two drawn rings shares atoms with both, and only the parent's pair
+    // defines the axis the two candidates differ across.
+    for (ordered, 0..) |atom, index| {
+        if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) == null) continue;
         if (first == null) first = index;
         last = index;
-    };
+    }
     const first_index = first orelse return error.InvalidMapping;
     if (first_index == last) return error.InvalidMapping;
     const target_first = atoms[ordered[first_index].index()].coordinates;
@@ -264,13 +598,13 @@ fn alignFusedRing(atoms: []model.Atom, ordered: []const core.ids.AtomId, local: 
     const rotation = target_angle - source_angle;
     var first_score: f32 = 0;
     var mirror_score: f32 = 0;
-    const existing_center = placedCenter(atoms, placed);
+    const parent_center = ringAtomCenter(atoms, parent_atoms);
     for (ordered, local) |atom, coordinate| {
-        if (placed[atom.index()]) continue;
+        if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) != null) continue;
         const candidate = transformFromPivot(coordinate, source_first, target_first, rotation);
         const mirror = reflectAcrossLine(candidate, target_first, target_last);
-        first_score += distance(candidate, existing_center);
-        mirror_score += distance(mirror, existing_center);
+        first_score += distance(candidate, parent_center);
+        mirror_score += distance(mirror, parent_center);
     }
     const use_mirror = mirror_score > first_score;
     for (ordered, local) |atom, coordinate| if (!placed[atom.index()]) {
@@ -308,6 +642,13 @@ fn placedCenter(atoms: []const model.Atom, placed: []const bool) core.math.Vec2 
         count += 1;
     };
     return if (count == 0) center else scale(center, 1 / @as(f32, @floatFromInt(count)));
+}
+
+/// `sketcherMinimizerRing::findCenter`: the mean of one ring's atoms.
+fn ringAtomCenter(atoms: []const model.Atom, members: []const core.ids.AtomId) core.math.Vec2 {
+    var center: core.math.Vec2 = .{};
+    for (members) |atom| center = add(center, atoms[atom.index()].coordinates);
+    return if (members.len == 0) center else scale(center, 1 / @as(f32, @floatFromInt(members.len)));
 }
 
 fn coordinateCenter(coordinates: []const core.math.Vec2) core.math.Vec2 {
@@ -533,21 +874,68 @@ fn restoreFixedCoordinates(atoms: []model.Atom) void {
     };
 }
 
-fn fallbackOn3dCoordinates(atoms: []model.Atom, fragmentation: fragments.Fragmentation) void {
+/// `CoordgenFragmentBuilder::fallbackIfNanCoordinates`: when a fragment's
+/// generated coordinates hold a NaN and its input 3D coordinates are usable,
+/// project those instead.
+///
+/// This was cgz-7v2.25. A hand-rolled version was wired here that copied 3D x/y
+/// straight through - unscaled, unmirrored, unrounded - while the faithful
+/// transcription sat unreachable in the optimize layer, and their triggers
+/// disagreed as well. Two implementations of one upstream function is how that
+/// happened, so there is now exactly one, in the layer that calls it.
+fn fallbackOnValid3dCoordinates(atoms: []model.Atom, fragmentation: fragments.Fragmentation) void {
     for (fragmentation.fragments) |fragment| {
         const members = fragmentation.members(fragment.id);
-        var generated_finite = true;
-        var source_valid = true;
-        for (members) |atom| {
-            generated_finite = generated_finite and atoms[atom.index()].coordinates.isFinite();
-            source_valid = source_valid and atoms[atom.index()].coordinates_3d != null and atoms[atom.index()].coordinates_3d.?.isFinite();
-        }
-        if (generated_finite or !source_valid) continue;
+        if (!fragmentHasNan(atoms, members)) continue;
+        if (!fragmentHasValid3dSource(atoms, members)) continue;
         for (members) |atom| {
             const source = atoms[atom.index()].coordinates_3d.?;
-            atoms[atom.index()].coordinates = .{ .x = source.x, .y = source.y };
+            // The 35x scale and the negated y are upstream's projection, and the
+            // rounding keeps the emergency pose on the same two-decimal grid as
+            // the rest of the layout.
+            atoms[atom.index()].coordinates = .{
+                .x = roundToTwoDecimalDigits(source.x * 35),
+                .y = roundToTwoDecimalDigits(-source.y * 35),
+            };
         }
     }
+}
+
+/// `CoordgenMinimizer::hasNaNCoordinates`: NaN only. An infinity is deliberately
+/// not a trigger upstream, and the hand-rolled version tested `!isFinite()`,
+/// which made it one and took the fallback where upstream would not.
+fn fragmentHasNan(atoms: []const model.Atom, members: []const core.ids.AtomId) bool {
+    for (members) |atom| {
+        const position = atoms[atom.index()].coordinates;
+        if (std.math.isNan(position.x) or std.math.isNan(position.y)) return true;
+    }
+    return false;
+}
+
+/// `sketcherMinimizerAtom::hasValid3DCoordinates`: upstream's 10,000,001 test.
+/// The number is not a magnitude policy - INVALID_COORDINATES is the *default*
+/// value upstream assigns m_x3D/y3D/z3D, so `< INVALID_COORDINATES` means "this
+/// atom actually carries 3D data". Native's `?Vec3` encodes that intent
+/// directly, and the null check below is the faithful half.
+///
+/// The ceiling is kept as well because it is one-sided, which makes it more than
+/// a presence test: a coordinate at or above the sentinel reads as absent, and a
+/// negative infinity reads as present. Both follow from comparing against a
+/// sentinel rather than from a decision, and the test below pins them rather
+/// than tidying them away.
+fn fragmentHasValid3dSource(atoms: []const model.Atom, members: []const core.ids.AtomId) bool {
+    const invalid_coordinates: f32 = 10_000_001;
+    for (members) |atom| {
+        const source = atoms[atom.index()].coordinates_3d orelse return false;
+        if (!(source.x < invalid_coordinates and
+            source.y < invalid_coordinates and
+            source.z < invalid_coordinates)) return false;
+    }
+    return true;
+}
+
+fn roundToTwoDecimalDigits(value: f32) f32 {
+    return @floor(value * 100 + 0.5) * 0.01;
 }
 
 fn fragmentCenter(atoms: []const model.Atom, members: []const core.ids.AtomId) core.math.Vec2 {
@@ -596,6 +984,174 @@ fn orderRing(allocator: std.mem.Allocator, ring: model.Ring, bonds: []const mode
         result[index] = next;
     }
     return result;
+}
+
+/// `initializeVariablesForNeighboursCoordinatesRingAtom`: place a ring atom's
+/// non-ring substituents inside the widest *scaled* gap between its ring
+/// neighbours, rather than at a fixed offset from an arbitrary one.
+///
+/// Native previously took the first placed neighbour it found, added pi/3, and
+/// spread the rest by 2*pi/3. On a fused quaternary carbon that picks between
+/// two candidate gaps effectively at random, and choosing the wrong one puts a
+/// methyl exactly two bond lengths from where upstream puts it - which is
+/// drug_like/1's whole remaining residual (cgz-7v2.29, cgz-r31).
+///
+/// Returns false when the centre has no ring neighbour with coordinates, so the
+/// caller keeps its own fallback rather than this inventing one.
+fn placeRingAtomSubstituents(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: core.ids.FragmentId,
+    center: core.ids.AtomId,
+    placed: []bool,
+    queue: []core.ids.AtomId,
+    tail: *usize,
+) core.errors.Error!bool {
+    const origin = atoms[center.index()].coordinates;
+    var ring_angles: [16]f32 = undefined;
+    var ring_neighbours: [16]core.ids.AtomId = undefined;
+    var ring_count: usize = 0;
+    // Upstream's orderedNeighbors for this branch is every non-ring neighbour,
+    // visited ones included: they are skipped when placing but still divide the
+    // gap, so the divisor counts them.
+    var substituents: [16]core.ids.AtomId = undefined;
+    var substituent_count: usize = 0;
+    for (graph.neighbors(center)) |neighbor| {
+        if (sharesRing(membership, center, neighbor)) {
+            if (ring_count == ring_angles.len) return false;
+            var angle = std.math.atan2(
+                atoms[neighbor.index()].coordinates.y - origin.y,
+                atoms[neighbor.index()].coordinates.x - origin.x,
+            );
+            if (angle < 0) angle += 2 * pi;
+            ring_angles[ring_count] = angle;
+            ring_neighbours[ring_count] = neighbor;
+            ring_count += 1;
+        } else {
+            if (substituent_count == substituents.len) return false;
+            substituents[substituent_count] = neighbor;
+            substituent_count += 1;
+        }
+    }
+    if (ring_count == 0 or substituent_count == 0) return false;
+
+    // Stable insertion sort by angle. Upstream stable_sorts pairs, whose
+    // secondary key is the atom pointer; sorting on the angle alone and keeping
+    // insertion order for exact ties is the order-stable reading of that
+    // (cgz-r13), and two ring bonds at an identical angle is degenerate anyway.
+    var i: usize = 1;
+    while (i < ring_count) : (i += 1) {
+        var j = i;
+        while (j > 0 and ring_angles[j - 1] > ring_angles[j]) : (j -= 1) {
+            std.mem.swap(f32, &ring_angles[j - 1], &ring_angles[j]);
+            std.mem.swap(core.ids.AtomId, &ring_neighbours[j - 1], &ring_neighbours[j]);
+        }
+    }
+
+    var best: usize = 0;
+    var best_scaled: f32 = -1;
+    var best_gap: f32 = 0;
+    for (0..ring_count) |index| {
+        const next = (index + 1) % ring_count;
+        var gap = ring_angles[next] - ring_angles[index];
+        if (gap < 0) gap += 2 * pi;
+        var scaled = gap;
+        if (gap > pi) {
+            // A reflex gap is the outside of the ring system, and upstream
+            // strongly prefers it.
+            scaled *= 10;
+        } else if (gapPointsIntoRing(atoms, membership, fragmentation, fragment, center, ring_angles[index] + gap * 0.5)) {
+            scaled *= 0.2;
+        }
+        // First-wins on a tie, matching upstream's strict `>`.
+        if (scaled > best_scaled) {
+            best_scaled = scaled;
+            best = index;
+            best_gap = gap;
+        }
+    }
+
+    // Upstream starts from the chosen gap's own ring neighbour and steps
+    // counter-clockwise into the gap, one step per substituent slot. A visited
+    // neighbour consumes no step but still counts in the divisor.
+    const step = best_gap / @as(f32, @floatFromInt(substituent_count + 1));
+    const start = std.math.atan2(
+        atoms[ring_neighbours[best].index()].coordinates.y - origin.y,
+        atoms[ring_neighbours[best].index()].coordinates.x - origin.x,
+    );
+    var taken: usize = 0;
+    var placed_any = false;
+    for (substituents[0..substituent_count]) |neighbor| {
+        if (fragmentation.atom_fragment[neighbor.index()] != fragment or placed[neighbor.index()]) continue;
+        taken += 1;
+        const angle = start + step * @as(f32, @floatFromInt(taken));
+        atoms[neighbor.index()].coordinates = .{
+            .x = origin.x + @cos(angle) * bond_length,
+            .y = origin.y + @sin(angle) * bond_length,
+        };
+        placed[neighbor.index()] = true;
+        queue[tail.*] = neighbor;
+        tail.* += 1;
+        placed_any = true;
+    }
+    return placed_any;
+}
+
+fn sharesRing(membership: topology.RingMembership, left: core.ids.AtomId, right: core.ids.AtomId) bool {
+    for (membership.atomRings(left)) |ring| {
+        for (membership.atomRings(right)) |other| {
+            if (ring == other) return true;
+        }
+    }
+    return false;
+}
+
+/// Upstream's SKETCHER_EPSILON, the guard against dividing by a horizontal edge.
+const sketcher_epsilon: f32 = 1.0e-5;
+
+/// Upstream probes a point a tenth of a bond length along the gap's midpoint and
+/// asks whether it falls inside any non-macrocyclic ring of the fragment
+/// (`sketcherMinimizerRing::contains`, an even-odd crossing count).
+fn gapPointsIntoRing(
+    atoms: []const model.Atom,
+    membership: topology.RingMembership,
+    fragmentation: fragments.Fragmentation,
+    fragment: core.ids.FragmentId,
+    center: core.ids.AtomId,
+    midpoint_angle: f32,
+) bool {
+    const origin = atoms[center.index()].coordinates;
+    const probe: core.math.Vec2 = .{
+        .x = origin.x + @cos(midpoint_angle) * bond_length * 0.1,
+        .y = origin.y + @sin(midpoint_angle) * bond_length * 0.1,
+    };
+    for (membership.rings) |ring| {
+        const members = membership.atoms(ring.id);
+        if (members.len == 0) continue;
+        if (fragmentation.atom_fragment[members[0].index()] != fragment) continue;
+        if (members.len >= topology.rings.macrocycle_size) continue;
+        if (ringContainsPoint(atoms, members, probe)) return true;
+    }
+    return false;
+}
+
+fn ringContainsPoint(atoms: []const model.Atom, members: []const core.ids.AtomId, probe: core.math.Vec2) bool {
+    var crossings: usize = 0;
+    for (members, 0..) |member, index| {
+        const next = members[(index + 1) % members.len];
+        const a = atoms[member.index()].coordinates;
+        const b = atoms[next.index()].coordinates;
+        // Upstream's strict inequalities, so a vertex exactly at the probe's
+        // height is not counted from either side.
+        if (!((probe.y < a.y and probe.y > b.y) or (probe.y > a.y and probe.y < b.y))) continue;
+        const dy = b.y - a.y;
+        if (dy <= sketcher_epsilon and dy >= -sketcher_epsilon) continue;
+        const t = (probe.y - a.y) / dy;
+        if (probe.x > a.x + (b.x - a.x) * t) crossings += 1;
+    }
+    return crossings % 2 != 0;
 }
 
 fn parentAngle(atoms: []const model.Atom, graph: topology.Graph, fragmentation: fragments.Fragmentation, fragment: core.ids.FragmentId, center: core.ids.AtomId, placed: []const bool) f32 {
@@ -664,7 +1220,7 @@ test "macrocycles dispatch through native polyomino placement" {
     try std.testing.expect(hex_edges > 0);
 
     const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
-    try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, true);
+    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, .{ .force_open_macrocycles = true });
     for (bonds) |bond| {
         if (bond.id == opened) continue;
         try std.testing.expectApproxEqAbs(
@@ -718,7 +1274,7 @@ fn layoutWithOptionsAndDiscard(
 ) !void {
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
-    try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, force_open_macrocycles);
+    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, .{ .force_open_macrocycles = force_open_macrocycles });
 }
 
 fn captureFramesAndDiscard(
@@ -771,6 +1327,79 @@ test "fused rings align on their shared edge and extend outward" {
         layoutAndDiscard,
         .{ &atoms, &bonds, graph, rings, split },
     );
+}
+
+test "the third ring of a linear acene mirrors away from its parent ring, not from everything drawn" {
+    // A linear tricyclic is the smallest case where upstream's two mirror
+    // references disagree: when the third ring is placed, the centroid of the
+    // ten atoms already drawn sits well outside its parent ring's own centre.
+    // Upstream scores against the parent ring (CoordgenFragmentBuilder.cpp:513),
+    // so this pins that reference rather than the placed centroid (cgz-r31).
+    var atoms: [14]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    const pairs = [_][2]u32{
+        .{ 0, 1 },  .{ 1, 2 },   .{ 2, 3 },   .{ 3, 4 },  .{ 4, 5 },   .{ 5, 0 },
+        .{ 3, 6 },  .{ 6, 7 },   .{ 7, 8 },   .{ 8, 9 },  .{ 9, 4 },   .{ 8, 10 },
+        .{ 10, 11 }, .{ 11, 12 }, .{ 12, 13 }, .{ 13, 7 },
+    };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    try layoutFixture(&atoms, &bonds);
+    try expectBondLengths(&atoms, &bonds);
+
+    // The middle ring is the outer ring's parent, and the outer ring's own
+    // atoms must sit further from that centre than their mirror images across
+    // the shared 7-8 edge would.
+    const middle = [_]u32{ 3, 4, 6, 7, 8, 9 };
+    var parent_center: core.math.Vec2 = .{};
+    for (middle) |index| parent_center = add(parent_center, atoms[index].coordinates);
+    parent_center = scale(parent_center, 1.0 / @as(f32, @floatFromInt(middle.len)));
+
+    const axis_start = atoms[7].coordinates;
+    const axis_end = atoms[8].coordinates;
+    var direct: f32 = 0;
+    var mirrored: f32 = 0;
+    for ([_]u32{ 10, 11, 12, 13 }) |index| {
+        const point = atoms[index].coordinates;
+        direct += distance(point, parent_center);
+        mirrored += distance(reflectAcrossLine(point, axis_start, axis_end), parent_center);
+    }
+    try std.testing.expect(direct >= mirrored);
+
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    defer analysis.deinit();
+
+    // And the parent chosen for the outer ring is the ring it shares an edge
+    // with, not the far one it shares nothing with.
+    var placed: [14]bool = @splat(true);
+    var outer: ?core.ids.RingId = null;
+    for (rings.rings) |ring| {
+        if (std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(ring.id), core.ids.AtomId.fromIndex(11)) != null) {
+            outer = ring.id;
+            break;
+        }
+    }
+    const outer_ring = outer orelse return error.TestUnexpectedResult;
+    // Its shared edge is already drawn as part of the parent, which is exactly
+    // the state the placement loop is in when it reaches this ring.
+    for ([_]u32{ 10, 11, 12, 13 }) |index| placed[index] = false;
+    const parent = selectParentRing(rings, analysis, outer_ring, &placed) orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(parent), core.ids.AtomId.fromIndex(6)) != null);
+    try std.testing.expect(std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(parent), core.ids.AtomId.fromIndex(0)) == null);
 }
 
 test "spiro rings sharing one atom are placed on opposite sides" {
@@ -858,7 +1487,7 @@ test "fragment assembly preserves every acyclic parent bond length" {
     };
 }
 
-test "constrained alignment, fixed reset, and valid 3D fallback are deterministic" {
+test "constrained alignment and fixed reset are deterministic" {
     var atoms: [3]model.Atom = undefined;
     for (&atoms, 0..) |*atom, index| atom.* = .{
         .id = core.ids.AtomId.fromIndex(@intCast(index)),
@@ -884,15 +1513,167 @@ test "constrained alignment, fixed reset, and valid 3D fallback are deterministi
     try layoutFixture(&atoms, &bonds);
     try std.testing.expectEqual(core.math.Vec2{ .x = -12, .y = 34 }, atoms[2].coordinates);
 
-    for (&atoms, 0..) |*atom, index| {
-        atom.fixed = false;
-        atom.constrained = true;
-        atom.template_coordinates = .{ .x = std.math.nan(f32), .y = 0 };
-        atom.coordinates_3d = .{ .x = @floatFromInt(index * 3), .y = @floatFromInt(index * 5), .z = 7 };
-    }
-    try layoutFixture(&atoms, &bonds);
+}
+
+test "the 3D fallback applies upstream's scaled, mirrored projection" {
+    // Exercised directly rather than through the whole layout: the projection is
+    // what cgz-7v2.25 got wrong, and upstream runs this BEFORE the constrained
+    // rotation, so driving it end to end would measure the rotation's handling
+    // of a deliberately broken template instead of the projection.
+    var atoms: [3]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+        .coordinates = .{ .x = std.math.nan(f32), .y = 0 },
+        .coordinates_3d = .{ .x = @floatFromInt(index * 3), .y = @floatFromInt(index * 5), .z = 7 },
+    };
+    var bonds = [_]model.Bond{
+        .{ .id = core.ids.BondId.fromIndex(0), .input_index = 0, .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(1), .input_order = .single, .effective_order = .single },
+        .{ .id = core.ids.BondId.fromIndex(1), .input_index = 1, .start = core.ids.AtomId.fromIndex(1), .end = core.ids.AtomId.fromIndex(2), .input_order = .single, .effective_order = .single },
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+
+    fallbackOnValid3dCoordinates(&atoms, split);
+    // 35x, y negated, rounded to two decimals - not the raw 3D x/y a hand-rolled
+    // version used to copy through.
     for (atoms, 0..) |atom, index| {
-        try std.testing.expectEqual(@as(f32, @floatFromInt(index * 3)), atom.coordinates.x);
-        try std.testing.expectEqual(@as(f32, @floatFromInt(index * 5)), atom.coordinates.y);
+        const source: f32 = @floatFromInt(index);
+        try std.testing.expectApproxEqAbs(source * 3 * 35, atom.coordinates.x, 0.001);
+        try std.testing.expectApproxEqAbs(-(source * 5) * 35, atom.coordinates.y, 0.001);
     }
+
+    // An infinity is not NaN, so it does not trigger the fallback at all.
+    for (&atoms) |*atom| atom.coordinates = .{ .x = std.math.inf(f32), .y = 0 };
+    fallbackOnValid3dCoordinates(&atoms, split);
+    for (atoms) |atom| try std.testing.expectEqual(std.math.inf(f32), atom.coordinates.x);
+
+    // A missing 3D source declines; and the sentinel is a one-sided ceiling, so
+    // a negative infinity passes it where a positive one does not.
+    for (&atoms) |*atom| {
+        atom.coordinates = .{ .x = std.math.nan(f32), .y = 0 };
+        atom.coordinates_3d = null;
+    }
+    fallbackOnValid3dCoordinates(&atoms, split);
+    for (atoms) |atom| try std.testing.expect(std.math.isNan(atom.coordinates.x));
+
+    for (&atoms) |*atom| atom.coordinates_3d = .{ .x = -std.math.inf(f32), .y = 0, .z = 0 };
+    try std.testing.expect(fragmentHasValid3dSource(&atoms, split.members(split.fragments[0].id)));
+    for (&atoms) |*atom| atom.coordinates_3d = .{ .x = std.math.inf(f32), .y = 0, .z = 0 };
+    try std.testing.expect(!fragmentHasValid3dSource(&atoms, split.members(split.fragments[0].id)));
+}
+
+test "planarity scoring separates a flat fused system from a bond shared by three rings" {
+    // Two fused six-membered rings: flat, nothing shared beyond one edge, and
+    // no atom carrying a fourth neighbour. Upstream's first branch.
+    var flat_atoms: [10]model.Atom = undefined;
+    for (&flat_atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    const flat_pairs = [_][2]u32{
+        .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 }, .{ 4, 5 }, .{ 5, 0 },
+        .{ 2, 6 }, .{ 6, 7 }, .{ 7, 8 }, .{ 8, 9 }, .{ 9, 3 },
+    };
+    var flat_bonds: [flat_pairs.len]model.Bond = undefined;
+    for (&flat_bonds, flat_pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    try std.testing.expectEqual(@as(f32, 0), try planarityFixture(&flat_atoms, &flat_bonds));
+
+    // Three bridges across one bond puts that bond in three rings at once,
+    // which is upstream's second condition. A bridged cage like
+    // bicyclo[2.2.2]octane does NOT qualify and must not be scored as if it
+    // did: its bridgeheads have degree three and its rings share atoms rather
+    // than bonds, which is why drug_like/5 measures zero here.
+    var bridged_atoms: [8]model.Atom = undefined;
+    for (&bridged_atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    const bridged_pairs = [_][2]u32{
+        .{ 0, 1 },
+        .{ 0, 2 }, .{ 2, 3 }, .{ 3, 1 },
+        .{ 0, 4 }, .{ 4, 5 }, .{ 5, 1 },
+        .{ 0, 6 }, .{ 6, 7 }, .{ 7, 1 },
+    };
+    var bridged_bonds: [bridged_pairs.len]model.Bond = undefined;
+    for (&bridged_bonds, bridged_pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    const bridged_score = try planarityFixture(&bridged_atoms, &bridged_bonds);
+    try std.testing.expect(bridged_score >= non_planar_system_score);
+    try std.testing.expect(bridged_score <= untreatable_system_planarity_score);
+}
+
+fn planarityFixture(atoms: []model.Atom, bonds: []const model.Bond) !f32 {
+    var graph = try topology.Graph.init(std.testing.allocator, atoms, bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, atoms, bonds, graph, rings);
+    defer split.deinit();
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, atoms, bonds);
+    defer analysis.deinit();
+    var worst: f32 = 0;
+    for (split.fragments) |fragment| {
+        if (fragment.ring_count == 0) continue;
+        worst = @max(worst, try scorePlanarity(rings, analysis, bonds, graph, split, fragment));
+    }
+    return worst;
+}
+
+test "maybeMinimizeRings fires on a five-membered ring sharing an atom with two others" {
+    // The transcription is exercised directly, because upstream's only call site
+    // hands it an already-drained ring vector and therefore never reaches these
+    // conditions. See placeFragmentRings for why that call passes nothing.
+    var atoms: [8]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
+    const pairs = [_][2]u32{
+        .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 }, .{ 4, 5 },
+        .{ 5, 0 }, .{ 5, 6 }, .{ 6, 7 }, .{ 7, 2 },
+    };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+
+    var all: [8]core.ids.RingId = undefined;
+    for (rings.rings, 0..) |ring, index| all[index] = ring.id;
+    const every_ring = all[0..rings.rings.len];
+
+    // An empty set is what the call site passes, and it can never fire.
+    try std.testing.expect(!maybeMinimizeRings(rings, &.{}));
+
+    // Over the real rings the answer depends on the perceived basis; assert the
+    // condition it encodes rather than a fixed verdict.
+    var expected = false;
+    for (every_ring) |ring| {
+        const members = rings.atoms(ring);
+        const five = members.len == 5;
+        const odd_macro = members.len >= topology.rings.macrocycle_size and members.len % 2 != 0;
+        if (!five and !odd_macro) continue;
+        for (members) |atom| {
+            if (rings.atomRings(atom).len > 2) expected = true;
+        }
+    }
+    try std.testing.expectEqual(expected, maybeMinimizeRings(rings, every_ring));
 }

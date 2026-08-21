@@ -2,7 +2,11 @@ const std = @import("std");
 const core = @import("core");
 const model = @import("model");
 const topology = @import("topology");
-const data = @import("templates/data.zig");
+/// The pinned template fixture. Public because the regeneration check
+/// (tests/template_generate.zig) validates these exact tables, and giving
+/// that file its own module over the same source would place one file in two
+/// modules — which Zig rejects as soon as anything reaches the layout layer.
+pub const data = @import("templates/data.zig");
 
 pub const template_count = data.templates.len;
 

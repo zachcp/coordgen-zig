@@ -7,7 +7,19 @@ const fragments = @import("fragments.zig");
 
 pub const max_macrocycles: usize = 40;
 pub const path_failed: i32 = -1000;
+pub const substituted_atom_restraint: i32 = 10;
 pub const sqrt_three_halves: f32 = 0.8660254037844386;
+
+/// Pinned `CoordgenMacrocycleBuilder::acceptableShapeScore`. Path scores start
+/// at zero and only ever subtract, so for ten atoms or more the threshold is
+/// unreachable and the early break never fires: upstream keeps expanding the
+/// shape pool until the `max_macrocycles` cap or a perfect zero score. The
+/// positive sign is upstream's and is load-bearing, not a transcription slip.
+pub fn acceptableShapeScore(atom_count: usize) core.errors.Error!i32 {
+    if (atom_count < 10) return 0;
+    if (atom_count > @as(usize, @intCast(@divTrunc(std.math.maxInt(i32), substituted_atom_restraint)))) return error.TooManyItems;
+    return @divTrunc(@as(i32, @intCast(atom_count)) * substituted_atom_restraint, 2);
+}
 
 pub const HexCoords = struct {
     x: i32,
@@ -541,7 +553,17 @@ pub const PathData = struct {
 
 pub const GenerateResult = enum {
     matched,
+    /// A shape was applied, and it carries pentagon vertices. Upstream calls
+    /// requireMinimization in exactly this case
+    /// (CoordgenMacrocycleBuilder.cpp, after writePolyominoCoordinates),
+    /// because a pentagon vertex leaves the ring off the hexagonal lattice
+    /// and the geometry needs relaxing.
+    matched_needs_minimization,
     no_shape,
+
+    pub fn placed(self: GenerateResult) bool {
+        return self != .no_shape;
+    }
 };
 
 /// Extract the ordered path and every hard/soft macrocycle condition from the
@@ -696,8 +718,7 @@ pub fn generateShape(
     var chosen_start: usize = 0;
     var chosen_score: i32 = path_failed;
     var found = false;
-    if (coordinates.len > @as(usize, @intCast(std.math.maxInt(i32) / 5))) return error.TooManyItems;
-    const acceptable_score: i32 = if (coordinates.len < 10) 0 else -@as(i32, @intCast(coordinates.len * 5));
+    const acceptable_score = try acceptableShapeScore(coordinates.len);
     while (shapes.items.items.len != 0) {
         if (try matchShapes(allocator, shapes, data.constraints(), data.restraints(), &checked)) |matched| {
             found = true;
@@ -719,7 +740,10 @@ pub fn generateShape(
     }
     if (found) if (chosen) |shape| {
         try writeCoordinates(shape, chosen_start, coordinates, coordinates_set);
-        return .matched;
+        return if (shape.pentagon_vertices.items.len != 0)
+            .matched_needs_minimization
+        else
+            .matched;
     };
     return .no_shape;
 }
@@ -749,7 +773,7 @@ pub fn generateRingShape(
         is_set.* = coordinates_set[atom.index()];
     }
     const result = try generateShape(allocator, data, coordinates, path_set, force_open_macrocycles);
-    if (result == .matched) for (data.ordered_atoms, coordinates) |atom, coordinate| {
+    if (result.placed()) for (data.ordered_atoms, coordinates) |atom, coordinate| {
         atoms[atom.index()].coordinates = coordinate;
         coordinates_set[atom.index()] = true;
     };
@@ -1492,7 +1516,10 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
     const coordinates_set = try allocator.alloc(bool, ring_size);
     defer allocator.free(coordinates_set);
     @memset(coordinates_set, false);
-    try std.testing.expectEqual(GenerateResult.matched, try generateShape(allocator, data, coordinates, coordinates_set, false));
+    // Asserts a shape was applied. The pentagon-vertex distinction is a
+    // separate fact reported by the same result, and this fixture does not
+    // pin which of the two it lands on.
+    try std.testing.expect((try generateShape(allocator, data, coordinates, coordinates_set, false)).placed());
     for (coordinates, 0..) |coordinate, index| {
         const following = coordinates[(index + 1) % coordinates.len];
         const dx = coordinate.x - following.x;

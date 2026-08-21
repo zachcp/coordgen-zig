@@ -150,7 +150,7 @@ coordgen_error_t validateInput(const coordgen_input_t* input) {
         !validFlag(input->options.skip_minimization) ||
         !validFlag(input->options.force_open_macrocycles) ||
         !validFlag(input->options.constrain_all_atoms) ||
-        !validFlag(input->options.build_from_fragments) ||
+        !validFlag(input->options.reserved) ||
         !validFlag(input->options.debug_coordinates) ||
         !validFlag(input->options.load_templates)) {
         return COORDGEN_ERROR_INVALID_OPTION;
@@ -161,8 +161,10 @@ coordgen_error_t validateInput(const coordgen_input_t* input) {
          * can be made explicit. */
         return COORDGEN_ERROR_UNSUPPORTED;
     }
-    if (input->options.build_from_fragments != 0) {
-        /* Upstream's sketcherMinimizer::buildFromFragments(bool) is not a
+    if (input->options.reserved != 0) {
+        /* This slot was named build_from_fragments until cgz-r25 renamed it;
+         * the rejection below is unchanged and predates the rename.
+         * Upstream's sketcherMinimizer::buildFromFragments(bool) is not a
          * stored option: it forwards straight to
          * CoordgenMinimizer::buildFromFragments(bool firstTime) const, an
          * imperative pipeline step, not a flag any later stage reads back.
@@ -177,7 +179,9 @@ coordgen_error_t validateInput(const coordgen_input_t* input) {
          * do without inventing pipeline behavior upstream itself never
          * runs. The default (0/false) is accepted because it matches
          * actual pinned behavior: fragments are always built during
-         * generation regardless of this flag. See cgz-7v2.8. */
+         * generation regardless of this flag. cgz-7v2.8 established the
+         * rejection; cgz-r25 renamed the field, because a slot that accepts
+         * exactly one value is a reserved field, not an option. */
         return COORDGEN_ERROR_UNSUPPORTED;
     }
     for (uint32_t i = 0; i < input->atoms.len; ++i) {
@@ -382,8 +386,9 @@ coordgen_error_t generate(const coordgen_input_t* input, Generation& output, boo
     minimizer.setEvenAngles(input->options.even_angles != 0);
     minimizer.setSkipMinimization(input->options.skip_minimization != 0);
     minimizer.setForceOpenMacrocycles(input->options.force_open_macrocycles != 0);
-    /* build_from_fragments is rejected in validateInput() when nonzero: see
-     * the comment there for why there is no faithful call to make here. */
+    /* options.reserved (formerly build_from_fragments) is rejected in
+     * validateInput() when nonzero: see the comment there for why there is
+     * no faithful call to make here. */
     minimizer.initialize(molecule.release());
     if (input->options.constrain_all_atoms != 0) minimizer.constrainAllAtoms();
     OracleCapture capture;
