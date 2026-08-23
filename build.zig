@@ -190,12 +190,14 @@ fn addCorpusRunner(b: *std.Build, options: CorpusRunnerOptions) *std.Build.Step.
         .link_libc = true,
         .link_libcpp = true,
     });
-    if (options.descending_allocator) {
-        module.addCSourceFile(.{
-            .file = b.path("conformance/allocator_order.cpp"),
-            .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
-        });
-    }
+    module.addCMacro(
+        "CGZ_ALLOCATOR_DESCENDING",
+        if (options.descending_allocator) "1" else "0",
+    );
+    module.addCSourceFile(.{
+        .file = b.path("conformance/allocator_order.cpp"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
     module.linkLibrary(options.oracle_abi);
     return b.addExecutable(.{ .name = options.name, .root_module = module });
 }
@@ -986,8 +988,10 @@ pub fn build(b: *std.Build) !void {
 
         // Corpus stability classification. The same corpus runs through
         // oracle builds that differ in exactly one variable at a time:
-        // architecture, or heap address order. Comparing the three dumps is
-        // what assigns each input and observable its comparison tier.
+        // architecture, or heap address order. The baseline and architecture
+        // builds use the same ascending allocator; the order perturbation uses
+        // its descending mode. Comparing the three dumps is what assigns each
+        // input and observable its comparison tier.
         // The classification is a per-(architecture, toolchain,
         // optimize-mode) artifact, so the corpus oracles are pinned to one
         // optimize mode instead of following -Doptimize. That keeps a
