@@ -79,16 +79,6 @@ REFERENCE_ROOTS = (
 # printed when --list-exemptions is passed so the table cannot rot silently
 # into a list of bare paths.
 UNREACHABLE_EXEMPT = {
-    "src/optimize/discrete.zig::avoidInternalClashes": (
-        "cgz-7v2.24, blocked on cgz-7v2.28. Upstream calls it per fragment from "
-        "buildFragment (CoordgenFragmentBuilder.cpp:857), and it is gated on "
-        "getDofsOfAtom(a).empty(). Measured: on drug_like it would fire for "
-        "member 1 alone, where two pairs of atoms sit at distance 0.000 - but "
-        "both pairs carry scale_atoms DOFs, so upstream's own guard skips them "
-        "too. A faithful wiring was written and measured byte-identical, then "
-        "reverted: it needs the DOF collection hoisted (cgz-7v2.28) to avoid "
-        "collecting twice per generation. Inert on this corpus, not in general."
-    ),
     "src/layout/templates.zig::rmsd": (
         "cgz-7v2.27: it is not a dead helper, it is the scoring function of a "
         "stage native does not have. Upstream's sole caller of RMSD is "
