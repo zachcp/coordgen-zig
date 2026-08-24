@@ -19,7 +19,7 @@
 //!
 //! Usage: native-oracle-diff --partition NAME [--count N] --ceiling PATH
 //!        [--tolerance BOND_LENGTHS] [--baseline PATH]
-//!        [--on-mismatch fail|record]
+//!        [--on-mismatch fail|record] [--check-baseline PATH]
 
 const std = @import("std");
 const api = @import("api");
@@ -63,6 +63,11 @@ const Counter = struct {
     ceiling_applied: u32 = 0,
 };
 
+const MemberDeviation = struct {
+    member: []const u8,
+    deviation: f64,
+};
+
 const Totals = struct {
     members: u32 = 0,
     /// Both implementations returned the same non-ok code. Agreement on a
@@ -79,6 +84,11 @@ const Totals = struct {
     /// divergence the public observables already catch (cgz-7v2.4.2.1).
     pre_orientation_compared: u32 = 0,
     pre_orientation_mismatched: u32 = 0,
+    /// Every member's coordinate deviation, in the order the partition
+    /// produced them. The published baseline records these per member so the
+    /// gate can catch one member worsening while another improves, which a
+    /// single molecule-wide maximum hides (cgz-zsm).
+    member_deviations: std.ArrayList(MemberDeviation) = .empty,
 
     fn recordDeviation(self: *Totals, member: []const u8, deviation: f64) void {
         if (deviation <= self.max_deviation_bond_lengths) return;
@@ -102,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
     var requested_count: u32 = 0;
     var ceiling_path: ?[]const u8 = null;
     var baseline_path: ?[]const u8 = null;
+    var check_baseline_path: ?[]const u8 = null;
     var tolerance = default_tolerance_bond_lengths;
     var on_mismatch: OnMismatch = .fail;
 
@@ -120,6 +131,8 @@ pub fn main(init: std.process.Init) !void {
             ceiling_path = value;
         } else if (std.mem.eql(u8, args[index], "--baseline")) {
             baseline_path = value;
+        } else if (std.mem.eql(u8, args[index], "--check-baseline")) {
+            check_baseline_path = value;
         } else if (std.mem.eql(u8, args[index], "--on-mismatch")) {
             on_mismatch = std.meta.stringToEnum(OnMismatch, value) orelse
                 return fatal("--on-mismatch takes 'fail' or 'record', not '{s}'", .{value});
@@ -177,6 +190,12 @@ pub fn main(init: std.process.Init) !void {
         try writeBaseline(&writer.interface, selected, tolerance, &counters, &totals);
         try writer.interface.flush();
     }
+    var baseline_regressed = false;
+    if (check_baseline_path) |path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+        baseline_regressed = try checkBaseline(report, text, &counters, &totals);
+    }
+
     const status_failed = totals.status_mismatches != 0 or totals.native_unsupported != 0;
     var parity_failed = false;
     for (counters) |counter| {
@@ -194,6 +213,7 @@ pub fn main(init: std.process.Init) !void {
     }
     try report.flush();
 
+    if (baseline_regressed) return error.NativeBaselineRegressed;
     if (on_mismatch == .record) return;
     if (status_failed) return error.NativeOracleStatusMismatch;
     if (parity_failed) return error.NativeOracleParityMismatch;
@@ -507,6 +527,10 @@ fn compareCoordinateObservable(
         .{},
     );
     totals.recordDeviation(member, result.max_deviation_bond_lengths);
+    try totals.member_deviations.append(gpa, .{
+        .member = member,
+        .deviation = result.max_deviation_bond_lengths,
+    });
     if (!result.matches) {
         try report.print(
             "{s}/coordinates: {d:.4} bond lengths exceeds {d:.4}\n",
@@ -605,6 +629,14 @@ fn writeBaseline(
         totals.pre_orientation_compared,
         totals.pre_orientation_mismatched,
     });
+    // Per-member coordinate deviations, which are what `--check-baseline`
+    // compares. A single molecule-wide maximum hides one member worsening
+    // while another improves, and that is exactly the shape of change the
+    // layout work produces (cgz-zsm).
+    try writer.print("member\tcoordinate_deviation_bond_lengths\n", .{});
+    for (totals.member_deviations.items) |entry| {
+        try writer.print("{s}\t{d:.6}\n", .{ entry.member, entry.deviation });
+    }
     try writer.print("observable\tcompared\tmismatched\tceiling_applied\n", .{});
     for (public_observables, counters) |observable, counter| {
         try writer.print("{t}\t{d}\t{d}\t{d}\n", .{
@@ -620,3 +652,123 @@ fn fatal(comptime format: []const u8, arguments: anytype) error{NativeOracleDiff
     std.log.err(format, arguments);
     return error.NativeOracleDiffFailed;
 }
+
+/// Compare this run against the published baseline and report anything that
+/// got worse (cgz-zsm).
+///
+/// The baseline is a record, and until this existed nothing read it back: a
+/// member could regress from 3.6262 to 4.5825 bond lengths with every gate
+/// still green, because both numbers are merely "over tolerance". That is how
+/// cgz-9ks landed unnoticed.
+///
+/// Improvement is deliberately free. A member that gets better passes, and the
+/// file is not rewritten here - republishing is `native-baseline`'s job, so
+/// that accepting a worse number is an edit a reviewer can see in the diff,
+/// exactly as the parity ceiling requires for order-instability.
+///
+/// Returns true when something regressed.
+fn checkBaseline(
+    report: *std.Io.Writer,
+    text: []const u8,
+    counters: *const [public_observables.len]Counter,
+    totals: *const Totals,
+) !bool {
+    var regressed = false;
+    var improved: usize = 0;
+    var matched_members: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const first = fields.next() orelse continue;
+        const second = fields.next() orelse continue;
+        if (std.mem.eql(u8, first, "member") or std.mem.eql(u8, first, "observable")) continue;
+
+        // A member row: one coordinate deviation.
+        if (std.mem.indexOfScalar(u8, first, '/') != null) {
+            const recorded = std.fmt.parseFloat(f64, second) catch continue;
+            const current = for (totals.member_deviations.items) |entry| {
+                if (std.mem.eql(u8, entry.member, first)) break entry.deviation;
+            } else {
+                try report.print(
+                    "baseline: {s} is recorded but this run did not measure it\n",
+                    .{first},
+                );
+                regressed = true;
+                continue;
+            };
+            matched_members += 1;
+            const allowance = baselineAllowance(recorded);
+            if (current > recorded + allowance) {
+                try report.print(
+                    "baseline REGRESSION: {s} coordinates {d:.6} exceeds the recorded {d:.6}\n",
+                    .{ first, current, recorded },
+                );
+                regressed = true;
+            } else if (current + allowance < recorded) {
+                improved += 1;
+                try report.print(
+                    "baseline improvement: {s} coordinates {d:.6} beats the recorded {d:.6}\n",
+                    .{ first, current, recorded },
+                );
+            }
+            continue;
+        }
+
+        // An observable row: compared, mismatched, ceiling_applied.
+        const recorded_mismatched = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        for (public_observables, counters) |observable, counter| {
+            if (!std.mem.eql(u8, @tagName(observable), first)) continue;
+            if (counter.mismatched > recorded_mismatched) {
+                try report.print(
+                    "baseline REGRESSION: {t} mismatched {d} exceeds the recorded {d}\n",
+                    .{ observable, counter.mismatched, recorded_mismatched },
+                );
+                regressed = true;
+            } else if (counter.mismatched < recorded_mismatched) {
+                improved += 1;
+                try report.print(
+                    "baseline improvement: {t} mismatched {d} beats the recorded {d}\n",
+                    .{ observable, counter.mismatched, recorded_mismatched },
+                );
+            }
+        }
+    }
+
+    // A baseline that records no members at all would pass everything without
+    // comparing anything, which is the false green this gate exists to prevent.
+    if (matched_members == 0) {
+        try report.print(
+            "baseline: no member rows were compared; the file records none, so this gate asserted nothing\n",
+            .{},
+        );
+        regressed = true;
+    }
+    if (!regressed) {
+        try report.print(
+            "baseline: {d} members checked, nothing worse than recorded, {d} improvement(s)\n",
+            .{ matched_members, improved },
+        );
+    }
+    return regressed;
+}
+
+/// How much worse a member may read before it counts as a regression.
+///
+/// A flat epsilon does not work across the whole range: the members that match
+/// sit near 0.0002 bond lengths, where an absolute floor has to absorb
+/// cross-host last-place noise, while drug_like/4 sits at 4.58, where a floor
+/// that small is needlessly tight. So it is the larger of a thousandth of a
+/// bond length and one percent of the recorded value.
+///
+/// Both bounds stay far below anything worth calling a regression: one percent
+/// of 3.63 is 0.036, and the regression this gate was built to catch (cgz-9ks)
+/// is 0.96.
+fn baselineAllowance(recorded: f64) f64 {
+    return @max(baseline_absolute_floor, recorded * baseline_relative_fraction);
+}
+
+const baseline_absolute_floor: f64 = 1e-3;
+const baseline_relative_fraction: f64 = 0.01;

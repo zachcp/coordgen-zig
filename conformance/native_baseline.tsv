@@ -2,8 +2,16 @@
 # partition	drug_like
 # members	7
 # tolerance_bond_lengths	0.100000
-# max_deviation_bond_lengths	3.626229	drug_like/4
+# max_deviation_bond_lengths	4.582532	drug_like/4
 # pre_orientation_compared	7	3
+member	coordinate_deviation_bond_lengths
+drug_like/0	0.000170
+drug_like/1	0.000343
+drug_like/2	0.000274
+drug_like/3	0.106465
+drug_like/4	4.582532
+drug_like/5	0.017225
+drug_like/6	0.001558
 observable	compared	mismatched	ceiling_applied
 clean_pose	7	0	0
 coordinates	7	2	0
