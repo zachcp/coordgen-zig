@@ -256,6 +256,8 @@ fn considerChains(allocator: std.mem.Allocator, records: []const Fragment, atom_
     defer allocator.free(queue);
     const visited = allocator.alloc(bool, records.len) catch return error.OutOfMemory;
     defer allocator.free(visited);
+    const depth = allocator.alloc(usize, records.len) catch return error.OutOfMemory;
+    defer allocator.free(depth);
     for (mains, 0..) |*main, component_index| {
         if (!main.isValid()) continue;
         var constrained = false;
@@ -271,10 +273,13 @@ fn considerChains(allocator: std.mem.Allocator, records: []const Fragment, atom_
             @memset(visited, false);
             visited[record.id.index()] = true;
             queue[0] = record.id;
+            depth[record.id.index()] = 1;
             var head: usize = 0;
             var tail: usize = 1;
+            var last_depth: usize = 1;
             while (head < tail) : (head += 1) {
                 const current = queue[head];
+                last_depth = depth[current.index()];
                 for (graph.structuralBonds()) |bond_id| {
                     const bond = bonds[bond_id.index()];
                     const start = atom_fragment[bond.start.index()];
@@ -282,12 +287,26 @@ fn considerChains(allocator: std.mem.Allocator, records: []const Fragment, atom_
                     const next = if (start == current) end else if (end == current) start else continue;
                     if (next == current or visited[next.index()] or !records[next.index()].flags.chain) continue;
                     visited[next.index()] = true;
+                    depth[next.index()] = depth[current.index()] + 1;
                     queue[tail] = next;
                     tail += 1;
                 }
             }
-            if (tail > longest) {
-                longest = tail;
+            // Upstream measures the PATH from this start to the last fragment
+            // the traversal dequeued, walking `parentMap` back and counting
+            // (`findLongestChain`, CoordgenFragmenter.cpp). It does not measure
+            // how many chain fragments the traversal reached.
+            //
+            // The distinction is invisible on a straight chain and decisive on
+            // a branched one, where every start reaches the same set. Counting
+            // reached fragments therefore scored every candidate identically,
+            // and first-wins picked whichever came first by fragment id rather
+            // than an end of the longest path. On drug_like/4 that put the root
+            // at atoms {9,10} where upstream puts it at {0,1}, which reparents
+            // the whole tree and makes every side choice a different question
+            // (cgz-7v2.27).
+            if (last_depth > longest) {
+                longest = last_depth;
                 longest_start = record.id;
             }
         }
