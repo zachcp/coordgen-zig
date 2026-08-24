@@ -1,0 +1,73 @@
+#!/bin/sh
+# cgz-jg4: refuse source that reads a bond's endpoints after looking the bond
+# up through a fragment's `bond_to_parent`.
+#
+# Upstream can read `_bondToParent->startAtom` directly because
+# CoordgenFragmenter mutates the molecule so that end is always the parent's
+# (CoordgenFragmenter.cpp:406-422, with an assert). Native keeps bonds in
+# canonical input order, which on the drug_like corpus is child-first, so the
+# same read silently selects the wrong atom. It cost a real defect once:
+# `scoreDirections` skipped every child bond and single-atom fragments could
+# not choose a side at all.
+#
+# `Fragment.attachment_atom` and `Fragment.parent_atom` are resolved once by
+# membership in `assignParents`. This check exists so the next transcription
+# reaches for them instead of rediscovering the hazard.
+#
+# --self-test plants the violation and requires it to be caught.
+set -eu
+
+scan_dir=${1:-src}
+
+scan() {
+    # A `bond_to_parent` lookup binding a bond, then an endpoint read off that
+    # binding within the same declaration.
+    grep -rnE 'bonds\[[^]]*bond_to_parent[^]]*\]' "$1" --include='*.zig' 2>/dev/null |
+        while IFS= read -r hit; do
+            file=${hit%%:*}
+            rest=${hit#*:}
+            line=${rest%%:*}
+            # The binding name, if the hit is `const NAME = bonds[...]`.
+            name=$(printf '%s' "$hit" | sed -nE 's/.*const ([a-z_][a-zA-Z0-9_]*) = bonds\[.*/\1/p')
+            [ -n "$name" ] || continue
+            if sed -n "${line},$((line + 12))p" "$file" |
+                grep -qE "\\b${name}\\.(start|end)\\b"; then
+                printf '%s:%s: reads .start/.end from a bond_to_parent lookup; use Fragment.attachment_atom / Fragment.parent_atom instead (cgz-jg4)\n' "$file" "$line"
+            fi
+        done
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    mkdir -p "$tmp/planted"
+    cat > "$tmp/planted/violation.zig" <<'PLANT'
+fn wrong(bonds: []const model.Bond, fragment: fragments.Fragment) core.ids.AtomId {
+    const bond = bonds[fragment.bond_to_parent.index()];
+    return bond.start;
+}
+PLANT
+    if [ -z "$(scan "$tmp/planted")" ]; then
+        echo "check-bond-orientation: SELF-TEST FAILED - the planted violation was not caught" >&2
+        exit 1
+    fi
+    cat > "$tmp/planted/violation.zig" <<'CLEAN'
+fn right(fragment: fragments.Fragment) core.ids.AtomId {
+    return fragment.attachment_atom;
+}
+CLEAN
+    if [ -n "$(scan "$tmp/planted")" ]; then
+        echo "check-bond-orientation: SELF-TEST FAILED - the corrected form was reported" >&2
+        exit 1
+    fi
+    echo "check-bond-orientation: self-test verified that a bond_to_parent endpoint read is caught and the corrected form is not"
+    exit 0
+fi
+
+found=$(scan "$scan_dir")
+if [ -n "$found" ]; then
+    printf '%s\n' "$found" >&2
+    echo "check-bond-orientation: endpoints of a fragment's bond to its parent must come from Fragment.attachment_atom / Fragment.parent_atom, which assignParents resolves by membership (cgz-jg4)" >&2
+    exit 1
+fi
+echo "check-bond-orientation: no source derives a parent-bond endpoint from the bond's stored direction"

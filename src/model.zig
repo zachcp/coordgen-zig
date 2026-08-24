@@ -291,7 +291,7 @@ test "input-order maps report and clean up every allocation failure" {
     try constructAndDiscardOrder(map_counter.allocator(), &source);
     // The retained permutation and its inverse are separate allocation sites.
     try std.testing.expectEqual(@as(usize, 2), map_counter.alloc_index);
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         constructAndDiscardOrder,
         .{&source},
@@ -301,7 +301,7 @@ test "input-order maps report and clean up every allocation failure" {
     try constructAndDiscardIdentity(identity_counter.allocator(), source.len);
     // Identity construction also allocates its temporary source permutation.
     try std.testing.expectEqual(@as(usize, 3), identity_counter.alloc_index);
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         constructAndDiscardIdentity,
         .{source.len},

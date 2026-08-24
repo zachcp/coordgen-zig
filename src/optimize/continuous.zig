@@ -181,9 +181,17 @@ pub fn buildBendInteractions(
         var ring_total: f32 = 0;
 
         for (group.candidates) |candidate| {
+            // `atom_a == atom_b` is deliberately NOT rejected. A duplicated
+            // bond between the same pair - which upstream's own
+            // test/macrocycle.mae contains, as `0-1` and `1-0` - puts that
+            // neighbour in the incidence list twice, and the clockwise pairing
+            // then hands the same atom to both ends of one bend.
+            // `CoordgenMinimizer::addBendInteractionsOfMolecule` builds that
+            // interaction without checking, so rejecting it here was stricter
+            // than upstream and failed a fixture upstream lays out (cgz-hez).
             if (!candidate.atom_a.isValid() or candidate.atom_a.index() >= atoms.len or
                 !candidate.atom_b.isValid() or candidate.atom_b.index() >= atoms.len or
-                candidate.atom_a == group.center or candidate.atom_b == group.center or candidate.atom_a == candidate.atom_b)
+                candidate.atom_a == group.center or candidate.atom_b == group.center)
             {
                 return error.InvalidAtomIndex;
             }
@@ -440,41 +448,6 @@ pub fn minimizeMolecule(
     return result;
 }
 
-pub fn hasNaNCoordinates(coordinates: []const core.math.Vec2) bool {
-    for (coordinates) |position| {
-        if (std.math.isNan(position.x) or std.math.isNan(position.y)) return true;
-    }
-    return false;
-}
-
-pub fn hasValid3DCoordinates(coordinates: []const ?core.math.Vec3) bool {
-    const invalid_coordinates: f32 = 10_000_001;
-    for (coordinates) |optional| {
-        const position = optional orelse return false;
-        if (!(position.x < invalid_coordinates and position.y < invalid_coordinates and position.z < invalid_coordinates)) return false;
-    }
-    return true;
-}
-
-/// Apply the upstream emergency x/-y projection and two-decimal rounding.
-pub fn fallbackOn3DCoordinates(
-    coordinates: []core.math.Vec2,
-    coordinates_3d: []const ?core.math.Vec3,
-) core.errors.Error!void {
-    if (coordinates.len != coordinates_3d.len or !hasValid3DCoordinates(coordinates_3d)) return error.InvalidCoordinate;
-    for (coordinates, coordinates_3d) |*position, optional| {
-        const source = optional.?;
-        position.* = .{
-            .x = roundToTwoDecimalDigits(source.x * 35),
-            .y = roundToTwoDecimalDigits(-source.y * 35),
-        };
-    }
-}
-
-fn roundToTwoDecimalDigits(value: f32) f32 {
-    return @floor(value * 100 + 0.5) * 0.01;
-}
-
 fn coordinate(state: State, atom: core.ids.AtomId) core.errors.Error!core.math.Vec2 {
     if (!atom.isValid() or atom.index() >= state.coordinates.len) return error.InvalidAtomIndex;
     return state.coordinates[atom.index()];
@@ -696,7 +669,7 @@ fn baseInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "base interaction construction preserves clash-stretch order and cleans allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
 }
 
 fn bendInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
@@ -724,7 +697,7 @@ fn bendInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "bend construction redistributes ring angles and cleans allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, bendInteractionsAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, bendInteractionsAndDiscard, .{});
 }
 
 fn remainingInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
@@ -752,7 +725,7 @@ fn remainingInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "constraint and E/Z construction combine with complete allocation cleanup" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, remainingInteractionsAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, remainingInteractionsAndDiscard, .{});
 }
 
 test "force application caps movement, clears movable force, and retains fixed force" {
@@ -815,18 +788,6 @@ test "fixed-center bend minimization agrees with pinned oracle fixture" {
     }
 }
 
-test "nonfinite detection and 3D fallback preserve pinned asymmetries" {
-    try std.testing.expect(hasNaNCoordinates(&.{.{ .x = std.math.nan(f32) }}));
-    try std.testing.expect(!hasNaNCoordinates(&.{.{ .x = std.math.inf(f32) }}));
-    const source = [_]?core.math.Vec3{.{ .x = 1.234, .y = -2.345, .z = 7 }};
-    try std.testing.expect(hasValid3DCoordinates(&source));
-    var coordinates = [_]core.math.Vec2{.{}};
-    try fallbackOn3DCoordinates(&coordinates, &source);
-    try std.testing.expectEqual(core.math.Vec2{ .x = 43.19, .y = 82.08 }, coordinates[0]);
-    try std.testing.expect(hasValid3DCoordinates(&.{.{ .x = -std.math.inf(f32) }}));
-    try std.testing.expect(!hasValid3DCoordinates(&.{null}));
-}
-
 fn rejectStereo(_: []const model.Atom) bool {
     return false;
 }
@@ -846,7 +807,7 @@ fn minimizeMoleculeAndDiscard(allocator: std.mem.Allocator) !void {
 }
 
 test "molecule minimization rolls back invalid stereo and cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, minimizeMoleculeAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, minimizeMoleculeAndDiscard, .{});
 }
 
 test {

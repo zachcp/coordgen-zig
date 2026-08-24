@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Reject a public entry point that nothing outside its own tests can reach.
+
+Five modules in this port were implemented, unit-tested, and never called from
+the pipeline: the template layer (cgz-r35), continuous minimization
+(cgz-7v2.18), bend interactions (cgz-r33), the inversion constraints
+(cgz-r34), and avoidTerminalClashes (cgz-r36). Each passed its own bead's
+evidence requirements in isolation. Each had tests. None had a caller.
+
+No existing gate can see that. coverage-check maps requirements to assertion
+sites, so a well-tested orphan scores as covered. module-graph-check validates
+which layers *may* import which, not which imports exist. This is the missing
+one, and it is the source-scanning half of cgz-7v2.22.
+
+One failing class:
+
+  UNREACHABLE  a top-level `pub fn` in a scanned layer with no reference
+               outside its declaring file, or whose only outside references
+               are inside test blocks. This is the cgz-r35 family.
+
+A second condition is counted and reported but does not fail: an entry point
+referenced outside test blocks, yet only from its own file. Measured at 29 of
+71 on first run, which is a deliberate convention here - helpers made `pub` so
+a unit test can reach them - not the defect this gate is for. Failing on it
+would demand 29 exemptions or 29 refactors, and a 29-entry table of bare paths
+is the rot this check is supposed to prevent. It is reported with an owning
+bead so the census is tracked rather than swallowed.
+
+Following check-gate-strength, the exemption table is a closed set: an entry is
+a reviewed decision carrying a reason, never a way to reach green. Under
+cgz-r21 a gate is never weakened to pass, so removing a caller means removing
+the function or recording why it stays.
+
+## What this check cannot see
+
+It catches native code nothing calls. It is blind to the inverse defect, and
+cgz-r31 found one: `maybeMinimizeRings` is dead code in pinned upstream - its
+single call site receives a ring vector the loop above has just drained - and
+native transcribed it faithfully and then called it for real. That function
+has a caller, which is precisely the problem, so no reachability scan will
+ever flag it. Catching that means reading the upstream *call site* and not
+only the upstream function. It is a review discipline, not a gate, and this
+check does not cover it.
+
+Run with no arguments to scan this repository. Run with --self-test to prove
+the checker catches a planted orphan and does not flag a compliant function.
+"""
+
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+# Where entry points are declared. These are the three layers whose public
+# surface the pipeline is supposed to consume; api and c_abi are excluded
+# because their whole purpose is to be called from outside this tree, and
+# core/model/geometry/topology are leaf utilities with many legitimate
+# single-consumer helpers.
+DECLARING_ROOTS = (
+    "src/layout.zig",
+    "src/layout",
+    "src/optimize",
+    "src/generator",
+)
+
+# Where a reference may come from. Deliberately wider than the declaring set:
+# a conformance probe, a test binary, an example or build.zig all count as
+# real consumers.
+REFERENCE_ROOTS = (
+    "src",
+    "tests",
+    "examples",
+    "build.zig",
+    "build_support",
+)
+
+# Reviewed exemptions. Key is "path::name"; value is the reason, which is
+# printed when --list-exemptions is passed so the table cannot rot silently
+# into a list of bare paths.
+UNREACHABLE_EXEMPT = {
+    "src/optimize/discrete.zig::avoidInternalClashes": (
+        "cgz-7v2.24, blocked on cgz-7v2.28. Upstream calls it per fragment from "
+        "buildFragment (CoordgenFragmentBuilder.cpp:857), and it is gated on "
+        "getDofsOfAtom(a).empty(). Measured: on drug_like it would fire for "
+        "member 1 alone, where two pairs of atoms sit at distance 0.000 - but "
+        "both pairs carry scale_atoms DOFs, so upstream's own guard skips them "
+        "too. A faithful wiring was written and measured byte-identical, then "
+        "reverted: it needs the DOF collection hoisted (cgz-7v2.28) to avoid "
+        "collecting twice per generation. Inert on this corpus, not in general."
+    ),
+    "src/layout/templates.zig::rmsd": (
+        "cgz-7v2.27: it is not a dead helper, it is the scoring function of a "
+        "stage native does not have. Upstream's sole caller of RMSD is "
+        "alignWithParentDirectionConstrained, the constrained half of the "
+        "child-fragment side choice, and that whole stage is missing - so this "
+        "becomes reachable when cgz-7v2.27 lands, and deleting it now would "
+        "mean writing it again. Exempt until then, not indefinitely."
+    ),
+    "src/optimize/discrete.zig::avoidTerminalClashes": (
+        "cgz-r36, closed: upstream calls it on the !cleanPose path before "
+        "minimizing, and wiring it into native's equivalent changed the "
+        "differential not at all - byte-identical on the drug_like partition. "
+        "It waits for a member whose measurement justifies it rather than "
+        "being wired on faith. The unreachability is recorded, not accidental."
+    ),
+}
+
+_DECL_RE = re.compile(r"^pub fn (\w+)\(", re.MULTILINE)
+# `pub const foo = bar.foo;` forwards a name without consuming it. Counting a
+# re-export as a caller is how an orphan hides behind its own layer root.
+_REEXPORT_RE = re.compile(r"^\s*pub const \w+\s*=\s*[\w.]+\s*;", re.MULTILINE)
+_TEST_RE = re.compile(r'^test\b[^{]*\{', re.MULTILINE)
+
+
+def _blank_comments_and_strings(text):
+    """Replace comment and string-literal bodies with spaces, preserving every
+    byte offset so ranges computed here stay valid against the original."""
+    out = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif ch == '"':
+            out[i] = " "
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\" and i + 1 < n:
+                    out[i] = " "
+                    i += 1
+                if i < n:
+                    out[i] = " " if text[i] != "\n" else "\n"
+                    i += 1
+            if i < n:
+                out[i] = " "
+                i += 1
+        elif ch == "'":
+            # Character literal, or a label/quoted identifier. Blanking a short
+            # run is safe either way; identifiers never contain a quote.
+            j = i + 1
+            while j < n and text[j] != "'" and text[j] != "\n" and j - i < 6:
+                j += 1
+            if j < n and text[j] == "'":
+                for k in range(i, j + 1):
+                    out[k] = " "
+                i = j + 1
+            else:
+                i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def _test_ranges(text):
+    """Byte ranges of every top-level `test` block, by brace matching."""
+    ranges = []
+    for match in _TEST_RE.finditer(text):
+        depth = 0
+        i = match.end() - 1
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    ranges.append((match.start(), i + 1))
+                    break
+            i += 1
+        else:
+            ranges.append((match.start(), len(text)))
+    return ranges
+
+
+def _reexport_ranges(text):
+    return [(m.start(), m.end()) for m in _REEXPORT_RE.finditer(text)]
+
+
+def _in_any(position, ranges):
+    return any(start <= position < end for start, end in ranges)
+
+
+def _walk(root, targets):
+    for target in targets:
+        path = os.path.join(root, target)
+        if os.path.isfile(path) and path.endswith(".zig"):
+            yield os.path.relpath(path, root).replace(os.sep, "/")
+            continue
+        if not os.path.isdir(path):
+            continue
+        for dirpath, dirnames, filenames in os.walk(path):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                if not name.endswith(".zig"):
+                    continue
+                full = os.path.join(dirpath, name)
+                yield os.path.relpath(full, root).replace(os.sep, "/")
+
+
+def scan(root):
+    """Return (violations, checked_count). Empty violations means clean."""
+    declarations = {}
+    for relpath in sorted(set(_walk(root, DECLARING_ROOTS))):
+        with open(os.path.join(root, relpath), "r", encoding="utf-8") as fh:
+            text = _blank_comments_and_strings(fh.read())
+        tests = _test_ranges(text)
+        for match in _DECL_RE.finditer(text):
+            if _in_any(match.start(), tests):
+                continue
+            declarations.setdefault(match.group(1), []).append(relpath)
+
+    # name -> set of files referencing it outside tests and outside re-exports
+    references = {name: set() for name in declarations}
+    pattern = re.compile(r"\b(" + "|".join(sorted(map(re.escape, declarations))) + r")\b")
+    for relpath in sorted(set(_walk(root, REFERENCE_ROOTS))):
+        with open(os.path.join(root, relpath), "r", encoding="utf-8") as fh:
+            text = _blank_comments_and_strings(fh.read())
+        skip = _test_ranges(text) + _reexport_ranges(text)
+        declared_here = {
+            m.group(1): m.start(1) for m in _DECL_RE.finditer(text)
+        }
+        for match in pattern.finditer(text):
+            if _in_any(match.start(), skip):
+                continue
+            if declared_here.get(match.group(1)) == match.start():
+                continue
+            references[match.group(1)].add(relpath)
+
+    violations = []
+    own_file_only = []
+    for name in sorted(declarations):
+        owners = declarations[name]
+        if len(owners) > 1:
+            # Same public name at file scope in two places makes every
+            # reference ambiguous, so the check cannot speak about either.
+            violations.append(
+                f"AMBIGUOUS {name}: declared at file scope in {', '.join(owners)}; "
+                f"reachability cannot be decided by name - rename one"
+            )
+            continue
+        owner = owners[0]
+        key = f"{owner}::{name}"
+        outside = references[name] - {owner}
+        if outside:
+            continue
+        if references[name]:
+            own_file_only.append(key)
+            continue
+        if key in UNREACHABLE_EXEMPT:
+            continue
+        violations.append(
+            f"UNREACHABLE {key}: no reference outside its own file except in "
+            f"test blocks; wire it up, delete it, or record an exemption with "
+            f"a reason"
+        )
+    return violations, len(declarations), own_file_only
+
+
+_COMPLIANT = """const helper = @import("helper.zig");
+
+pub fn reachedFromElsewhere() u32 {
+    return helper.contribute();
+}
+
+test "local coverage" {
+    _ = reachedFromElsewhere();
+}
+"""
+
+_ORPHAN = """pub fn neverCalledOutsideTests() u32 {
+    return 7;
+}
+
+test "thorough coverage of an orphan" {
+    _ = neverCalledOutsideTests();
+}
+"""
+
+_HELPER = """pub fn contribute() u32 {
+    return 1;
+}
+"""
+
+_CONSUMER = """const layout = @import("layout");
+
+pub fn drive() u32 {
+    return layout.reachedFromElsewhere();
+}
+"""
+
+
+def _write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+def run_self_test():
+    """Plant one orphan and one compliant function in a throwaway tree and
+    prove the check separates them. Without this the check could report a
+    clean tree because it found nothing to look at - the cgz-r28 shape."""
+    tmp = tempfile.mkdtemp(prefix="cgz-reachability-")
+    try:
+        _write(os.path.join(tmp, "src/layout.zig"), _COMPLIANT)
+        _write(os.path.join(tmp, "src/layout/helper.zig"), _HELPER)
+        _write(os.path.join(tmp, "src/optimize/orphan.zig"), _ORPHAN)
+        _write(os.path.join(tmp, "src/generator/minimal.zig"), _CONSUMER)
+
+        violations, checked, _ = scan(tmp)
+        if checked == 0:
+            print(
+                "check-reachability: self-test scanned no declarations at all",
+                file=sys.stderr,
+            )
+            return False
+        orphans = [v for v in violations if "neverCalledOutsideTests" in v]
+        if not orphans:
+            print(
+                "check-reachability: self-test FAILED to catch a planted orphan",
+                file=sys.stderr,
+            )
+            return False
+        if not orphans[0].startswith("UNREACHABLE"):
+            print(
+                f"check-reachability: planted orphan misclassified: {orphans[0]}",
+                file=sys.stderr,
+            )
+            return False
+        wrong = [v for v in violations if "reachedFromElsewhere" in v]
+        if wrong:
+            print(
+                f"check-reachability: self-test flagged a compliant function: {wrong[0]}",
+                file=sys.stderr,
+            )
+            return False
+        # And the re-export blindness the real tree depends on: a name whose
+        # only outside mention is `pub const x = y.x;` must still be an orphan.
+        _write(
+            os.path.join(tmp, "src/layout.zig"),
+            _COMPLIANT + "\npub const neverCalledOutsideTests = orphan.neverCalledOutsideTests;\n",
+        )
+        violations, _, _ = scan(tmp)
+        if not any("neverCalledOutsideTests" in v for v in violations):
+            print(
+                "check-reachability: self-test let a re-export count as a caller",
+                file=sys.stderr,
+            )
+            return False
+        print(
+            "check-reachability: self-test verified a planted orphan, a "
+            "compliant function, and a re-export that must not count",
+        )
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def main(argv):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if argv[1:2] == ["--self-test"]:
+        return 0 if run_self_test() else 1
+    if argv[1:2] == ["--list-exemptions"]:
+        for key, reason in sorted(UNREACHABLE_EXEMPT.items()):
+            print(f"UNREACHABLE {key}: {reason}")
+        return 0
+
+    violations, checked, own_file_only = scan(root)
+    census = (
+        f"check-reachability: {len(own_file_only)} of {checked} entry points are "
+        f"referenced only within their own file (counted, not gated; cgz-7v2.24)"
+    )
+    if violations:
+        for violation in violations:
+            print(f"check-reachability: {violation}", file=sys.stderr)
+        print(census, file=sys.stderr)
+        print(
+            f"check-reachability: {len(violations)} unreachable entry point(s) "
+            f"across {checked} checked",
+            file=sys.stderr,
+        )
+        return 1
+    print(census)
+    print(
+        f"check-reachability: verified {checked} public entry points are "
+        f"reachable outside their own tests"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

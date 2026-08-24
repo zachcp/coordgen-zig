@@ -1,0 +1,774 @@
+//! The native-vs-oracle differential runner (cgz-7v2.4.2).
+//!
+//! Both implementations run over the same corpus member in one process,
+//! build, and target, which is what `COMPARISON_SEMANTICS.md` requires and
+//! what makes the architecture axis unobservable here (cgz-r13, cgz-r30).
+//!
+//! Native is reached through the Zig `api` module, never through the C ABI
+//! exports. This binary links the *oracle's* definition of
+//! `coordgen_generate`; linking the native library's definition as well is
+//! the duplicate-symbol failure cgz-r28 records. The public C entry point has
+//! its own end-to-end coverage in `tests/abi_layout.c`.
+//!
+//! The gate is the eight public observables. Alongside them the runner reports
+//! one probe seam, the pose each side holds immediately before global
+//! orientation, which localises a coordinate divergence to the layout stages or
+//! to orientation (cgz-7v2.4.2.1). The remaining seams (Morgan ranks, rings,
+//! fragments, DOFs, template mappings, components) are named in the parity
+//! manifest and still need native probe records.
+//!
+//! Usage: native-oracle-diff --partition NAME [--count N] --ceiling PATH
+//!        [--tolerance BOND_LENGTHS] [--baseline PATH]
+//!        [--on-mismatch fail|record] [--check-baseline PATH]
+
+const std = @import("std");
+const api = @import("api");
+const conformance = @import("conformance");
+const c_abi = @import("c_abi");
+const core = @import("core");
+
+const corpus = conformance.corpus;
+const comparison = conformance.comparison;
+
+extern fn coordgen_generate(input: *const c_abi.Input, result: *c_abi.Result) u32;
+extern fn coordgen_result_free(result: *c_abi.Result) void;
+/// The oracle's conformance-only surface, linked from the same library. Only
+/// its component transforms are read here: they carry the oracle's own
+/// pre-orientation pose, recoverable by inverting them (cgz-7v2.4.2.1).
+extern fn coordgen_probe_generate(
+    input: *const c_abi.Input,
+    result: *conformance.probe_types.ProbeResult,
+) u32;
+extern fn coordgen_probe_result_free(result: *conformance.probe_types.ProbeResult) void;
+
+/// The published prior from SUCCESS_CRITERIA.md. It bounds the *oracle's* own
+/// float sensitivity, not the port's, and recalibrating it against the first
+/// baseline this runner produces is part of cgz-7v2.4.2.
+const default_tolerance_bond_lengths: f64 = 0.1;
+
+const public_observables = [_]comparison.Observable{
+    .clean_pose,
+    .coordinates,
+    .input_to_internal,
+    .internal_to_input,
+    .effective_bond_orders,
+    .bond_displays,
+    .atom_stereo,
+};
+
+const Counter = struct {
+    compared: u32 = 0,
+    mismatched: u32 = 0,
+    /// Pairs the enumeration excused from exact comparison (cgz-r26).
+    ceiling_applied: u32 = 0,
+};
+
+const MemberDeviation = struct {
+    member: []const u8,
+    deviation: f64,
+};
+
+const Totals = struct {
+    members: u32 = 0,
+    /// Both implementations returned the same non-ok code. Agreement on a
+    /// rejection is agreement, and it is reported rather than hidden.
+    agreed_rejections: u32 = 0,
+    /// Native declined a domain the oracle produced coordinates for. Never a
+    /// silent skip: it is a coverage gap and it fails the run.
+    native_unsupported: u32 = 0,
+    status_mismatches: u32 = 0,
+    max_deviation_bond_lengths: f64 = 0,
+    max_deviation_member: [64]u8 = @splat(0),
+    max_deviation_member_len: usize = 0,
+    /// The pre-orientation stage is reported, not gated: it localises a
+    /// divergence the public observables already catch (cgz-7v2.4.2.1).
+    pre_orientation_compared: u32 = 0,
+    pre_orientation_mismatched: u32 = 0,
+    /// Every member's coordinate deviation, in the order the partition
+    /// produced them. The published baseline records these per member so the
+    /// gate can catch one member worsening while another improves, which a
+    /// single molecule-wide maximum hides (cgz-zsm).
+    member_deviations: std.ArrayList(MemberDeviation) = .empty,
+
+    fn recordDeviation(self: *Totals, member: []const u8, deviation: f64) void {
+        if (deviation <= self.max_deviation_bond_lengths) return;
+        self.max_deviation_bond_lengths = deviation;
+        const len = @min(member.len, self.max_deviation_member.len);
+        @memcpy(self.max_deviation_member[0..len], member[0..len]);
+        self.max_deviation_member_len = len;
+    }
+
+    fn worstMember(self: *const Totals) []const u8 {
+        return self.max_deviation_member[0..self.max_deviation_member_len];
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const gpa = init.gpa;
+    const io = init.io;
+
+    var partition: ?corpus.Partition = null;
+    var requested_count: u32 = 0;
+    var ceiling_path: ?[]const u8 = null;
+    var baseline_path: ?[]const u8 = null;
+    var check_baseline_path: ?[]const u8 = null;
+    var tolerance = default_tolerance_bond_lengths;
+    var on_mismatch: OnMismatch = .fail;
+
+    const args = try init.minimal.args.toSlice(arena);
+    var index: usize = 1;
+    while (index < args.len) : (index += 2) {
+        if (index + 1 >= args.len) return fatal("option '{s}' needs a value", .{args[index]});
+        const value = args[index + 1];
+        if (std.mem.eql(u8, args[index], "--partition")) {
+            partition = std.meta.stringToEnum(corpus.Partition, value) orelse
+                return fatal("unknown partition '{s}'", .{value});
+        } else if (std.mem.eql(u8, args[index], "--count")) {
+            requested_count = std.fmt.parseInt(u32, value, 10) catch
+                return fatal("--count '{s}' is not a number", .{value});
+        } else if (std.mem.eql(u8, args[index], "--ceiling")) {
+            ceiling_path = value;
+        } else if (std.mem.eql(u8, args[index], "--baseline")) {
+            baseline_path = value;
+        } else if (std.mem.eql(u8, args[index], "--check-baseline")) {
+            check_baseline_path = value;
+        } else if (std.mem.eql(u8, args[index], "--on-mismatch")) {
+            on_mismatch = std.meta.stringToEnum(OnMismatch, value) orelse
+                return fatal("--on-mismatch takes 'fail' or 'record', not '{s}'", .{value});
+        } else if (std.mem.eql(u8, args[index], "--tolerance")) {
+            tolerance = std.fmt.parseFloat(f64, value) catch
+                return fatal("--tolerance '{s}' is not a number", .{value});
+        } else {
+            return fatal("unknown option '{s}'", .{args[index]});
+        }
+    }
+
+    const selected = partition orelse return fatal("--partition is required", .{});
+    // Required, not optional: an optional ceiling would let a forgotten
+    // argument silently downgrade the run to "no pair is ever excused", which
+    // reads as a pass. Same reasoning as corpus-classify's --ceiling.
+    const ceiling_file = ceiling_path orelse return fatal("--ceiling is required", .{});
+    const count = selected.memberCount(requested_count);
+    if (count == 0) return fatal("corpus partition '{t}' would be empty", .{selected});
+
+    const ceiling_text = try std.Io.Dir.cwd().readFileAlloc(io, ceiling_file, arena, .limited(1 << 20));
+    const ceiling = comparison.CeilingTable{ .text = ceiling_text };
+    ceiling.validateUnique() catch |err|
+        return fatal("ceiling file '{s}' is malformed: {t}", .{ ceiling_file, err });
+
+    var report_buffer: [64 * 1024]u8 = undefined;
+    var report_file: std.Io.File.Writer = .init(.stderr(), io, &report_buffer);
+    const report = &report_file.interface;
+
+    var counters: [public_observables.len]Counter = @splat(.{});
+    var totals = Totals{};
+
+    for (0..count) |raw_index| {
+        const member_index: u32 = @intCast(raw_index);
+        const molecule = try corpus.generate(gpa, selected, member_index);
+        defer molecule.deinit(gpa);
+        const member = try std.fmt.allocPrint(arena, "{t}/{d}", .{ selected, member_index });
+        try compareMember(
+            gpa,
+            report,
+            molecule,
+            member,
+            ceiling,
+            tolerance,
+            &counters,
+            &totals,
+        );
+    }
+
+    try writeSummary(report, selected, tolerance, &counters, &totals);
+    if (baseline_path) |path| {
+        var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer file.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(io, &buffer);
+        try writeBaseline(&writer.interface, selected, tolerance, &counters, &totals);
+        try writer.interface.flush();
+    }
+    var baseline_regressed = false;
+    if (check_baseline_path) |path| {
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1 << 20));
+        baseline_regressed = try checkBaseline(report, text, &counters, &totals);
+    }
+
+    const status_failed = totals.status_mismatches != 0 or totals.native_unsupported != 0;
+    var parity_failed = false;
+    for (counters) |counter| {
+        if (counter.mismatched != 0) parity_failed = true;
+    }
+
+    if (on_mismatch == .record and (status_failed or parity_failed)) {
+        // Said out loud, in the report, so a zero exit in this mode can never
+        // be read as parity. The verdict above is unchanged; only who acts on
+        // it is.
+        try report.print(
+            "native-oracle-diff: --on-mismatch record, so the mismatches above did not fail this run\n",
+            .{},
+        );
+    }
+    try report.flush();
+
+    if (baseline_regressed) return error.NativeBaselineRegressed;
+    if (on_mismatch == .record) return;
+    if (status_failed) return error.NativeOracleStatusMismatch;
+    if (parity_failed) return error.NativeOracleParityMismatch;
+}
+
+/// Whether a mismatch is this run's verdict or merely its output.
+///
+/// `fail` is the gate: `zig build native-diff` is red until the port reaches
+/// parity, which is the point of it (cgz-r20 - a gate that cannot fail is not
+/// a gate). `record` is for the publish step, whose job is to write down what
+/// the measurement currently says; making that depend on the measurement being
+/// good is what left conformance/native_baseline.tsv to be copied out of the
+/// build cache by hand (cgz-7v2.4.2).
+const OnMismatch = enum { fail, record };
+
+fn compareMember(
+    gpa: std.mem.Allocator,
+    report: *std.Io.Writer,
+    molecule: corpus.Molecule,
+    member: []const u8,
+    ceiling: comparison.CeilingTable,
+    tolerance: f64,
+    counters: *[public_observables.len]Counter,
+    totals: *Totals,
+) !void {
+    totals.members += 1;
+
+    const oracle_atoms = try gpa.alloc(c_abi.AtomInput, molecule.atoms.len);
+    defer gpa.free(oracle_atoms);
+    const native_atoms = try gpa.alloc(api.AtomInput, molecule.atoms.len);
+    defer gpa.free(native_atoms);
+    for (oracle_atoms, native_atoms, molecule.atoms) |*oracle_atom, *native_atom, source| {
+        oracle_atom.* = .{
+            .atomic_number = source.atomic_number,
+            .formal_charge = source.formal_charge,
+        };
+        native_atom.* = .{
+            .atomic_number = api.AtomicNumber.fromPublic(source.atomic_number) orelse
+                return error.CorpusAtomicNumberOutOfRange,
+            .formal_charge = source.formal_charge,
+        };
+    }
+
+    const oracle_bonds = try gpa.alloc(c_abi.BondInput, molecule.bonds.len);
+    defer gpa.free(oracle_bonds);
+    const native_bonds = try gpa.alloc(api.BondInput, molecule.bonds.len);
+    defer gpa.free(native_bonds);
+    for (oracle_bonds, native_bonds, molecule.bonds) |*oracle_bond, *native_bond, source| {
+        oracle_bond.* = .{ .start = source.start, .end = source.end, .order = source.order };
+        native_bond.* = .{
+            .start = source.start,
+            .end = source.end,
+            .order = api.BondOrder.fromInt(source.order) orelse
+                return error.CorpusBondOrderOutOfRange,
+        };
+    }
+
+    const oracle_input: c_abi.Input = .{
+        .atoms = .{ .ptr = oracle_atoms.ptr, .len = @intCast(oracle_atoms.len) },
+        .bonds = .{ .ptr = oracle_bonds.ptr, .len = @intCast(oracle_bonds.len) },
+    };
+    var oracle_result: c_abi.Result = undefined;
+    const oracle_status = coordgen_generate(&oracle_input, &oracle_result);
+    defer coordgen_result_free(&oracle_result);
+
+    const native_input = api.Input{ .atoms = native_atoms, .bonds = native_bonds };
+    const native_probe_input = native_input;
+    var native_value = api.generate(gpa, native_input) catch |err| {
+        const native_status = @backingInt(core.errors.code(err));
+        if (oracle_status == native_status) {
+            totals.agreed_rejections += 1;
+            return;
+        }
+        if (err == error.Unsupported) {
+            totals.native_unsupported += 1;
+            try report.print(
+                "{s}: native declined a domain the oracle accepted (oracle status {d})\n",
+                .{ member, oracle_status },
+            );
+            return;
+        }
+        totals.status_mismatches += 1;
+        try report.print(
+            "{s}: status oracle={d} native={d} ({t})\n",
+            .{ member, oracle_status, native_status, err },
+        );
+        return;
+    };
+    defer native_value.deinit();
+
+    if (oracle_status != 0) {
+        totals.status_mismatches += 1;
+        try report.print(
+            "{s}: status oracle={d} native=0 (native succeeded where the oracle did not)\n",
+            .{ member, oracle_status },
+        );
+        return;
+    }
+
+    try comparePreOrientation(gpa, report, native_probe_input, oracle_input, oracle_result, native_value, member, tolerance, totals);
+
+    for (public_observables, 0..) |observable, slot| {
+        const row = ceiling.find(member, observable) catch |err|
+            return fatal("ceiling lookup failed for {s}: {t}", .{ member, err });
+        // A pair carrying a ceiling row is precisely the enumerated
+        // order-unstable set (cgz-r26); everything else is held order-stable
+        // and therefore to its base tier.
+        const plan = comparison.differentialComparison(
+            observable,
+            row == null,
+            row,
+            tolerance,
+        ) catch |err| {
+            try report.print("{s}/{t}: {t}\n", .{ member, observable, err });
+            counters[slot].mismatched += 1;
+            continue;
+        };
+        if (row != null) counters[slot].ceiling_applied += 1;
+        counters[slot].compared += 1;
+
+        const matched = switch (observable) {
+            .coordinates => try compareCoordinateObservable(
+                gpa,
+                report,
+                member,
+                oracle_result,
+                native_value,
+                plan.tolerance_bond_lengths,
+                totals,
+            ),
+            .clean_pose => oracle_result.clean_pose == @intFromBool(native_value.clean_pose),
+            .input_to_internal => spansEqual(
+                oracle_result.input_to_internal,
+                native_value.input_to_internal,
+            ),
+            .internal_to_input => spansEqual(
+                oracle_result.internal_to_input,
+                native_value.internal_to_input,
+            ),
+            .effective_bond_orders => enumSpanEqual(
+                oracle_result.effective_bond_orders,
+                native_value.effective_bond_orders,
+            ),
+            .bond_displays => enumSpanEqual(
+                oracle_result.bond_displays,
+                native_value.bond_displays,
+            ),
+            .atom_stereo => enumSpanEqual(oracle_result.atom_stereo, native_value.atom_stereo),
+            else => unreachable,
+        };
+        if (!matched) {
+            counters[slot].mismatched += 1;
+            if (observable != .coordinates) {
+                try report.print("{s}/{t}: mismatch\n", .{ member, observable });
+            }
+        }
+    }
+}
+
+/// Compare the two implementations one stage earlier than the final
+/// coordinates, at the pose each holds immediately before global orientation.
+///
+/// Neither side needs new instrumentation: native reports the stage through its
+/// own probe surface, and the oracle's is recovered by inverting the transform
+/// its hook already publishes. Reported, never gating — the gate remains the
+/// public observables, and this exists so that a failure there says *which*
+/// stage diverged instead of only that one did (cgz-7v2.4.2.1).
+///
+/// Reflection is reported at both stages rather than tolerated at either. A
+/// mirrored pose is a divergence under COMPARISON_SEMANTICS.md, and knowing
+/// whether it arrived before orientation or was introduced by it is the whole
+/// point of splitting the comparison.
+fn comparePreOrientation(
+    gpa: std.mem.Allocator,
+    report: *std.Io.Writer,
+    native_input: api.Input,
+    oracle_input: c_abi.Input,
+    oracle_result: c_abi.Result,
+    native_value: api.Result,
+    member: []const u8,
+    tolerance: f64,
+    totals: *Totals,
+) !void {
+    var probe: conformance.probe_types.ProbeResult = undefined;
+    if (coordgen_probe_generate(&oracle_input, &probe) != 0) return;
+    defer coordgen_probe_result_free(&probe);
+
+    const components = probe.componentSlice();
+    // One component is the case the reconstruction is defined for: with several,
+    // each carries its own transform and the atom-to-component mapping would
+    // have to be applied per atom before inverting. Reported as skipped rather
+    // than silently omitted.
+    if (components.len != 1 or
+        components[0].transform_status != .observed)
+    {
+        try report.print(
+            "{s}/pre_orientation: not reconstructible ({d} components)\n",
+            .{ member, components.len },
+        );
+        return;
+    }
+
+    var stages = conformance.native_probe.generateStages(gpa, native_input) catch |err| {
+        try report.print("{s}/pre_orientation: native probe failed ({t})\n", .{ member, err });
+        return;
+    };
+    defer stages.deinit();
+
+    // One generation feeding two readings is only sound if it agrees with the
+    // public entry point. Checked, not assumed: a disagreement is a
+    // nondeterminism finding and it fails the run.
+    if (stages.coordinates.len != native_value.coordinates.len) return error.NativeProbeLengthMismatch;
+    for (stages.coordinates, native_value.coordinates) |probe_point, public_point| {
+        if (probe_point.x != public_point.x or probe_point.y != public_point.y) {
+            totals.status_mismatches += 1;
+            try report.print(
+                "{s}/pre_orientation: the probe and public entry points disagree on the final pose\n",
+                .{member},
+            );
+            return;
+        }
+    }
+
+    const len: usize = @intCast(oracle_result.coordinates.len);
+    if (len != stages.pre_orientation.len) return error.NativeProbeLengthMismatch;
+    const oracle_final = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(oracle_final);
+    const oracle_before = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(oracle_before);
+    const native_before = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(native_before);
+    const raw = oracle_result.coordinates.ptr.?;
+    for (oracle_final, native_before, stages.pre_orientation, 0..) |*reference, *candidate, point, i| {
+        reference.* = .{ .x = raw[i].x, .y = raw[i].y };
+        candidate.* = .{ .x = point.x, .y = point.y };
+    }
+    comparison.invertComponentTransform(components[0].transform, oracle_final, oracle_before) catch |err| {
+        try report.print("{s}/pre_orientation: {t}\n", .{ member, err });
+        return;
+    };
+
+    const direct = try comparison.compareCoordinates(oracle_before, native_before, tolerance, .{});
+    totals.pre_orientation_compared += 1;
+    const orientation = if (comparison.transformReflects(components[0].transform)) "reflects" else "rotates";
+    if (direct.matches) {
+        try report.print(
+            "{s}/pre_orientation: {d:.4}, matched; oracle orientation {s}\n",
+            .{ member, direct.max_deviation_bond_lengths, orientation },
+        );
+        return;
+    }
+    totals.pre_orientation_mismatched += 1;
+    // Only once the direct reading has failed is a reflected one worth taking,
+    // and it is diagnosis alone: it never decides whether anything matched, it
+    // says whether the residual is a mirror. Note that it answers that
+    // reliably only when the residual is small — this runner aligns on two
+    // anchor atoms rather than by best fit, so a large residual makes the two
+    // readings a weak comparison rather than a verdict.
+    const mirrored = try comparison.compareCoordinates(
+        oracle_before,
+        native_before,
+        tolerance,
+        .{ .achiral_proof = "diagnostic only, never a pass" },
+    );
+    try report.print(
+        "{s}/pre_orientation: {d:.4} direct, {d:.4} reflected; oracle orientation {s}\n",
+        .{
+            member,
+            direct.max_deviation_bond_lengths,
+            mirrored.max_deviation_bond_lengths,
+            orientation,
+        },
+    );
+}
+
+fn compareCoordinateObservable(
+    gpa: std.mem.Allocator,
+    report: *std.Io.Writer,
+    member: []const u8,
+    oracle_result: c_abi.Result,
+    native_value: api.Result,
+    tolerance: f64,
+    totals: *Totals,
+) !bool {
+    const len: usize = @intCast(oracle_result.coordinates.len);
+    if (len != native_value.coordinates.len) {
+        try report.print(
+            "{s}/coordinates: length oracle={d} native={d}\n",
+            .{ member, len, native_value.coordinates.len },
+        );
+        return false;
+    }
+    const oracle_points = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(oracle_points);
+    const native_points = try gpa.alloc(comparison.Point, len);
+    defer gpa.free(native_points);
+    const raw = oracle_result.coordinates.ptr.?;
+    for (oracle_points, native_points, 0..) |*oracle_point, *native_point, i| {
+        oracle_point.* = .{ .x = raw[i].x, .y = raw[i].y };
+        native_point.* = .{
+            .x = native_value.coordinates[i].x,
+            .y = native_value.coordinates[i].y,
+        };
+    }
+    // Reflection stays off: a mirrored layout is a different molecule unless
+    // the fixture carries an achirality proof (COMPARISON_SEMANTICS.md).
+    const result = try comparison.compareCoordinates(
+        oracle_points,
+        native_points,
+        tolerance,
+        .{},
+    );
+    totals.recordDeviation(member, result.max_deviation_bond_lengths);
+    try totals.member_deviations.append(gpa, .{
+        .member = member,
+        .deviation = result.max_deviation_bond_lengths,
+    });
+    if (!result.matches) {
+        try report.print(
+            "{s}/coordinates: {d:.4} bond lengths exceeds {d:.4}\n",
+            .{ member, result.max_deviation_bond_lengths, tolerance },
+        );
+    }
+    return result.matches;
+}
+
+fn spansEqual(oracle: c_abi.U32Span, native: []const u32) bool {
+    const len: usize = @intCast(oracle.len);
+    if (len != native.len) return false;
+    if (len == 0) return true;
+    return std.mem.eql(u32, oracle.ptr.?[0..len], native);
+}
+
+fn enumSpanEqual(oracle: c_abi.U32Span, native: anytype) bool {
+    const len: usize = @intCast(oracle.len);
+    if (len != native.len) return false;
+    if (len == 0) return true;
+    const raw = oracle.ptr.?;
+    for (native, 0..) |value, i| {
+        if (raw[i] != @backingInt(value)) return false;
+    }
+    return true;
+}
+
+fn writeSummary(
+    report: *std.Io.Writer,
+    partition: corpus.Partition,
+    tolerance: f64,
+    counters: *const [public_observables.len]Counter,
+    totals: *const Totals,
+) !void {
+    try report.print(
+        "native-oracle-diff {t}: {d} members, T={d:.4} bond lengths\n",
+        .{ partition, totals.members, tolerance },
+    );
+    if (totals.agreed_rejections != 0) {
+        try report.print("  agreed rejections: {d}\n", .{totals.agreed_rejections});
+    }
+    if (totals.native_unsupported != 0) {
+        try report.print("  native unsupported: {d}\n", .{totals.native_unsupported});
+    }
+    if (totals.status_mismatches != 0) {
+        try report.print("  status mismatches: {d}\n", .{totals.status_mismatches});
+    }
+    for (public_observables, counters) |observable, counter| {
+        try report.print(
+            "  {t}: {d}/{d} matched",
+            .{ observable, counter.compared - counter.mismatched, counter.compared },
+        );
+        if (counter.ceiling_applied != 0) {
+            try report.print(", {d} at the enumerated ceiling", .{counter.ceiling_applied});
+        }
+        try report.print("\n", .{});
+    }
+    if (totals.pre_orientation_compared != 0) {
+        try report.print(
+            "  pre-orientation stage: {d}/{d} matched (reported, not gated)\n",
+            .{
+                totals.pre_orientation_compared - totals.pre_orientation_mismatched,
+                totals.pre_orientation_compared,
+            },
+        );
+    }
+    if (totals.max_deviation_member_len != 0) {
+        try report.print(
+            "  max coordinate deviation: {d:.6} bond lengths ({s})\n",
+            .{ totals.max_deviation_bond_lengths, totals.worstMember() },
+        );
+    }
+}
+
+/// The machine-readable half. cgz-7v2.4.2 recalibrates T from this file and
+/// cgz-7v2.4.7 takes its performance trigger from the same milestone, so the
+/// numbers have to survive outside a build log.
+fn writeBaseline(
+    writer: *std.Io.Writer,
+    partition: corpus.Partition,
+    tolerance: f64,
+    counters: *const [public_observables.len]Counter,
+    totals: *const Totals,
+) !void {
+    try writer.print("# native-vs-oracle baseline, one line per observable\n", .{});
+    try writer.print("# partition\t{t}\n", .{partition});
+    try writer.print("# members\t{d}\n", .{totals.members});
+    try writer.print("# tolerance_bond_lengths\t{d:.6}\n", .{tolerance});
+    try writer.print(
+        "# max_deviation_bond_lengths\t{d:.6}\t{s}\n",
+        .{ totals.max_deviation_bond_lengths, totals.worstMember() },
+    );
+    // A header line rather than an observable row: the stage is reported, not
+    // gated, and the row schema is what the gate reads.
+    try writer.print("# pre_orientation_compared\t{d}\t{d}\n", .{
+        totals.pre_orientation_compared,
+        totals.pre_orientation_mismatched,
+    });
+    // Per-member coordinate deviations, which are what `--check-baseline`
+    // compares. A single molecule-wide maximum hides one member worsening
+    // while another improves, and that is exactly the shape of change the
+    // layout work produces (cgz-zsm).
+    try writer.print("member\tcoordinate_deviation_bond_lengths\n", .{});
+    for (totals.member_deviations.items) |entry| {
+        try writer.print("{s}\t{d:.6}\n", .{ entry.member, entry.deviation });
+    }
+    try writer.print("observable\tcompared\tmismatched\tceiling_applied\n", .{});
+    for (public_observables, counters) |observable, counter| {
+        try writer.print("{t}\t{d}\t{d}\t{d}\n", .{
+            observable,
+            counter.compared,
+            counter.mismatched,
+            counter.ceiling_applied,
+        });
+    }
+}
+
+fn fatal(comptime format: []const u8, arguments: anytype) error{NativeOracleDiffFailed} {
+    std.log.err(format, arguments);
+    return error.NativeOracleDiffFailed;
+}
+
+/// Compare this run against the published baseline and report anything that
+/// got worse (cgz-zsm).
+///
+/// The baseline is a record, and until this existed nothing read it back: a
+/// member could regress from 3.6262 to 4.5825 bond lengths with every gate
+/// still green, because both numbers are merely "over tolerance". That is how
+/// cgz-9ks landed unnoticed.
+///
+/// Improvement is deliberately free. A member that gets better passes, and the
+/// file is not rewritten here - republishing is `native-baseline`'s job, so
+/// that accepting a worse number is an edit a reviewer can see in the diff,
+/// exactly as the parity ceiling requires for order-instability.
+///
+/// Returns true when something regressed.
+fn checkBaseline(
+    report: *std.Io.Writer,
+    text: []const u8,
+    counters: *const [public_observables.len]Counter,
+    totals: *const Totals,
+) !bool {
+    var regressed = false;
+    var improved: usize = 0;
+    var matched_members: usize = 0;
+
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r\t");
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const first = fields.next() orelse continue;
+        const second = fields.next() orelse continue;
+        if (std.mem.eql(u8, first, "member") or std.mem.eql(u8, first, "observable")) continue;
+
+        // A member row: one coordinate deviation.
+        if (std.mem.indexOfScalar(u8, first, '/') != null) {
+            const recorded = std.fmt.parseFloat(f64, second) catch continue;
+            const current = for (totals.member_deviations.items) |entry| {
+                if (std.mem.eql(u8, entry.member, first)) break entry.deviation;
+            } else {
+                try report.print(
+                    "baseline: {s} is recorded but this run did not measure it\n",
+                    .{first},
+                );
+                regressed = true;
+                continue;
+            };
+            matched_members += 1;
+            const allowance = baselineAllowance(recorded);
+            if (current > recorded + allowance) {
+                try report.print(
+                    "baseline REGRESSION: {s} coordinates {d:.6} exceeds the recorded {d:.6}\n",
+                    .{ first, current, recorded },
+                );
+                regressed = true;
+            } else if (current + allowance < recorded) {
+                improved += 1;
+                try report.print(
+                    "baseline improvement: {s} coordinates {d:.6} beats the recorded {d:.6}\n",
+                    .{ first, current, recorded },
+                );
+            }
+            continue;
+        }
+
+        // An observable row: compared, mismatched, ceiling_applied.
+        const recorded_mismatched = std.fmt.parseInt(u32, fields.next() orelse continue, 10) catch continue;
+        for (public_observables, counters) |observable, counter| {
+            if (!std.mem.eql(u8, @tagName(observable), first)) continue;
+            if (counter.mismatched > recorded_mismatched) {
+                try report.print(
+                    "baseline REGRESSION: {t} mismatched {d} exceeds the recorded {d}\n",
+                    .{ observable, counter.mismatched, recorded_mismatched },
+                );
+                regressed = true;
+            } else if (counter.mismatched < recorded_mismatched) {
+                improved += 1;
+                try report.print(
+                    "baseline improvement: {t} mismatched {d} beats the recorded {d}\n",
+                    .{ observable, counter.mismatched, recorded_mismatched },
+                );
+            }
+        }
+    }
+
+    // A baseline that records no members at all would pass everything without
+    // comparing anything, which is the false green this gate exists to prevent.
+    if (matched_members == 0) {
+        try report.print(
+            "baseline: no member rows were compared; the file records none, so this gate asserted nothing\n",
+            .{},
+        );
+        regressed = true;
+    }
+    if (!regressed) {
+        try report.print(
+            "baseline: {d} members checked, nothing worse than recorded, {d} improvement(s)\n",
+            .{ matched_members, improved },
+        );
+    }
+    return regressed;
+}
+
+/// How much worse a member may read before it counts as a regression.
+///
+/// A flat epsilon does not work across the whole range: the members that match
+/// sit near 0.0002 bond lengths, where an absolute floor has to absorb
+/// cross-host last-place noise, while drug_like/4 sits at 4.58, where a floor
+/// that small is needlessly tight. So it is the larger of a thousandth of a
+/// bond length and one percent of the recorded value.
+///
+/// Both bounds stay far below anything worth calling a regression: one percent
+/// of 3.63 is 0.036, and the regression this gate was built to catch (cgz-9ks)
+/// is 0.96.
+fn baselineAllowance(recorded: f64) f64 {
+    return @max(baseline_absolute_floor, recorded * baseline_relative_fraction);
+}
+
+const baseline_absolute_floor: f64 = 1e-3;
+const baseline_relative_fraction: f64 = 0.01;

@@ -9,12 +9,34 @@ contracts in the existing architecture documents remain authoritative.
 
 The Phase 1 geometry and graph foundations landed as `cgz-7v2.9` and
 `cgz-7v2.10`, but the Phase 2–5 implementation beads promised by `cgz-7v2`
-were never created. The `layout`, `optimize`, and `generator` build modules are
-still empty-module stubs, and a structurally valid call to
-`coordgen_generate` returns `unsupported`. This document closes that planning
-gap. It maps the pinned C++ implementation to one native owner per component,
-defines the integration order, and names the conformance evidence required at
-each seam.
+were never created. When this document was written the `layout`, `optimize`,
+and `generator` build modules were empty-module stubs. This document closes
+that planning gap. It maps the pinned C++ implementation to one native owner
+per component, defines the integration order, and names the conformance
+evidence required at each seam.
+
+## Current state (2026-08-16)
+
+Every module this plan decomposes is implemented and merged. `cgz-7v2.12`
+through `cgz-7v2.20` all landed in PRs #19 and #20 and are closed; `src/` is
+~19,400 lines and CI is green on `main`.
+
+Integration landed with `cgz-7v2.21`: `api.generate` runs the full pipeline
+and `coordgen_generate` publishes owned spans for all six observables, so a
+supported input now returns coordinates through both the safe and the C entry
+point. Coverage is partial **by domain, never by size** — the rejected set is
+enumerated on `api.generate` and an unowned domain returns `Unsupported`
+rather than a successful empty result.
+
+What has still not happened is comparison. **No native output has yet been
+compared against the oracle** — the tolerance `T` in
+[`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md) is still a prior taken from the
+oracle's own float sensitivity, and the performance gate is still deliberately
+red with no threshold.
+
+The beads for this decomposition were created retroactively on 2026-08-16,
+eleven days after the work merged. See `cgz-r29` for why that happened and
+what should prevent the next one.
 
 In the tables below, `P/` means the pinned package root recorded by
 `upstream/coordgenlibs.lock` and materialized by Zig under its content hash.
@@ -200,10 +222,12 @@ the full upstream feature set:
 The minimal success fixture is a connected acyclic stereo-free molecule with
 no template, residue, proximity, macrocycle, constraint, clash, or minimization
 requirement. The internal result must contain deterministic caller-order
-coordinates at bond length 50. Public `generate` remains unsupported until the
-full integration bead can distinguish every supported domain and provide the
+coordinates at bond length 50. Public `generate` remained unsupported until the
+full integration bead could distinguish every supported domain and provide the
 complete ownership contract; unsupported domains must never return a silently
-empty successful result.
+empty successful result. `cgz-7v2.21` discharged that condition: both entry
+points reject by domain with `Unsupported`, and the C result publishes all six
+spans under one owner released by `coordgen_result_free`.
 
 ## Implementation beads and dependencies
 
@@ -280,3 +304,38 @@ previously missing from:
 
 Those dependencies must point to the concrete integration bead. Their existing
 non-generation slices remain valid and must not be reopened.
+
+As of 2026-08-16 that integration bead is `cgz-7v2.21`, it exists, and all six
+edges above are recorded in the database. Each of the five validation beads
+also carries a note distinguishing the slice that already merged from the slice
+that waits on generation, so none of them is reopened wholesale.
+
+## Remaining sequence
+
+1. **`cgz-7v2.21` — wire public generation.** Nothing else can start. The
+   ABI/consumer tests that currently assert `unsupported` are part of this
+   diff, and unsupported domains must return a specific error rather than a
+   silently-empty success.
+2. **`cgz-r26` — give the enumerated parity ceiling a portable home.** Wanted
+   before the differential runner, not after: the runner has to know per member
+   whether an exact claim is owed, and neither existing artifact can tell it
+   portably. This is decidable today and does not wait on step 1.
+3. **`cgz-7v2.4.2` — differential runner, then the first native baseline.**
+   That single baseline discharges two deferred numbers: it recalibrates `T`
+   (which today bounds the *oracle's* float sensitivity, not the port's) and it
+   sets the per-bucket performance ratio for `cgz-7v2.4.7`. Lowering `T` is
+   free; raising it needs a decision bead.
+4. **Fan out the remaining validation slices** — `cgz-7v2.4.3` generation-level
+   property/OOM/concurrency, `cgz-7v2.4.4` fuzzing (which also owns failure 2
+   of `cgz-r27`, the 0-byte crash seed), `cgz-7v2.4.6` installed native
+   generation, `cgz-7v2.4.7` ratios, `cgz-r16` C-entry OOM probes. These are
+   independent of each other once step 3 exists.
+5. **`cgz-7v2.4.8` — final validation audit and scoped parity report.**
+
+`cgz-r25` is settled: the `build_from_fragments` slot is now
+`coordgen_options_t.reserved`, required to be zero, and gone from
+`api.Options` entirely, so step 1 freezes public generation around a reserved
+field rather than around a name that promises a toggle. See
+[FOUNDATION_CONTRACTS.md](FOUNDATION_CONTRACTS.md). One open item remains cheap
+now and expensive later: `cgz-7v2.3` (owner-controlled mirrors for the pinned
+archives, which every gate above assumes will keep resolving).

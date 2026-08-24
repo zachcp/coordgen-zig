@@ -190,12 +190,14 @@ fn addCorpusRunner(b: *std.Build, options: CorpusRunnerOptions) *std.Build.Step.
         .link_libc = true,
         .link_libcpp = true,
     });
-    if (options.descending_allocator) {
-        module.addCSourceFile(.{
-            .file = b.path("conformance/allocator_order.cpp"),
-            .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
-        });
-    }
+    module.addCMacro(
+        "CGZ_ALLOCATOR_DESCENDING",
+        if (options.descending_allocator) "1" else "0",
+    );
+    module.addCSourceFile(.{
+        .file = b.path("conformance/allocator_order.cpp"),
+        .flags = &.{ "-std=c++17", "-Wall", "-Wextra", "-Werror" },
+    });
     module.linkLibrary(options.oracle_abi);
     return b.addExecutable(.{ .name = options.name, .root_module = module });
 }
@@ -426,6 +428,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "api", .module = api },
+            .{ .name = "core", .module = core },
             .{ .name = "generator", .module = generator },
         },
         .link_libc = false,
@@ -465,6 +468,34 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
+    // The parity ceiling is enumerated per corpus member, so it is checkable
+    // without an oracle: regenerate each enumerated member and confirm it
+    // still hashes to the bytes the row was measured against. Deliberately on
+    // `test` rather than on `corpus-check`, because the point of cgz-r26 is
+    // that the enumeration is portable and does not need the oracle build.
+    const parity_ceiling_module = b.createModule(.{
+        .root_source_file = b.path("tests/parity_ceiling_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "conformance", .module = conformance }},
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    const parity_ceiling_check = b.addExecutable(.{
+        .name = "parity-ceiling-check",
+        .root_module = parity_ceiling_module,
+    });
+    const run_parity_ceiling_check = b.addRunArtifact(parity_ceiling_check);
+    run_parity_ceiling_check.expectExitCode(0);
+    run_parity_ceiling_check.addArg("--ceiling");
+    run_parity_ceiling_check.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+    const parity_ceiling_step = b.step(
+        "parity-ceiling-check",
+        "Verify the enumerated parity ceiling still names the members it was measured on",
+    );
+    parity_ceiling_step.dependOn(&run_parity_ceiling_check.step);
+    test_step.dependOn(parity_ceiling_step);
+
     const coverage_step = b.step("coverage-check", "Validate requirements-to-test traceability");
     const coverage_check = b.addSystemCommand(&.{
         "python3",
@@ -493,6 +524,38 @@ pub fn build(b: *std.Build) !void {
     const module_import_self_test = b.addSystemCommand(&.{ "python3", "tools/check-module-imports", "--self-test" });
     module_graph_step.dependOn(&module_import_check.step);
     module_graph_step.dependOn(&module_import_self_test.step);
+
+    // A fragment's bond to its parent has no reliable stored direction here:
+    // native keeps bonds in canonical input order, which on the drug_like
+    // corpus is child-first, while upstream's fragmenter mutates the molecule
+    // so `startAtom` is always the parent's end. Transcribing that read
+    // directly fails silently, and did (cgz-jg4). Fragment.attachment_atom and
+    // Fragment.parent_atom are resolved once by membership; this rejects any
+    // source that goes back to the bond. --self-test is the negative fixture.
+    const bond_orientation_check = b.addSystemCommand(&.{ "tools/check-bond-orientation", "src" });
+    const bond_orientation_self_test = b.addSystemCommand(&.{ "tools/check-bond-orientation", "--self-test" });
+    module_graph_step.dependOn(&bond_orientation_check.step);
+    module_graph_step.dependOn(&bond_orientation_self_test.step);
+
+    // Its own step, deliberately not part of `test`, because it is RED on
+    // landing and says so: six public entry points of the layout and optimize
+    // layers have no caller outside their own tests (cgz-7v2.24). That is the
+    // cgz-r35 family, which nothing in this build could previously see -
+    // coverage-check counts assertion sites, so a well-tested orphan reads as
+    // covered, and module-graph-check validates which layers may import which,
+    // not which imports exist. A gate that must fail until real work lands is
+    // cgz-r20's rule, not a defect in the gate.
+    const reachability_step = b.step(
+        "reachability-check",
+        "Reject a public layout/optimize/generator entry point with no caller outside its own tests",
+    );
+    const reachability_check = b.addSystemCommand(&.{ "python3", "tools/check-reachability" });
+    const reachability_self_test = b.addSystemCommand(&.{ "python3", "tools/check-reachability", "--self-test" });
+    reachability_step.dependOn(&reachability_check.step);
+    reachability_step.dependOn(&reachability_self_test.step);
+    // The self-test runs with the default checks even while the scan is red, so
+    // the checker itself cannot rot unnoticed behind its own known failure.
+    module_graph_step.dependOn(&reachability_self_test.step);
 
     const policy_command = b.addSystemCommand(&.{ "sh", "tools/check-build-policy" });
     const external_consumer = b.addRunFile(std.Build.LazyPath.zig_exe);
@@ -630,18 +693,13 @@ pub fn build(b: *std.Build) !void {
         "performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cgz-7v2.4.7",
     );
     performance_step.dependOn(&performance_pending.step);
-    const template_fixture = b.createModule(.{
-        .root_source_file = b.path("src/layout/templates/data.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
     const template_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/template_generate.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "conformance", .module = conformance },
-            .{ .name = "template_fixture", .module = template_fixture },
+            .{ .name = "layout", .module = layers.layout },
         },
     });
     const template_generator_tests = b.addTest(.{
@@ -942,8 +1000,10 @@ pub fn build(b: *std.Build) !void {
 
         // Corpus stability classification. The same corpus runs through
         // oracle builds that differ in exactly one variable at a time:
-        // architecture, or heap address order. Comparing the three dumps is
-        // what assigns each input and observable its comparison tier.
+        // architecture, or heap address order. The baseline and architecture
+        // builds use the same ascending allocator; the order perturbation uses
+        // its descending mode. Comparing the three dumps is what assigns each
+        // input and observable its comparison tier.
         // The classification is a per-(architecture, toolchain,
         // optimize-mode) artifact, so the corpus oracles are pinned to one
         // optimize mode instead of following -Doptimize. That keeps a
@@ -1117,6 +1177,11 @@ pub fn build(b: *std.Build) !void {
         }
         run_classify.addArg("--expectations");
         run_classify.addFileArg(b.path("conformance/parity_expectations.tsv"));
+        // The fraction ceilings bound how many pairs may be order-unstable;
+        // this enumerates which. Both are checked, and an order-unstable pair
+        // missing from the enumeration fails closed (cgz-r13, cgz-r26).
+        run_classify.addArg("--ceiling");
+        run_classify.addFileArg(b.path("conformance/parity_ceiling.tsv"));
         run_classify.addArg("--manifest");
         const generated_manifest = run_classify.addOutputFileArg("parity_manifest.tsv");
 
@@ -1208,6 +1273,87 @@ pub fn build(b: *std.Build) !void {
         run_native_macrocycle.expectExitCode(0);
         run_native_macrocycle.addFileArg(oracle.path("test/macrocycle.mae"));
         oracle_step.dependOn(&run_native_macrocycle.step);
+
+        // The differential runner (cgz-7v2.4.2). It imports `api` for the
+        // native side and links the oracle's C ABI for the other, which is
+        // only sound because the native C exports are absent from this module
+        // - see tests/native_oracle_diff.zig and cgz-r28.
+        const native_diff_module = b.createModule(.{
+            .root_source_file = b.path("tests/native_oracle_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "api", .module = api },
+                .{ .name = "core", .module = core },
+                .{ .name = "conformance", .module = conformance },
+                .{ .name = "c_abi", .module = c_abi },
+            },
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        native_diff_module.linkLibrary(oracle_abi);
+        const native_diff = b.addExecutable(.{
+            .name = "native-oracle-diff",
+            .root_module = native_diff_module,
+        });
+        const run_native_diff = b.addRunArtifact(native_diff);
+        run_native_diff.expectExitCode(0);
+        // drug_like first: it is the partition the Phase 3 gate in
+        // SUCCESS_CRITERIA.md is stated over, and every member is
+        // coordinate-stable on both axes, so a mismatch here is the port's.
+        run_native_diff.addArgs(&.{ "--partition", "drug_like" });
+        run_native_diff.addArg("--ceiling");
+        run_native_diff.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        const native_diff_step = b.step(
+            "native-diff",
+            "Compare native against the pinned oracle over a corpus partition",
+        );
+        native_diff_step.dependOn(&run_native_diff.step);
+
+        // Publishing the baseline is a second run of the same binary over the
+        // same partition, in the mode that reports a mismatch instead of
+        // failing on it (cgz-7v2.4.2). It is deliberately not the gate's run:
+        // making the record of a red measurement depend on the measurement
+        // being green is what left conformance/native_baseline.tsv to be
+        // copied out of the build cache by hand.
+        const record_baseline = b.addRunArtifact(native_diff);
+        record_baseline.expectExitCode(0);
+        record_baseline.addArgs(&.{ "--partition", "drug_like" });
+        record_baseline.addArg("--ceiling");
+        record_baseline.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        record_baseline.addArgs(&.{ "--on-mismatch", "record" });
+        record_baseline.addArg("--baseline");
+        const native_diff_baseline = record_baseline.addOutputFileArg("native_baseline.tsv");
+        const publish_baseline = b.addUpdateSourceFiles();
+        publish_baseline.addCopyFileToSource(native_diff_baseline, "conformance/native_baseline.tsv");
+        const native_baseline_step = b.step(
+            "native-baseline",
+            "Regenerate the published native-vs-oracle baseline from this build",
+        );
+        native_baseline_step.dependOn(&publish_baseline.step);
+
+        // The gate that reads the baseline back (cgz-zsm). Deliberately a
+        // third run of the binary rather than a flag on either of the two
+        // above: the publisher rewrites the file unconditionally, so a gate
+        // sharing that run could never fail, and the differential's own run
+        // exits non-zero while the port is red, which would mask this
+        // verdict behind one everybody is already waiting on. It reports the
+        // mismatches without failing on them, and fails only on a number
+        // worse than the one recorded.
+        const check_baseline = b.addRunArtifact(native_diff);
+        check_baseline.expectExitCode(0);
+        check_baseline.addArgs(&.{ "--partition", "drug_like" });
+        check_baseline.addArg("--ceiling");
+        check_baseline.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        check_baseline.addArgs(&.{ "--on-mismatch", "record" });
+        check_baseline.addArg("--check-baseline");
+        check_baseline.addFileArg(b.path("conformance/native_baseline.tsv"));
+        const native_baseline_check_step = b.step(
+            "native-baseline-check",
+            "Fail when any member is worse than the published native-vs-oracle baseline",
+        );
+        native_baseline_check_step.dependOn(&check_baseline.step);
+        conformance_step.dependOn(native_diff_step);
 
         conformance_step.dependOn(oracle_step);
     } else {

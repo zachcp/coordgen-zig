@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core");
 const model = @import("model");
+const geometry = @import("geometry");
 
 pub const canonical = @import("topology/canonical.zig");
 pub const prepare = @import("topology/prepare.zig");
@@ -261,6 +262,62 @@ pub fn prepareInput(allocator: std.mem.Allocator, input: anytype) core.errors.Er
     };
 }
 
+/// Neighbours of `center` ordered clockwise starting from its first
+/// neighbour, mirroring `sketcherMinimizerAtom::clockwiseOrderedNeighbors`.
+///
+/// The angle is measured from the first neighbour, so the first neighbour
+/// always sorts to zero and the ordering is a rotation of the incidence list
+/// rather than an absolute direction. A degenerate angle sorts last at 361,
+/// exactly as upstream does, so coincident atoms cannot reorder the rest.
+///
+/// `output` must have room for every neighbour; the ordered prefix is
+/// returned.
+pub fn clockwiseOrderedNeighbors(
+    graph: Graph,
+    atoms: []const model.Atom,
+    center: AtomId,
+    output: []AtomId,
+) core.errors.Error![]AtomId {
+    const incident = graph.neighbors(center);
+    if (output.len < incident.len) return error.InvalidMapping;
+    if (incident.len == 0) return output[0..0];
+    if (center.index() >= atoms.len) return error.InvalidMapping;
+
+    const Ranked = struct {
+        angle: f32,
+        atom: AtomId,
+        fn lessThan(_: void, left: @This(), right: @This()) bool {
+            return left.angle < right.angle;
+        }
+    };
+    var ranked: [max_ordered_neighbors]Ranked = undefined;
+    if (incident.len > ranked.len) return error.TooManyItems;
+
+    const origin = atoms[center.index()].coordinates;
+    if (incident[0].index() >= atoms.len) return error.InvalidMapping;
+    const reference = atoms[incident[0].index()].coordinates;
+    for (incident, 0..) |neighbor, index| {
+        if (neighbor.index() >= atoms.len) return error.InvalidMapping;
+        var angle = geometry.signedAngle(reference, origin, atoms[neighbor.index()].coordinates);
+        if (std.math.isNan(angle)) {
+            angle = 361;
+        } else if (angle < 0) {
+            angle += 360;
+        }
+        ranked[index] = .{ .angle = angle, .atom = neighbor };
+    }
+    std.mem.sort(Ranked, ranked[0..incident.len], {}, Ranked.lessThan);
+    for (ranked[0..incident.len], output[0..incident.len]) |entry, *destination| {
+        destination.* = entry.atom;
+    }
+    return output[0..incident.len];
+}
+
+/// Upstream carries no bound here, but a stack buffer needs one. Real
+/// chemistry does not reach it: the pinned corpus tops out well below this,
+/// and exceeding it is an explicit error rather than a truncation.
+const max_ordered_neighbors = 16;
+
 pub const RingMembership = struct {
     allocator: std.mem.Allocator,
     rings: []model.Ring,
@@ -399,6 +456,44 @@ pub const RingMembership = struct {
 
     pub fn atomRings(self: RingMembership, atom: AtomId) []const core.ids.RingId {
         return self.atom_rings[self.atom_ring_offsets[atom.index()]..self.atom_ring_offsets[atom.index() + 1]];
+    }
+
+    /// The ring shared by all three atoms, mirroring
+    /// `sketcherMinimizer::sameRing(at1, at2, at3)` including its two-pass
+    /// shape: a non-macrocyclic shared ring is taken first, and only a
+    /// strictly smaller shared ring replaces it afterwards. Without the first
+    /// pass a macrocycle could win purely by appearing earlier.
+    pub fn sameRing(
+        self: RingMembership,
+        first: AtomId,
+        second: AtomId,
+        third: AtomId,
+    ) ?core.ids.RingId {
+        const first_rings = self.atomRings(first);
+        const second_rings = self.atomRings(second);
+        const third_rings = self.atomRings(third);
+        if (first_rings.len == 0 or second_rings.len == 0 or third_rings.len == 0) return null;
+
+        var selected: ?core.ids.RingId = null;
+        for (first_rings) |ring| {
+            if (self.atoms(ring).len >= rings.macrocycle_size) continue;
+            if (!contains(second_rings, ring) or !contains(third_rings, ring)) continue;
+            selected = ring;
+        }
+        for (first_rings) |ring| {
+            if (!contains(second_rings, ring) or !contains(third_rings, ring)) continue;
+            const current = selected orelse {
+                selected = ring;
+                continue;
+            };
+            if (self.atoms(ring).len < self.atoms(current).len) selected = ring;
+        }
+        return selected;
+    }
+
+    fn contains(haystack: []const core.ids.RingId, needle: core.ids.RingId) bool {
+        for (haystack) |candidate| if (candidate == needle) return true;
+        return false;
     }
 
     pub fn bondRings(self: RingMembership, bond: BondId) []const core.ids.RingId {
@@ -660,7 +755,7 @@ test "component Morgan scoring reports and cleans every allocation failure" {
     const input_bonds = [_]model.Bond{ makeBond(0, 0, 1), makeBond(1, 0, 2) };
     var graph = try Graph.init(std.testing.allocator, &atoms, &input_bonds);
     defer graph.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         scoreAndDiscard,
         .{ graph, &input_bonds },
@@ -699,7 +794,7 @@ test "complete preparation seam matches pinned oracle maps, components, and Morg
     try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(2), AtomId.fromIndex(3) }, prepared.graph.componentMembers(MoleculeId.fromIndex(1)));
     try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1 }, prepared.component_morgan_scores);
 
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         prepareAndDiscard,
         .{ &atoms, &bonds },
@@ -747,7 +842,7 @@ test "ring perception matches pinned oracle cycle and fused probes" {
     );
     try std.testing.expect(!fusion.flags[0].aromatic);
 
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         prepareAndDiscard,
         .{ &fused_atoms, &fused_bonds },
@@ -930,14 +1025,14 @@ test "malformed and allocation-failing atom stereo is rejected cleanly" {
         AtomId.fromIndex(0),
     ));
     fixture[0][0].stereo_atom_b = AtomId.fromIndex(3);
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         resolveTetrahedralAndDiscard,
         .{ &fixture[0], &fixture[1], graph },
     );
     var membership = try RingMembership.init(std.testing.allocator, graph, &fixture[1]);
     defer membership.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         writeTetrahedralAndDiscard,
         .{ &fixture[0], &fixture[1], graph, membership },
@@ -1046,7 +1141,7 @@ test "graph construction reports and cleans up every allocation failure" {
     try constructAndDiscard(counting_allocator.allocator());
     // Seven retained graph arrays plus the temporary adjacency cursor array.
     try std.testing.expectEqual(@as(usize, 8), counting_allocator.alloc_index);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, constructAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, constructAndDiscard, .{});
 }
 
 fn traverseAndDiscard(allocator: std.mem.Allocator, graph: Graph) !void {
@@ -1063,5 +1158,150 @@ test "cut traversal reports and cleans up every allocation failure" {
     try traverseAndDiscard(counting_allocator.allocator(), graph);
     // The visited bitmap and caller-owned result are independently fallible.
     try std.testing.expectEqual(@as(usize, 2), counting_allocator.alloc_index);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, traverseAndDiscard, .{graph});
+    try core.oom.checkAllocationFailures(std.testing.allocator, traverseAndDiscard, .{graph});
+}
+
+test "clockwise neighbour order is a rotation anchored on the first neighbour" {
+    // A star: centre 0 with neighbours at east, north, west and south. The
+    // incidence list order is deliberately not the geometric order.
+    var atoms = [_]model.Atom{
+        .{ .id = AtomId.fromIndex(0), .input_index = 0, .atomic_number = .carbon, .coordinates = .{ .x = 0, .y = 0 } },
+        .{ .id = AtomId.fromIndex(1), .input_index = 1, .atomic_number = .carbon, .coordinates = .{ .x = 50, .y = 0 } },
+        .{ .id = AtomId.fromIndex(2), .input_index = 2, .atomic_number = .carbon, .coordinates = .{ .x = 0, .y = 50 } },
+        .{ .id = AtomId.fromIndex(3), .input_index = 3, .atomic_number = .carbon, .coordinates = .{ .x = -50, .y = 0 } },
+        .{ .id = AtomId.fromIndex(4), .input_index = 4, .atomic_number = .carbon, .coordinates = .{ .x = 0, .y = -50 } },
+    };
+    const bonds = [_]model.Bond{
+        makeTestBond(0, 0, 1),
+        makeTestBond(1, 0, 2),
+        makeTestBond(2, 0, 3),
+        makeTestBond(3, 0, 4),
+    };
+    var graph = try Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+
+    var buffer: [8]AtomId = undefined;
+    const ordered = try clockwiseOrderedNeighbors(graph, &atoms, AtomId.fromIndex(0), &buffer);
+    try std.testing.expectEqual(@as(usize, 4), ordered.len);
+    // Anchored on the first neighbour, then increasing signed angle.
+    try std.testing.expectEqual(AtomId.fromIndex(1), ordered[0]);
+    try std.testing.expectEqual(AtomId.fromIndex(2), ordered[1]);
+    try std.testing.expectEqual(AtomId.fromIndex(3), ordered[2]);
+    try std.testing.expectEqual(AtomId.fromIndex(4), ordered[3]);
+
+    // The 361 guard is for a non-finite angle, which needs a non-finite
+    // coordinate: a neighbour merely coincident with the centre gives
+    // atan2(0, 0) = 0, not NaN, and ties with the reference instead.
+    atoms[3].coordinates = .{ .x = std.math.nan(f32), .y = 0 };
+    const degenerate = try clockwiseOrderedNeighbors(graph, &atoms, AtomId.fromIndex(0), &buffer);
+    try std.testing.expectEqual(AtomId.fromIndex(3), degenerate[degenerate.len - 1]);
+
+    atoms[3].coordinates = .{ .x = 0, .y = 0 };
+    const coincident = try clockwiseOrderedNeighbors(graph, &atoms, AtomId.fromIndex(0), &buffer);
+    try std.testing.expectEqual(@as(usize, 4), coincident.len);
+    try std.testing.expectEqual(AtomId.fromIndex(4), coincident[coincident.len - 1]);
+}
+
+test "clockwise ordering rejects an output slice that cannot hold every neighbour" {
+    const atoms = [_]model.Atom{
+        .{ .id = AtomId.fromIndex(0), .input_index = 0, .atomic_number = .carbon },
+        .{ .id = AtomId.fromIndex(1), .input_index = 1, .atomic_number = .carbon },
+        .{ .id = AtomId.fromIndex(2), .input_index = 2, .atomic_number = .carbon },
+    };
+    const bonds = [_]model.Bond{ makeTestBond(0, 0, 1), makeTestBond(1, 0, 2) };
+    var graph = try Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var buffer: [1]AtomId = undefined;
+    try std.testing.expectError(
+        error.InvalidMapping,
+        clockwiseOrderedNeighbors(graph, &atoms, AtomId.fromIndex(0), &buffer),
+    );
+}
+
+fn makeTestBond(index: u32, start: u32, end: u32) model.Bond {
+    return .{
+        .id = BondId.fromIndex(index),
+        .input_index = index,
+        .start = AtomId.fromIndex(start),
+        .end = AtomId.fromIndex(end),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+}
+
+test "sameRing prefers the smallest shared ring and skips a macrocycle first" {
+    // Two fused rings sharing the 0-1 bond: a 6-ring 0-1-2-3-4-5 and a
+    // 14-membered macrocycle 0-1-6-7-8-9-10-11-12-13-14-15-16-17.
+    const ring_atoms = [_][]const u32{
+        &.{ 0, 1, 2, 3, 4, 5 },
+        &.{ 0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 },
+    };
+    var membership = try buildTestMembership(std.testing.allocator, 18, &ring_atoms);
+    defer membership.deinit();
+
+    // 0, 1 and 2 sit only in the small ring.
+    try std.testing.expectEqual(
+        core.ids.RingId.fromIndex(0),
+        membership.sameRing(AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(2)).?,
+    );
+    // 0, 1 and 6 share only the macrocycle, which is still returned - the
+    // first pass skips macrocycles, the second pass accepts one when it is
+    // the only shared ring.
+    try std.testing.expectEqual(
+        core.ids.RingId.fromIndex(1),
+        membership.sameRing(AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(6)).?,
+    );
+    // An atom in no ring, and three atoms with no ring in common.
+    try std.testing.expect(membership.sameRing(AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(17)) != null);
+    try std.testing.expect(membership.sameRing(AtomId.fromIndex(2), AtomId.fromIndex(3), AtomId.fromIndex(6)) == null);
+}
+
+fn buildTestMembership(
+    allocator: std.mem.Allocator,
+    atom_count: usize,
+    ring_atom_sets: []const []const u32,
+) !RingMembership {
+    var atoms_flat: std.ArrayList(AtomId) = .empty;
+    defer atoms_flat.deinit(allocator);
+    var ring_records: std.ArrayList(model.Ring) = .empty;
+    defer ring_records.deinit(allocator);
+    for (ring_atom_sets, 0..) |set, index| {
+        try ring_records.append(allocator, .{
+            .id = core.ids.RingId.fromIndex(@intCast(index)),
+            .atom_start = @intCast(atoms_flat.items.len),
+            .atom_count = @intCast(set.len),
+            .bond_start = 0,
+            .bond_count = 0,
+        });
+        for (set) |atom| try atoms_flat.append(allocator, AtomId.fromIndex(atom));
+    }
+
+    var atom_ring_list: std.ArrayList(core.ids.RingId) = .empty;
+    defer atom_ring_list.deinit(allocator);
+    const offsets = try allocator.alloc(u32, atom_count + 1);
+    for (0..atom_count) |atom| {
+        offsets[atom] = @intCast(atom_ring_list.items.len);
+        for (ring_atom_sets, 0..) |set, ring| {
+            for (set) |member| {
+                if (member == atom) {
+                    try atom_ring_list.append(allocator, core.ids.RingId.fromIndex(@intCast(ring)));
+                    break;
+                }
+            }
+        }
+    }
+    offsets[atom_count] = @intCast(atom_ring_list.items.len);
+
+    const bond_offsets = try allocator.alloc(u32, 1);
+    bond_offsets[0] = 0;
+    return .{
+        .allocator = allocator,
+        .rings = try allocator.dupe(model.Ring, ring_records.items),
+        .ring_atoms = try allocator.dupe(AtomId, atoms_flat.items),
+        .ring_bonds = try allocator.alloc(BondId, 0),
+        .atom_ring_offsets = offsets,
+        .atom_rings = try allocator.dupe(core.ids.RingId, atom_ring_list.items),
+        .bond_ring_offsets = bond_offsets,
+        .bond_rings = try allocator.alloc(core.ids.RingId, 0),
+    };
 }

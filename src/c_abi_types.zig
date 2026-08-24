@@ -113,7 +113,12 @@ pub const Options = extern struct {
     skip_minimization: u32 = 0,
     force_open_macrocycles: u32 = 0,
     constrain_all_atoms: u32 = 0,
-    build_from_fragments: u32 = 0,
+    /// Formerly `build_from_fragments`; renamed by cgz-r25. The slot accepts
+    /// exactly one value because upstream has no option here to gate (see
+    /// `coordgen_options.reserved` in `include/coordgen_abi.h`). This struct
+    /// is `extern` and bound to that frozen layout, so the slot stays at
+    /// offset 28 under its honest name. Must be zero on input.
+    reserved: u32 = 0,
     debug_coordinates: u32 = 0,
     load_templates: u32 = 1,
     template_directory: StringView = .{},
@@ -216,7 +221,7 @@ test "C DTO widths, alignments, and offsets are frozen on supported 64-bit targe
     try expectOffset(Options, "skip_minimization", 16);
     try expectOffset(Options, "force_open_macrocycles", 20);
     try expectOffset(Options, "constrain_all_atoms", 24);
-    try expectOffset(Options, "build_from_fragments", 28);
+    try expectOffset(Options, "reserved", 28);
     try expectOffset(Options, "debug_coordinates", 32);
     try expectOffset(Options, "load_templates", 36);
     try expectOffset(Options, "template_directory", 40);
@@ -265,7 +270,7 @@ test "C option DTO defaults match the safe Zig option contract" {
     try std.testing.expectEqual(@as(u32, 0), options.skip_minimization);
     try std.testing.expectEqual(@as(u32, 0), options.force_open_macrocycles);
     try std.testing.expectEqual(@as(u32, 0), options.constrain_all_atoms);
-    try std.testing.expectEqual(@as(u32, 0), options.build_from_fragments);
+    try std.testing.expectEqual(@as(u32, 0), options.reserved);
     try std.testing.expectEqual(@as(u32, 0), options.debug_coordinates);
     try std.testing.expectEqual(@as(u32, 1), options.load_templates);
     try std.testing.expect(options.template_directory.ptr == null);

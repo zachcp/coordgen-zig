@@ -2,7 +2,11 @@ const std = @import("std");
 const core = @import("core");
 const model = @import("model");
 const topology = @import("topology");
-const data = @import("templates/data.zig");
+/// The pinned template fixture. Public because the regeneration check
+/// (tests/template_generate.zig) validates these exact tables, and giving
+/// that file its own module over the same source would place one file in two
+/// modules — which Zig rejects as soon as anything reaches the layout layer.
+pub const data = @import("templates/data.zig");
 
 pub const template_count = data.templates.len;
 
@@ -505,7 +509,7 @@ test "template matching rejects nonmatching and malformed graphs" {
 
 test "template matching cleans every injected allocation failure" {
     const edges = comptime fixtureEdges(80);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, findAndDiscard, .{&edges});
+    try core.oom.checkAllocationFailures(std.testing.allocator, findAndDiscard, .{&edges});
 }
 
 test "all 82 immutable templates are structurally matchable" {
@@ -674,7 +678,7 @@ test "ring-set matching cleans every injected allocation failure" {
     defer graph.deinit();
     defer rings.deinit();
     const ring_ids = [_]core.ids.RingId{ core.ids.RingId.fromIndex(0), core.ids.RingId.fromIndex(1) };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, findRingSetAndDiscard, .{ &bonds, rings, &ring_ids });
+    try core.oom.checkAllocationFailures(std.testing.allocator, findRingSetAndDiscard, .{ &bonds, rings, &ring_ids });
 }
 
 const ThreadResult = struct {

@@ -69,12 +69,14 @@ variable:
 | Axis | Baseline | Perturbation |
 |---|---|---|
 | Architecture | native target | the other CPU architecture of the same OS, cross-compiled |
-| Heap address order | platform allocator | `conformance/allocator_order.cpp`: a global `operator new` handing out **descending** addresses |
+| Heap address order | `conformance/allocator_order.cpp`: a global `operator new` handing out **ascending** addresses | the same allocator handing out **descending** addresses |
 
 The allocator axis exists because upstream keys 94 `std::set`/`std::map`
 declarations on object pointers, whose iteration order is heap address order.
 Inverting that order changes every one of those comparisons without touching a
-line of upstream source.
+line of upstream source. Both sides use monotonic allocators because a platform
+allocator does not promise ascending addresses; using one as the control would
+conflate the requested inversion with host- and heap-dependent pointer order.
 
 Both perturbations are compared per **member × observable**, never per member
 alone. That distinction is the point: coordinates going unstable must not
@@ -185,12 +187,34 @@ These are deliberately different artifacts.
   per-(architecture, toolchain, optimize-mode) artifacts, so this file
   describes the build that produced it and is never a cross-platform fixture.
   Regenerate it with `zig build parity-manifest -Denable-oracle=true`.
+- `conformance/parity_ceiling.tsv` is the **enumerated parity ceiling**: the
+  (member, observable) pairs the port is excused from exact comparison on, and
+  the per-pair bound where one is published. It is gated and portable, which
+  neither of the other two can be at once — expectations are fractions that
+  cannot name a member, and the manifest names members but means something
+  different on every host. `cgz-r26` settled this; the consumer contract is in
+  [COMPARISON_SEMANTICS.md](COMPARISON_SEMANTICS.md).
 
-Running the gate:
+The split matters most where it is easiest to lose. Nine rows in the ceiling
+file carry the same information the manifest's `order_unstable` column does at
+this pin, and the temptation is to read the column instead. The column is
+measurement; the file is decision. Reading measurement as decision is how a
+gate starts meaning something different on every machine.
+
+Running the gates:
 
 ```sh
-zig build corpus-check -Denable-oracle=true
+zig build corpus-check -Denable-oracle=true   # measurement vs both ceilings
+zig build parity-ceiling-check                # the enumeration alone, no oracle
 ```
+
+`parity-ceiling-check` regenerates each enumerated member and confirms it still
+hashes to the bytes the row was measured against. The corpus generator is a
+pure function of `(partition, index)` — see [Corpus](#corpus) — so the identity
+survives a toolchain bump, an optimize-mode change, and a different
+architecture. It does not survive an edit to the generator, which would leave
+every row parsing while naming a different molecule. The digest is what makes
+that a failure instead of a silent repoint.
 
 The architecture axis needs a host that can execute the other architecture's
 binaries — Rosetta on aarch64 macOS, `-fqemu` with `qemu-user` on Linux. If it
@@ -205,14 +229,21 @@ disappears from a classification is worse than a red build.
   the exact tier on the whole corpus, not only on the stable partition.
 - `cgz-r13` (parity ceiling): settled in
   [COMPATIBILITY_POLICY.md](COMPATIBILITY_POLICY.md). The ceiling is per
-  observable, is scoped to the **allocator-order axis only**, and is the
-  enumerated `order_unstable` column of `parity_manifest.tsv` rather than any
-  fraction in `parity_expectations.tsv`. At the pin it is four member ×
-  observable groups: `adversarial/917`, `1538`, `1588` (component transforms
-  only, coordinates bit-identical) and `adversarial/1695` (coordinates, 0.580
-  bond lengths). The 1414/2000 architecture figure is **not** a ceiling — the
-  same-build rule means both sides of a differential comparison share an
-  architecture.
+  observable, is scoped to the **allocator-order axis only**, and is an
+  enumerated set rather than any fraction in `parity_expectations.tsv`. At the
+  pin it is four member × observable groups: `adversarial/917`, `1538`, `1588`
+  (component transforms only, coordinates bit-identical) and
+  `adversarial/1695` (coordinates, 0.580 bond lengths). The 1414/2000
+  architecture figure is **not** a ceiling — the same-build rule means both
+  sides of a differential comparison share an architecture.
+- `cgz-r26` (portable home for that enumeration): the authoritative artifact is
+  `conformance/parity_ceiling.tsv`, not the `order_unstable` column of this
+  manifest. The column is the measurement that produced the rows and remains
+  published evidence, but it is per-build, so a gate reading it changes meaning
+  per host. The nine rows expand the four groups to individual pairs, which is
+  what a gate reads.
 - `cgz-7v2.4.2` (differential runner): reuse `tests/oracle_corpus_run.zig`'s
   dump format. Oracle and native must run in the same process, same build,
-  same target.
+  same target. Per pair, call `comparison.differentialComparison` with the
+  order-axis stability and the row from `parity_ceiling.tsv`; it fails closed
+  on an unenumerated unstable pair rather than demoting it.

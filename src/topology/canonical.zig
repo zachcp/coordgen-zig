@@ -267,5 +267,5 @@ test "Morgan ordering reports and cleans every allocation failure" {
             result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{ &atoms, &bonds });
+    try core.oom.checkAllocationFailures(std.testing.allocator, Runner.run, .{ &atoms, &bonds });
 }

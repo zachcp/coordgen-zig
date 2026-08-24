@@ -36,7 +36,7 @@ zig_dto	zig.BondStereoInput	src/api.zig	BondStereoInput	3	src/api.zig::test "zer
 zig_dto	zig.BondInput	src/api.zig	BondInput	7	src/api.zig::test "zero-order, hidden, fixed, constrained, templates, charge, and stereo validate"	executable	-
 zig_dto	zig.ResidueInput	src/api.zig	ResidueInput	4	src/c_abi/exports.zig::.residues = &.{.{ .atom = 9	executable	-
 zig_dto	zig.ResidueInteractionInput	src/api.zig	ResidueInteractionInput	5	src/c_abi/exports.zig::.residue_interactions = &.{.{ .start = 0	executable	-
-zig_dto	zig.Options	src/api.zig	Options	11	src/api.zig::test "complete option table has pinned defaults"	executable	-
+zig_dto	zig.Options	src/api.zig	Options	10	src/api.zig::test "complete option table has pinned defaults"	executable	-
 zig_dto	zig.Input	src/api.zig	Input	6	src/api.zig::test "caller-controlled invalid states return errors"	executable	-
 zig_dto	zig.Result	src/api.zig	Result	8	src/api.zig::test "result allocation has explicit leak-free ownership"	executable	-
 c_dto	c.StringView	src/c_abi_types.zig	StringView	3	tests/abi_layout.c::ASSERT_LAYOUT(coordgen_string_view_t	executable	-

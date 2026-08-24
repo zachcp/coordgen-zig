@@ -1,12 +1,13 @@
 //! Turns oracle corpus dumps into the stability classification and checks it
 //! against the recorded expectations.
 //!
-//! Three dumps of the same corpus are compared: a baseline build, a build for
-//! a different architecture, and a build whose global `operator new` hands out
-//! descending addresses. For every member and every observable the classifier
-//! records whether that observable survived each perturbation, which is the
-//! per-input-per-observable classification cgz-r13 requires: coordinates going
-//! unstable must not silently demote ring sets or fragment trees.
+//! Three dumps of the same corpus are compared: an ascending-address baseline,
+//! an ascending-address build for a different architecture, and a native build
+//! whose global `operator new` hands out descending addresses. For every member
+//! and every observable the classifier records whether that observable survived
+//! each perturbation, which is the per-input-per-observable classification
+//! cgz-r13 requires: coordinates going unstable must not silently demote ring
+//! sets or fragment trees.
 //!
 //! What is gated and what is published are deliberately different things.
 //! Coordinate values and their deviations are per-(architecture, toolchain,
@@ -16,13 +17,22 @@
 //! are allowed to - recorded in conformance/parity_expectations.tsv. The
 //! manifest itself is published evidence, regenerated per build.
 //!
+//! The order axis carries a second, stricter gate. The fraction ceilings in
+//! parity_expectations.tsv bound how often the oracle may disagree with itself
+//! but never say on which members, so an aggregate under budget can hide a
+//! newly unstable member. conformance/parity_ceiling.tsv enumerates the
+//! permitted (member, observable) pairs instead, and this classifier fails on
+//! any order-unstable pair missing from it (cgz-r13, cgz-r26).
+//!
 //! Usage: corpus-classify (--partition NAME --baseline FILE --architecture FILE
-//!            --allocator-order FILE)... --expectations FILE [--manifest FILE]
+//!            --allocator-order FILE)... --expectations FILE --ceiling FILE
+//!            [--manifest FILE]
 
 const std = @import("std");
 const conformance = @import("conformance");
 
 const corpus = conformance.corpus;
+const comparison = conformance.comparison;
 
 /// One bond length in CoordGen units. Deviations are reported in these units
 /// because a raw float distance means nothing without the scale.
@@ -160,6 +170,7 @@ pub fn main(init: std.process.Init) !void {
 
     var inputs: std.ArrayList(PartitionInput) = .empty;
     var expectations_path: ?[]const u8 = null;
+    var ceiling_path: ?[]const u8 = null;
     var manifest_path: ?[]const u8 = null;
 
     const args = try init.minimal.args.toSlice(arena);
@@ -177,6 +188,8 @@ pub fn main(init: std.process.Init) !void {
             (try currentInput(inputs.items)).allocator_order = value;
         } else if (std.mem.eql(u8, args[index], "--expectations")) {
             expectations_path = value;
+        } else if (std.mem.eql(u8, args[index], "--ceiling")) {
+            ceiling_path = value;
         } else if (std.mem.eql(u8, args[index], "--manifest")) {
             manifest_path = value;
         } else {
@@ -187,8 +200,16 @@ pub fn main(init: std.process.Init) !void {
     if (inputs.items.len == 0) return fatal("at least one --partition is required", .{});
     const expectations_file = expectations_path orelse
         return fatal("--expectations is required", .{});
+    // Required, not optional: a gate that silently degrades to the fraction
+    // ceilings when an argument is forgotten is the budget framing cgz-r13
+    // rejected.
+    const ceiling_file = ceiling_path orelse
+        return fatal("--ceiling is required; the enumerated parity ceiling is not optional (cgz-r26)", .{});
 
     const expectations = try readExpectations(arena, io, expectations_file);
+    const ceiling: comparison.CeilingTable = .{ .text = try readFile(arena, io, ceiling_file) };
+    ceiling.validateUnique() catch |err|
+        return fatal("ceiling file '{s}' is malformed: {t}", .{ ceiling_file, err });
 
     var classifications: std.ArrayList(Classification) = .empty;
     var counters: std.StringArrayHashMapUnmanaged(Counter) = .empty;
@@ -214,7 +235,8 @@ pub fn main(init: std.process.Init) !void {
         try writer.interface.flush();
     }
 
-    const failures = try checkExpectations(report, counters, expectations);
+    const failures = try checkExpectations(report, counters, expectations) +
+        try checkCeiling(report, classifications.items, ceiling);
     if (failures != 0) {
         try writeSummary(report, counters);
         try report.flush();
@@ -580,6 +602,71 @@ fn checkExpectations(
     return failures;
 }
 
+/// The enumerated half of the order-axis gate. `checkExpectations` bounds how
+/// many pairs may be order-unstable; this bounds *which*, and the two run
+/// together rather than one replacing the other.
+///
+/// Only the allocator-order axis is checked. The architecture axis is not a
+/// parity ceiling: the differential runner executes oracle and native in one
+/// process, build, and target, so architectural divergence is not a difference
+/// it can observe (cgz-r13).
+fn checkCeiling(
+    out: *std.Io.Writer,
+    classifications: []const Classification,
+    ceiling: comparison.CeilingTable,
+) !usize {
+    var failures: usize = 0;
+    const slot = @backingInt(Axis.allocator_order);
+
+    for (classifications) |classification| {
+        for (classification.unstable[slot].items) |observable_name| {
+            const observable = std.meta.stringToEnum(comparison.Observable, observable_name) orelse {
+                try out.print(
+                    "corpus-classify: dumped observable '{s}' has no comparison.Observable; " ++
+                        "the dump protocol and the comparison enum have drifted apart\n",
+                    .{observable_name},
+                );
+                failures += 1;
+                continue;
+            };
+            if (try ceiling.find(classification.key, observable) != null) continue;
+            try out.print(
+                "corpus-classify: {s}/{s} is order-unstable but is not enumerated in the " ++
+                    "parity ceiling; the ceiling is an enumerated set of (member, observable) " ++
+                    "pairs and never a budget, so this fails closed. Admitting it is a review " ++
+                    "event: add the row with the measurement that placed it there " ++
+                    "(cgz-r13, cgz-r26)\n",
+                .{ classification.key, observable_name },
+            );
+            failures += 1;
+        }
+    }
+
+    // A row is permission, not obligation, so an enumerated pair that happens
+    // to be stable on this host is a pass. A row naming a member this corpus
+    // does not contain is different: the file has stopped describing the
+    // population it was measured on.
+    var rows = ceiling.iterate();
+    while (try rows.next()) |row| {
+        var present = false;
+        for (classifications) |classification| {
+            if (std.mem.eql(u8, classification.key, row.member)) {
+                present = true;
+                break;
+            }
+        }
+        if (present) continue;
+        try out.print(
+            "corpus-classify: the parity ceiling enumerates '{s}', which is not a member " ++
+                "of the classified corpus\n",
+            .{row.member},
+        );
+        failures += 1;
+    }
+
+    return failures;
+}
+
 fn findExpectation(
     expectations: []const Expectation,
     partition: []const u8,
@@ -592,6 +679,51 @@ fn findExpectation(
         if (std.mem.eql(u8, expectation.observable, "*")) wildcard = expectation;
     }
     return wildcard;
+}
+
+const test_digest = "0000000000000000000000000000000000000000000000000000000000000000";
+
+test "an order-unstable pair outside the enumeration fails closed" {
+    const classificationFor = struct {
+        fn build(key: []const u8, order_unstable: std.ArrayList([]const u8)) Classification {
+            return .{
+                .key = key,
+                .partition = "adversarial",
+                .bucket = "medium",
+                .atom_count = 36,
+                .status = "ok",
+                .clean_pose = "0",
+                .unstable = .{ .empty, order_unstable },
+                .max_deviation = @splat(0),
+            };
+        }
+    }.build;
+
+    const ceiling: comparison.CeilingTable = .{
+        .text = "adversarial/1695\tcoordinates\t0.75\t" ++ test_digest ++ "\tcgz-r13\n",
+    };
+
+    var unstable_coordinates: std.ArrayList([]const u8) = .empty;
+    defer unstable_coordinates.deinit(std.testing.allocator);
+    try unstable_coordinates.append(std.testing.allocator, "coordinates");
+
+    var buffer: [8192]u8 = undefined;
+    var out = std.Io.Writer.fixed(&buffer);
+
+    const enumerated = [_]Classification{classificationFor("adversarial/1695", unstable_coordinates)};
+    try std.testing.expectEqual(@as(usize, 0), try checkCeiling(&out, &enumerated, ceiling));
+
+    // The same observable on a member nobody measured is not excused by the
+    // aggregate fraction having room in it.
+    const other_member = [_]Classification{
+        classificationFor("adversarial/1695", .empty),
+        classificationFor("adversarial/7", unstable_coordinates),
+    };
+    try std.testing.expectEqual(@as(usize, 1), try checkCeiling(&out, &other_member, ceiling));
+
+    // A row naming a member outside the corpus is a stale file, not a pass.
+    const missing_member = [_]Classification{classificationFor("adversarial/7", .empty)};
+    try std.testing.expectEqual(@as(usize, 1), try checkCeiling(&out, &missing_member, ceiling));
 }
 
 test "schema rejects observable, member, and input metadata drift" {

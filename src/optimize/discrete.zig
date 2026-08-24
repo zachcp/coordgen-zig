@@ -56,10 +56,8 @@ pub const PoseEvaluator = struct {
         for (self.dofs, states) |*dof, state| {
             if (state >= dof.state.count) return error.InvalidMapping;
             dof.state.current = state;
-            const start = dof.affected_atoms.start;
-            const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
-            if (end > self.affected_atoms.len) return error.InvalidMapping;
-            apply(dof.*, self.affected_atoms[start..end], self.local_coordinates) catch |err| switch (err) {
+            const affected = try affectedAtoms(self.affected_atoms, dof.*);
+            apply(dof.*, affected, self.local_coordinates) catch |err| switch (err) {
                 error.InvalidDofState => return error.InvalidMapping,
                 else => return err,
             };
@@ -168,10 +166,7 @@ pub const FramePoseEvaluator = struct {
         for (self.dofs, states) |*dof, state| {
             if (state >= dof.state.count) return error.InvalidMapping;
             dof.state.current = state;
-            const start = dof.affected_atoms.start;
-            const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
-            if (end > self.affected_atoms.len) return error.InvalidMapping;
-            try applyToFrame(dof.*, self.affected_atoms[start..end], self.pose);
+            try applyToFrame(dof.*, try affectedAtoms(self.affected_atoms, dof.*), self.pose);
         }
         try self.pose.rebuild();
         return self.scorePoseFn(self.score_context, self.pose.global_coordinates, self.dofs);
@@ -792,11 +787,22 @@ fn scoreCoordinate(coordinates: []const core.math.Vec2, atom: core.ids.AtomId) c
     return coordinates[atom.index()];
 }
 
-pub fn affectedAtoms(collection: core.dof.Collection, dof: core.dof.Dof) core.errors.Error![]const core.ids.AtomId {
+/// The atoms one DOF moves, as a checked slice of the collection's flat array.
+///
+/// `core.dof.Dof` stores a start/len range rather than a slice so no DOF owns
+/// pointers, which means every consumer has to bounds-check the range against
+/// the array it came from. This is that check, in one place: it used to be
+/// open-coded identically at both evaluator sites while this function had no
+/// callers at all, which is how the two copies could have drifted apart
+/// unnoticed (cgz-7v2.24).
+pub fn affectedAtoms(
+    collection_atoms: []const core.ids.AtomId,
+    dof: core.dof.Dof,
+) core.errors.Error![]const core.ids.AtomId {
     const start = dof.affected_atoms.start;
     const end = std.math.add(u32, start, dof.affected_atoms.len) catch return error.InvalidMapping;
-    if (end > collection.affected_atoms.len) return error.InvalidMapping;
-    return collection.affected_atoms[start..end];
+    if (end > collection_atoms.len) return error.InvalidMapping;
+    return collection_atoms[start..end];
 }
 
 /// Apply one DOF to fragment-local coordinates. Callers rebuild global
@@ -1329,5 +1335,27 @@ fn allocateSearchState(allocator: std.mem.Allocator) !void {
 }
 
 test "solution bookkeeping and tuple construction clean every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateSearchState, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, allocateSearchState, .{});
+}
+
+test "the affected-atom range is bounds-checked rather than trusted" {
+    const atoms = [_]core.ids.AtomId{
+        core.ids.AtomId.fromIndex(3),
+        core.ids.AtomId.fromIndex(4),
+    };
+    var dof = testDof(.{ .flip_fragment = .{} }, 0, 2);
+
+    dof.affected_atoms = .{ .start = 1, .len = 1 };
+    try std.testing.expectEqualSlices(
+        core.ids.AtomId,
+        atoms[1..2],
+        try affectedAtoms(&atoms, dof),
+    );
+
+    // Past the end, and an end that overflows u32: both are the collection
+    // disagreeing with the range, and neither may produce a slice.
+    dof.affected_atoms = .{ .start = 1, .len = 2 };
+    try std.testing.expectError(error.InvalidMapping, affectedAtoms(&atoms, dof));
+    dof.affected_atoms = .{ .start = std.math.maxInt(u32), .len = 2 };
+    try std.testing.expectError(error.InvalidMapping, affectedAtoms(&atoms, dof));
 }

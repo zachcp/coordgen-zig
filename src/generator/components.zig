@@ -4,6 +4,7 @@ const model = @import("model");
 const geometry = @import("geometry");
 const topology = @import("topology");
 const layout = @import("layout");
+const inversions = @import("inversions.zig");
 
 const Vec2 = core.math.Vec2;
 const Bounds = struct { min: Vec2, max: Vec2 };
@@ -114,30 +115,43 @@ pub fn selectProximityCenter(graph: topology.Graph, relations: []const Proximity
 
 const WeightedAngle = struct { weight: f32, angle: f32 };
 
-/// Apply upstream's global bestRotation/maybeFlip rules to acyclic components.
-/// Ring-fusion and peptide candidate bonuses are deferred until those
-/// controller records are available; affected components are left untouched.
-pub fn orientAcyclicComponents(
+/// Apply upstream's global bestRotation/maybeFlip rules (sketcherMinimizer.cpp
+/// :822 and :612). Both run on every component whose fragments are neither
+/// fixed nor constrained, ring-containing ones included: upstream's only ring
+/// gate is per-atom and applies to the neighbour-pair angle term alone. The
+/// fragment ring and peptide terms need the fragmentation, so a caller that
+/// has none — the residue and proximity meta-molecules, which carry no rings —
+/// passes null and contributes neither (cgz-r31.1).
+pub fn orientComponents(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
     bonds: []const model.Bond,
     graph: topology.Graph,
     rings: topology.RingMembership,
+    fragmentation: ?layout.Fragmentation,
 ) core.errors.Error!void {
+    var analysis: ?topology.rings.Analysis = null;
+    defer if (analysis) |*value| value.deinit();
+    if (fragmentation != null and rings.rings.len != 0) {
+        analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds);
+    }
+
     for (0..graph.component_count) |raw_component| {
         const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
         const members = graph.componentMembers(component);
-        var has_ring = false;
         var constrained = false;
         for (members) |atom| {
-            has_ring = has_ring or rings.atomRings(atom).len != 0;
             constrained = constrained or atoms[atom.index()].fixed or atoms[atom.index()].constrained;
         }
-        if (has_ring or constrained) continue;
+        if (constrained) continue;
 
         var angles: std.ArrayList(WeightedAngle) = .empty;
         defer angles.deinit(allocator);
+        // addBestRotationInfoForPeptides runs before every other term.
+        try addPeptideRotationAngles(allocator, &angles, atoms, bonds, graph, members);
         for (members) |atom| {
+            // Upstream skips ring atoms here and only here.
+            if (rings.atomRings(atom).len != 0) continue;
             if (graph.degree(atom) <= 1) continue;
             const neighbors = graph.neighbors(atom);
             for (neighbors[0 .. neighbors.len - 1], 0..) |first, first_index| {
@@ -171,6 +185,9 @@ pub fn orientAcyclicComponents(
                 if (angle > std.math.pi) angle -= std.math.pi;
             }
         }
+        if (fragmentation) |parts| if (analysis) |fusion| {
+            try addFragmentRingAngles(allocator, &angles, atoms, graph, rings, fusion, parts, component);
+        };
         if (angles.items.len > 1 and
             angles.items[angles.items.len - 1].angle - angles.items[0].angle >= std.math.pi - 2 * geometry.epsilon)
         {
@@ -190,9 +207,230 @@ pub fn orientAcyclicComponents(
                 atoms[atom.index()].coordinates = geometry.add(center, geometry.rotate(relative, sine, cosine));
             }
         }
-        maybeFlipComponent(atoms, bonds, graph, component, members);
+        try maybeFlipComponent(allocator, atoms, bonds, graph, rings, analysis, fragmentation, component, members);
     }
 }
+
+/// One fragment's rings, in ring-index order. Upstream assigns a ring to the
+/// fragment owning its first atom (CoordgenFragmenter.cpp:72) and appends in
+/// molecule ring order, so `rings[0]` and `rings[1]` below are that order.
+const FragmentRings = struct {
+    ids: []core.ids.RingId,
+    len: usize,
+
+    fn slice(self: *const FragmentRings) []const core.ids.RingId {
+        return self.ids[0..self.len];
+    }
+};
+
+/// Walk the component's fragments in id order, handing each one's ring list to
+/// `visit`. Threaded rather than materialised so the two callers — bestRotation's
+/// angle terms and maybeFlip's score terms — share one grouping.
+fn forEachFragmentRings(
+    allocator: std.mem.Allocator,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    parts: layout.Fragmentation,
+    component: core.ids.MoleculeId,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), []const core.ids.RingId) core.errors.Error!void,
+) core.errors.Error!void {
+    if (rings.rings.len == 0) return;
+    const owner = allocator.alloc(core.ids.FragmentId, rings.rings.len) catch return error.OutOfMemory;
+    defer allocator.free(owner);
+    for (owner, 0..) |*value, index| {
+        const ring = core.ids.RingId.fromIndex(@intCast(index));
+        const members = rings.atoms(ring);
+        if (members.len == 0) return error.InvalidMapping;
+        value.* = parts.atom_fragment[members[0].index()];
+    }
+    var buffer: FragmentRings = .{
+        .ids = allocator.alloc(core.ids.RingId, rings.rings.len) catch return error.OutOfMemory,
+        .len = 0,
+    };
+    defer allocator.free(buffer.ids);
+    for (parts.fragments) |fragment| {
+        const fragment_atoms = parts.members(fragment.id);
+        if (fragment_atoms.len == 0) continue;
+        if (graph.component(fragment_atoms[0]) != component) continue;
+        buffer.len = 0;
+        for (owner, 0..) |value, index| {
+            if (value != fragment.id) continue;
+            buffer.ids[buffer.len] = core.ids.RingId.fromIndex(@intCast(index));
+            buffer.len += 1;
+        }
+        try visit(context, buffer.slice());
+    }
+}
+
+fn ringCenter(atoms: []const model.Atom, members: []const core.ids.AtomId) Vec2 {
+    var result: Vec2 = .{};
+    for (members) |atom| {
+        result.x += atoms[atom.index()].coordinates.x;
+        result.y += atoms[atom.index()].coordinates.y;
+    }
+    result.x /= @floatFromInt(members.len);
+    result.y /= @floatFromInt(members.len);
+    return result;
+}
+
+const RingAngleContext = struct {
+    allocator: std.mem.Allocator,
+    angles: *std.ArrayList(WeightedAngle),
+    atoms: []const model.Atom,
+    rings: topology.RingMembership,
+    fusion: topology.rings.Analysis,
+};
+
+/// bestRotation's per-fragment ring terms (sketcherMinimizer.cpp:910-975).
+fn addFragmentRingAngles(
+    allocator: std.mem.Allocator,
+    angles: *std.ArrayList(WeightedAngle),
+    atoms: []const model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    fusion: topology.rings.Analysis,
+    parts: layout.Fragmentation,
+    component: core.ids.MoleculeId,
+) core.errors.Error!void {
+    var context = RingAngleContext{
+        .allocator = allocator,
+        .angles = angles,
+        .atoms = atoms,
+        .rings = rings,
+        .fusion = fusion,
+    };
+    try forEachFragmentRings(allocator, graph, rings, parts, component, &context, addRingAnglesOfFragment);
+}
+
+fn addRingAnglesOfFragment(
+    context: *RingAngleContext,
+    fragment_rings: []const core.ids.RingId,
+) core.errors.Error!void {
+    if (fragment_rings.len == 2) {
+        const first = ringCenter(context.atoms, context.rings.atoms(fragment_rings[0]));
+        const second = ringCenter(context.atoms, context.rings.atoms(fragment_rings[1]));
+        const direction = geometry.subtract(second, first);
+        try addAngle(context.allocator, context.angles, 25, std.math.atan2(-direction.y, direction.x));
+        return;
+    }
+    if (fragment_rings.len == 3) {
+        var first = ringCenter(context.atoms, context.rings.atoms(fragment_rings[0]));
+        var second = ringCenter(context.atoms, context.rings.atoms(fragment_rings[1]));
+        // The first ring fused to exactly two others across two two-atom
+        // fusions replaces both reference points with the fusion midpoints.
+        for (fragment_rings) |ring| {
+            const fusions = context.fusion.fusedWith(ring);
+            if (fusions.len != 2) continue;
+            const left = context.fusion.fusionAtoms(fusions[0]);
+            const right = context.fusion.fusionAtoms(fusions[1]);
+            if (left.len != 2 or right.len != 2) continue;
+            first = fusionMidpoint(context.atoms, left[0], left[1]);
+            second = fusionMidpoint(context.atoms, right[0], right[1]);
+            break;
+        }
+        const direction = geometry.subtract(second, first);
+        try addAngle(context.allocator, context.angles, 50, std.math.atan2(-direction.y, direction.x));
+        return;
+    }
+    for (fragment_rings) |ring| {
+        if (context.rings.atoms(ring).len != 6) continue;
+        for (context.fusion.fusedWith(ring)) |entry| {
+            const shared = context.fusion.fusionAtoms(entry);
+            if (shared.len != 2) continue;
+            const direction = geometry.subtract(
+                context.atoms[shared[0].index()].coordinates,
+                context.atoms[shared[1].index()].coordinates,
+            );
+            try addAngle(
+                context.allocator,
+                context.angles,
+                25,
+                std.math.atan2(-direction.y, direction.x) - std.math.pi * 0.5,
+            );
+        }
+    }
+}
+
+fn fusionMidpoint(atoms: []const model.Atom, left: core.ids.AtomId, right: core.ids.AtomId) Vec2 {
+    return .{
+        .x = (atoms[left.index()].coordinates.x + atoms[right.index()].coordinates.x) * 0.5,
+        .y = (atoms[left.index()].coordinates.y + atoms[right.index()].coordinates.y) * 0.5,
+    };
+}
+
+/// The direction each alpha carbon's amino nitrogen takes from its cheto
+/// carbon. Upstream reads it twice — once as a rotation angle at weight 1000
+/// and once as a flip score of +/-100 — from the same classification, whose
+/// two-of-each-class guard lives in the peptide *constraint* builder and not in
+/// the classifiers, so no count threshold applies here.
+fn forEachPeptideDirection(
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    members: []const core.ids.AtomId,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), Vec2) core.errors.Error!void,
+) core.errors.Error!void {
+    for (members) |candidate| {
+        if (atoms[candidate.index()].atomic_number != .carbon) continue;
+        if (try inversions.isChetoCarbon(candidate, atoms, bonds, graph)) continue;
+        var amino: ?core.ids.AtomId = null;
+        var cheto: ?core.ids.AtomId = null;
+        var bonded_to_cheto = false;
+        var bonded_to_amino = false;
+        for (graph.neighbors(candidate)) |neighbor| {
+            if (atoms[neighbor.index()].atomic_number == .nitrogen) {
+                bonded_to_amino = true;
+                amino = neighbor;
+            } else if (try inversions.isChetoCarbon(neighbor, atoms, bonds, graph)) {
+                bonded_to_cheto = true;
+                cheto = neighbor;
+            }
+        }
+        if (!bonded_to_cheto or !bonded_to_amino) continue;
+        const amino_atom = amino orelse continue;
+        const cheto_atom = cheto orelse continue;
+        try visit(context, geometry.subtract(
+            atoms[amino_atom.index()].coordinates,
+            atoms[cheto_atom.index()].coordinates,
+        ));
+    }
+}
+
+const PeptideAngleContext = struct {
+    allocator: std.mem.Allocator,
+    angles: *std.ArrayList(WeightedAngle),
+};
+
+fn addPeptideRotationAngles(
+    allocator: std.mem.Allocator,
+    angles: *std.ArrayList(WeightedAngle),
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    members: []const core.ids.AtomId,
+) core.errors.Error!void {
+    var context = PeptideAngleContext{ .allocator = allocator, .angles = angles };
+    try forEachPeptideDirection(atoms, bonds, graph, members, &context, addPeptideAngle);
+}
+
+fn addPeptideAngle(context: *PeptideAngleContext, direction: Vec2) core.errors.Error!void {
+    try addAngle(context.allocator, context.angles, 1000, std.math.atan2(-direction.y, direction.x));
+}
+
+fn addPeptideFlipScore(score_x: *f32, direction: Vec2) core.errors.Error!void {
+    const peptide_score: f32 = 100;
+    if (direction.x > 0) score_x.* -= peptide_score else score_x.* += peptide_score;
+}
+
+const RingFlipContext = struct {
+    score_x: *f32,
+    score_y: *f32,
+    atoms: []const model.Atom,
+    rings: topology.RingMembership,
+    fusion: topology.rings.Analysis,
+};
 
 fn addAngle(allocator: std.mem.Allocator, angles: *std.ArrayList(WeightedAngle), weight: f32, raw_angle: f32) core.errors.Error!void {
     var angle = roundToTwo(raw_angle);
@@ -209,13 +447,35 @@ fn addAngle(allocator: std.mem.Allocator, angles: *std.ArrayList(WeightedAngle),
     angles.append(allocator, .{ .weight = weight, .angle = angle }) catch return error.OutOfMemory;
 }
 
-fn maybeFlipComponent(atoms: []model.Atom, bonds: []const model.Bond, graph: topology.Graph, component: core.ids.MoleculeId, members: []const core.ids.AtomId) void {
+fn maybeFlipComponent(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    analysis: ?topology.rings.Analysis,
+    fragmentation: ?layout.Fragmentation,
+    component: core.ids.MoleculeId,
+    members: []const core.ids.AtomId,
+) core.errors.Error!void {
     if (members.len < 2) return;
-    const center = componentCenter(atoms, members);
-    const bounds = componentBounds(atoms, members);
-    const midpoint = Vec2{ .x = (bounds.max.x + bounds.min.x) * 0.5, .y = (bounds.max.y + bounds.min.y) * 0.5 };
     var score_x: f32 = 0;
     var score_y: f32 = 0;
+    // maybeFlipPeptides runs before every other term and scores X only.
+    try forEachPeptideDirection(atoms, bonds, graph, members, &score_x, addPeptideFlipScore);
+    if (fragmentation) |parts| if (analysis) |fusion| {
+        var context = RingFlipContext{
+            .score_x = &score_x,
+            .score_y = &score_y,
+            .atoms = atoms,
+            .rings = rings,
+            .fusion = fusion,
+        };
+        try forEachFragmentRings(allocator, graph, rings, parts, component, &context, scoreRingFlipOfFragment);
+    };
+    const center = componentCenter(atoms, members);
+    const bounds = flipBounds(atoms, members);
+    const midpoint = Vec2{ .x = (bounds.max.x + bounds.min.x) * 0.5, .y = (bounds.max.y + bounds.min.y) * 0.5 };
     if (midpoint.x - center.x > geometry.epsilon) score_x -= 0.5 else if (midpoint.x - center.x < -geometry.epsilon) score_x += 0.5;
     if (midpoint.y - center.y > geometry.epsilon) score_y += 0.5 else if (midpoint.y - center.y < -geometry.epsilon) score_y -= 0.5;
     for (bonds) |bond| {
@@ -233,6 +493,89 @@ fn maybeFlipComponent(atoms: []model.Atom, bonds: []const model.Bond, graph: top
     for (members) |atom| {
         if (score_y < 0) atoms[atom.index()].coordinates.y = -atoms[atom.index()].coordinates.y;
         if (score_x < 0) atoms[atom.index()].coordinates.x = -atoms[atom.index()].coordinates.x;
+    }
+}
+
+/// maybeFlip's own extent loop, quirk included: upstream chains the maximum
+/// test behind `else` (sketcherMinimizer.cpp:693-706), so an atom that sets a
+/// new minimum is never considered for the maximum — the first atom can never
+/// set one. Seeds are upstream's literals, not the first atom's coordinates.
+/// `componentBounds` is a true bounding box and belongs to other phases; this
+/// is deliberately not that function.
+fn flipBounds(atoms: []const model.Atom, members: []const core.ids.AtomId) Bounds {
+    var result = Bounds{
+        .min = .{ .x = 9999, .y = 9999 },
+        .max = .{ .x = -9999, .y = -9999 },
+    };
+    for (members) |atom| {
+        const coordinate = atoms[atom.index()].coordinates;
+        if (coordinate.x < result.min.x) {
+            result.min.x = coordinate.x;
+        } else if (coordinate.x > result.max.x) {
+            result.max.x = coordinate.x;
+        }
+        if (coordinate.y < result.min.y) {
+            result.min.y = coordinate.y;
+        } else if (coordinate.y > result.max.y) {
+            result.max.y = coordinate.y;
+        }
+    }
+    return result;
+}
+
+/// maybeFlip's per-fragment ring terms (sketcherMinimizer.cpp:634-691).
+fn scoreRingFlipOfFragment(
+    context: *RingFlipContext,
+    fragment_rings: []const core.ids.RingId,
+) core.errors.Error!void {
+    if (fragment_rings.len == 2) {
+        var first = fragment_rings[0];
+        var second = fragment_rings[1];
+        var first_center = ringCenter(context.atoms, context.rings.atoms(first));
+        var second_center = ringCenter(context.atoms, context.rings.atoms(second));
+        if (first_center.x - second_center.x > geometry.epsilon) {
+            std.mem.swap(core.ids.RingId, &first, &second);
+            std.mem.swap(Vec2, &first_center, &second_center);
+        }
+        const first_benzene = context.fusion.flags[first.index()].benzene;
+        const second_benzene = context.fusion.flags[second.index()].benzene;
+        if (second_benzene and !first_benzene) {
+            context.score_x.* -= 20;
+        } else if (first_benzene and !second_benzene) {
+            context.score_x.* += 20;
+        }
+    }
+    if (fragment_rings.len > 3) {
+        var center: Vec2 = .{};
+        var weighted: Vec2 = .{};
+        var total_atoms: usize = 0;
+        var total_rings: usize = 0;
+        for (fragment_rings) |ring| {
+            const ring_atoms = context.rings.atoms(ring);
+            if (ring_atoms.len < 4) continue;
+            const ring_center = ringCenter(context.atoms, ring_atoms);
+            center = geometry.add(center, ring_center);
+            weighted.x += ring_center.x * @as(f32, @floatFromInt(ring_atoms.len));
+            weighted.y += ring_center.y * @as(f32, @floatFromInt(ring_atoms.len));
+            total_atoms += ring_atoms.len;
+            total_rings += 1;
+        }
+        if (total_rings != 0 and total_atoms != 0) {
+            center.x /= @floatFromInt(total_rings);
+            center.y /= @floatFromInt(total_rings);
+            weighted.x /= @floatFromInt(total_atoms);
+            weighted.y /= @floatFromInt(total_atoms);
+        }
+        if (weighted.y - center.y < -geometry.epsilon) {
+            context.score_y.* += 50;
+        } else if (weighted.y - center.y > geometry.epsilon) {
+            context.score_y.* -= 50;
+        }
+        if (weighted.x - center.x < -geometry.epsilon) {
+            context.score_x.* += 50;
+        } else if (weighted.x - center.x > geometry.epsilon) {
+            context.score_x.* -= 50;
+        }
     }
 }
 
@@ -582,7 +925,7 @@ fn generateMetaCoordinates(
     var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
     defer fragmentation.deinit();
     try layout.initializeCoordinates(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, fragmentation);
-    try orientAcyclicComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
+    try orientComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, null);
 
     const coordinates = allocator.alloc(Vec2, meta_atoms.len) catch return error.OutOfMemory;
     for (meta_atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
@@ -1134,7 +1477,7 @@ test "isolated acyclic bond rotates to the upstream horizontal preference" {
     defer graph.deinit();
     var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
     defer rings.deinit();
-    try orientAcyclicComponents(std.testing.allocator, &atoms, &bonds, graph, rings);
+    try orientComponents(std.testing.allocator, &atoms, &bonds, graph, rings, null);
     try std.testing.expectApproxEqAbs(atoms[0].coordinates.y, atoms[1].coordinates.y, 0.05);
     try std.testing.expectApproxEqAbs(core.math.bond_length, @abs(atoms[1].coordinates.x - atoms[0].coordinates.x), 0.001);
 }
@@ -1238,7 +1581,7 @@ test "neutral component placement cleans every allocation failure" {
     }};
     var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
     defer graph.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeAndDiscard, .{ &atoms, graph });
+    try core.oom.checkAllocationFailures(std.testing.allocator, arrangeAndDiscard, .{ &atoms, graph });
 }
 
 test "component arrangement ignores residue-only components" {
@@ -1288,7 +1631,7 @@ test "proximity arrangement compacts excluded residue components and cleans allo
         .end = core.ids.AtomId.fromIndex(2),
     }};
     const excluded = [_]bool{ false, false, false, true };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, arrangeProximityExcludingAndDiscard, .{
+    try core.oom.checkAllocationFailures(std.testing.allocator, arrangeProximityExcludingAndDiscard, .{
         &source_atoms,
         &bonds,
         &relations,
