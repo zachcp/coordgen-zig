@@ -99,8 +99,8 @@ fn initializeCoordinatesInternal(
             // atom happens to be first. The parent-side atom is seeded one bond
             // length along -x, which is also the direction the neighbour
             // placement starts rotating from.
-            const start = attachmentAtom(bonds, fragmentation, fragment) orelse members[0];
-            if (parentEndpoint(bonds, fragmentation, fragment)) |parent_atom| {
+            const start = attachmentOf(fragment) orelse members[0];
+            if (parentAtomOf(fragment)) |parent_atom| {
                 atoms[parent_atom.index()].coordinates = .{ .x = -bond_length, .y = 0 };
             }
             atoms[start.index()].coordinates = .{};
@@ -156,7 +156,7 @@ fn initializeCoordinatesInternal(
         fallbackOnValid3dCoordinates(atoms, members);
         alignConstrainedMainFragment(atoms, fragmentation, fragment);
         restoreFixedFragmentCoordinates(atoms, fragmentation, fragment);
-        frames.store(atoms, bonds, fragmentation, fragment);
+        frames.store(atoms, fragmentation, fragment);
     }
     try placeFragmentsFromFrames(allocator, atoms, bonds, graph, fragmentation, frames);
     restoreFixedCoordinates(atoms);
@@ -202,16 +202,15 @@ const FragmentFrames = struct {
     fn store(
         self: FragmentFrames,
         atoms: []const model.Atom,
-        bonds: []const model.Bond,
         fragmentation: fragments.Fragmentation,
         fragment: fragments.Fragment,
     ) void {
         const members = fragmentation.members(fragment.id);
         var origin: core.math.Vec2 = .{};
         var angle: f32 = 0;
-        if (attachmentAtom(bonds, fragmentation, fragment)) |attachment_atom| {
+        if (attachmentOf(fragment)) |attachment_atom| {
             origin = atoms[attachment_atom.index()].coordinates;
-            const parent_atom = parentEndpoint(bonds, fragmentation, fragment).?;
+            const parent_atom = parentAtomOf(fragment).?;
             const parent_position = atoms[parent_atom.index()].coordinates;
             angle = std.math.atan2(parent_position.y - origin.y, origin.x - parent_position.x);
         } else if (!fragment.flags.constrained and !fragment.flags.fixed) {
@@ -222,7 +221,7 @@ const FragmentFrames = struct {
         }
         for (fragmentation.fragments) |candidate| {
             if (candidate.parent != fragment.id) continue;
-            const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+            const child_attachment = attachmentOf(candidate) orelse continue;
             self.attachment[candidate.id.index()] =
                 rotateClockwise(subtract(atoms[child_attachment.index()].coordinates, origin), -angle);
         }
@@ -258,8 +257,8 @@ fn placeFragmentsFromFrames(
             if (fragmentDepth(fragmentation.fragments, fragment.id) != depth) continue;
             var position: core.math.Vec2 = .{};
             var angle: f32 = 0;
-            if (attachmentAtom(bonds, fragmentation, fragment)) |attachment_atom| {
-                const parent_atom = parentEndpoint(bonds, fragmentation, fragment) orelse return error.InvalidMapping;
+            if (attachmentOf(fragment)) |attachment_atom| {
+                const parent_atom = parentAtomOf(fragment) orelse return error.InvalidMapping;
                 position = atoms[attachment_atom.index()].coordinates;
                 const direction = subtract(position, atoms[parent_atom.index()].coordinates);
                 angle = std.math.atan2(-direction.y, direction.x);
@@ -272,7 +271,7 @@ fn placeFragmentsFromFrames(
                 if (!fragment.flags.fixed and !fragment.flags.constrained and
                     shouldInvertAgainstParent(atoms, bonds, graph, fragmentation, frames, fragment, angle, scratch))
                 {
-                    mirrorFragmentFrame(bonds, fragmentation, frames, fragment);
+                    mirrorFragmentFrame(fragmentation, frames, fragment);
                 }
             } else if (fragment.parent.isValid()) {
                 return error.InvalidMapping;
@@ -282,7 +281,7 @@ fn placeFragmentsFromFrames(
             }
             for (fragmentation.fragments) |candidate| {
                 if (candidate.parent != fragment.id) continue;
-                const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+                const child_attachment = attachmentOf(candidate) orelse continue;
                 atoms[child_attachment.index()].coordinates =
                     add(rotateClockwise(frames.attachment[candidate.id.index()], angle), position);
             }
@@ -290,26 +289,18 @@ fn placeFragmentsFromFrames(
     }
 }
 
-/// The end of the bond to the parent that lies inside this fragment.
-fn attachmentAtom(
-    bonds: []const model.Bond,
-    fragmentation: fragments.Fragmentation,
-    fragment: fragments.Fragment,
-) ?core.ids.AtomId {
-    if (!fragment.bond_to_parent.isValid()) return null;
-    const bond = bonds[fragment.bond_to_parent.index()];
-    return if (fragmentation.atom_fragment[bond.start.index()] == fragment.id) bond.start else bond.end;
+/// The end of `bond_to_parent` inside this fragment, and the end outside it.
+///
+/// Both are resolved once by `Fragmentation`, by membership, and only read
+/// back here. Deliberately never recomputed from the bond's stored direction:
+/// native keeps bonds child-first, so `.start` is not the parent's end the way
+/// upstream's fragmenter guarantees, and reading it fails silently (cgz-jg4).
+fn attachmentOf(fragment: fragments.Fragment) ?core.ids.AtomId {
+    return if (fragment.attachment_atom.isValid()) fragment.attachment_atom else null;
 }
 
-/// The other end of that bond, which lies in the parent fragment.
-fn parentEndpoint(
-    bonds: []const model.Bond,
-    fragmentation: fragments.Fragmentation,
-    fragment: fragments.Fragment,
-) ?core.ids.AtomId {
-    const attachment = attachmentAtom(bonds, fragmentation, fragment) orelse return null;
-    const bond = bonds[fragment.bond_to_parent.index()];
-    return if (attachment == bond.start) bond.end else bond.start;
+fn parentAtomOf(fragment: fragments.Fragment) ?core.ids.AtomId {
+    return if (fragment.parent_atom.isValid()) fragment.parent_atom else null;
 }
 
 fn placeFragmentRings(
@@ -837,7 +828,6 @@ fn coordinateCenter(coordinates: []const core.math.Vec2) core.math.Vec2 {
 pub fn captureFragmentFrames(
     allocator: std.mem.Allocator,
     atoms: []const model.Atom,
-    bonds: []const model.Bond,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!core.dof.FrameCollection {
     const frame_count = fragmentation.fragments.len;
@@ -867,15 +857,9 @@ pub fn captureFragmentFrames(
             .attachments = .{ .start = attachment_offset, .len = child_count },
         };
         if (fragment.parent.isValid()) {
-            if (!fragment.bond_to_parent.isValid() or fragment.bond_to_parent.index() >= bonds.len) return error.InvalidMapping;
-            const bond = bonds[fragment.bond_to_parent.index()];
-            if (fragmentation.atom_fragment[bond.start.index()] == fragment.id) {
-                frame.anchor_atom = bond.start;
-                frame.parent_atom = bond.end;
-            } else if (fragmentation.atom_fragment[bond.end.index()] == fragment.id) {
-                frame.anchor_atom = bond.end;
-                frame.parent_atom = bond.start;
-            } else return error.InvalidMapping;
+            if (!fragment.attachment_atom.isValid() or !fragment.parent_atom.isValid()) return error.InvalidMapping;
+            frame.anchor_atom = fragment.attachment_atom;
+            frame.parent_atom = fragment.parent_atom;
         }
         attachment_offset += child_count;
     }
@@ -1566,20 +1550,21 @@ fn collectTerminalBonds(
     }
     for (fragmentation.fragments) |candidate| {
         if (candidate.parent != fragment.id or !candidate.bond_to_parent.isValid()) continue;
-        const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
-        const parent_side = parentEndpoint(bonds, fragmentation, candidate) orelse continue;
+        if (!candidate.attachment_atom.isValid() or !candidate.parent_atom.isValid()) continue;
         if (count == out.len) return out[0..count];
-        out[count] = .{ .id = candidate.bond_to_parent, .start = parent_side, .end = child_attachment };
+        out[count] = .{ .id = candidate.bond_to_parent, .start = candidate.parent_atom, .end = candidate.attachment_atom };
         count += 1;
     }
     if (fragment.bond_to_parent.isValid() and count != out.len) {
         // Oriented outward, so `scoreDirections`'s "starts in this fragment"
         // test skips it exactly as upstream's does.
-        if (attachmentAtom(bonds, fragmentation, fragment)) |inside| {
-            if (parentEndpoint(bonds, fragmentation, fragment)) |outside| {
-                out[count] = .{ .id = fragment.bond_to_parent, .start = outside, .end = inside };
-                count += 1;
-            }
+        if (fragment.attachment_atom.isValid() and fragment.parent_atom.isValid()) {
+            out[count] = .{
+                .id = fragment.bond_to_parent,
+                .start = fragment.parent_atom,
+                .end = fragment.attachment_atom,
+            };
+            count += 1;
         }
     }
     return out[0..count];
@@ -1623,7 +1608,6 @@ fn assignLongestChains(
 /// attachment atom of each of its children; both are stored here, in the two
 /// halves of `FragmentFrames`.
 fn frameCoordinate(
-    bonds: []const model.Bond,
     fragmentation: fragments.Fragmentation,
     frames: FragmentFrames,
     fragment: fragments.Fragment,
@@ -1632,7 +1616,7 @@ fn frameCoordinate(
     if (fragmentation.atom_fragment[atom.index()] == fragment.id) return frames.own[atom.index()];
     for (fragmentation.fragments) |candidate| {
         if (candidate.parent != fragment.id) continue;
-        const child_attachment = attachmentAtom(bonds, fragmentation, candidate) orelse continue;
+        const child_attachment = attachmentOf(candidate) orelse continue;
         if (child_attachment == atom) return frames.attachment[candidate.id.index()];
     }
     return frames.own[atom.index()];
@@ -1675,8 +1659,8 @@ fn findDirectionsToAlignWith(
     scratch: SideChoiceScratch,
 ) usize {
     const parent = fragmentation.fragments[fragment.parent.index()];
-    const attachment = attachmentAtom(bonds, fragmentation, fragment) orelse return 0;
-    const parent_atom = parentEndpoint(bonds, fragmentation, fragment) orelse return 0;
+    const attachment = attachmentOf(fragment) orelse return 0;
+    const parent_atom = parentAtomOf(fragment) orelse return 0;
     const origin = scale(add(
         atoms[parent_atom.index()].coordinates,
         atoms[attachment.index()].coordinates,
@@ -1744,8 +1728,8 @@ fn shouldInvertAgainstParent(
     for (collectTerminalBonds(bonds, graph, fragmentation, fragment, scratch.own_bonds)) |bond| {
         if (fragmentation.atom_fragment[bond.start.index()] != fragment.id) continue;
         const midpoint = scale(add(
-            frameCoordinate(bonds, fragmentation, frames, fragment, bond.start),
-            frameCoordinate(bonds, fragmentation, frames, fragment, bond.end),
+            frameCoordinate(fragmentation, frames, fragment, bond.start),
+            frameCoordinate(fragmentation, frames, fragment, bond.end),
         ), 0.5);
         // The frame's own origin for this purpose is half a bond length back
         // along -x, which is where the bond to the parent enters it.
@@ -1787,7 +1771,6 @@ fn shouldInvertAgainstParent(
 /// the drug-like partition (`bond_displays` 7/7), and flipping here as well
 /// would invert it twice.
 fn mirrorFragmentFrame(
-    bonds: []const model.Bond,
     fragmentation: fragments.Fragmentation,
     frames: FragmentFrames,
     fragment: fragments.Fragment,
@@ -1797,7 +1780,7 @@ fn mirrorFragmentFrame(
     }
     for (fragmentation.fragments) |candidate| {
         if (candidate.parent != fragment.id) continue;
-        if (attachmentAtom(bonds, fragmentation, candidate) == null) continue;
+        if (attachmentOf(candidate) == null) continue;
         frames.attachment[candidate.id.index()].y = -frames.attachment[candidate.id.index()].y;
     }
 }
@@ -1983,10 +1966,9 @@ fn layoutWithOptionsAndDiscard(
 fn captureFramesAndDiscard(
     allocator: std.mem.Allocator,
     atoms: []const model.Atom,
-    bonds: []const model.Bond,
     split: fragments.Fragmentation,
 ) !void {
-    var frames = try captureFragmentFrames(allocator, atoms, bonds, split);
+    var frames = try captureFragmentFrames(allocator, atoms, split);
     defer frames.deinit();
 }
 
@@ -2154,7 +2136,7 @@ test "fragment assembly preserves every acyclic parent bond length" {
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
-    var frames = try captureFragmentFrames(std.testing.allocator, &atoms, &bonds, split);
+    var frames = try captureFragmentFrames(std.testing.allocator, &atoms, split);
     defer frames.deinit();
     try std.testing.expectEqual(split.fragments.len, frames.frames.len);
     try std.testing.expectEqual(split.fragments.len - 1, frames.child_attachments.len);
@@ -2170,7 +2152,7 @@ test "fragment assembly preserves every acyclic parent bond length" {
     try core.oom.checkAllocationFailures(
         std.testing.allocator,
         captureFramesAndDiscard,
-        .{ &atoms, &bonds, split },
+        .{ &atoms, split },
     );
     const first = atoms;
     try layoutFixture(&atoms, &bonds);

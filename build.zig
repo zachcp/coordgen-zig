@@ -525,6 +525,18 @@ pub fn build(b: *std.Build) !void {
     module_graph_step.dependOn(&module_import_check.step);
     module_graph_step.dependOn(&module_import_self_test.step);
 
+    // A fragment's bond to its parent has no reliable stored direction here:
+    // native keeps bonds in canonical input order, which on the drug_like
+    // corpus is child-first, while upstream's fragmenter mutates the molecule
+    // so `startAtom` is always the parent's end. Transcribing that read
+    // directly fails silently, and did (cgz-jg4). Fragment.attachment_atom and
+    // Fragment.parent_atom are resolved once by membership; this rejects any
+    // source that goes back to the bond. --self-test is the negative fixture.
+    const bond_orientation_check = b.addSystemCommand(&.{ "tools/check-bond-orientation", "src" });
+    const bond_orientation_self_test = b.addSystemCommand(&.{ "tools/check-bond-orientation", "--self-test" });
+    module_graph_step.dependOn(&bond_orientation_check.step);
+    module_graph_step.dependOn(&bond_orientation_self_test.step);
+
     // Its own step, deliberately not part of `test`, because it is RED on
     // landing and says so: six public entry points of the layout and optimize
     // layers have no caller outside their own tests (cgz-7v2.24). That is the

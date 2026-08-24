@@ -967,8 +967,9 @@ fn appendSpecializedDofs(
     if (tail == 0) {
         var start = members[0];
         if (fragment.parent.isValid()) {
-            const parent_bond = bonds[fragment.bond_to_parent.index()];
-            start = if (fragmentation.atom_fragment[parent_bond.start.index()] == fragment.id) parent_bond.start else parent_bond.end;
+            // The attachment end, resolved by Fragmentation rather than read
+            // off the bond's stored direction (cgz-jg4).
+            if (fragment.attachment_atom.isValid()) start = fragment.attachment_atom;
         }
         queue[0] = start;
         tail = 1;
