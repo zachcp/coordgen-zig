@@ -1319,6 +1319,28 @@ pub fn build(b: *std.Build) !void {
             "Regenerate the published native-vs-oracle baseline from this build",
         );
         native_baseline_step.dependOn(&publish_baseline.step);
+
+        // The gate that reads the baseline back (cgz-zsm). Deliberately a
+        // third run of the binary rather than a flag on either of the two
+        // above: the publisher rewrites the file unconditionally, so a gate
+        // sharing that run could never fail, and the differential's own run
+        // exits non-zero while the port is red, which would mask this
+        // verdict behind one everybody is already waiting on. It reports the
+        // mismatches without failing on them, and fails only on a number
+        // worse than the one recorded.
+        const check_baseline = b.addRunArtifact(native_diff);
+        check_baseline.expectExitCode(0);
+        check_baseline.addArgs(&.{ "--partition", "drug_like" });
+        check_baseline.addArg("--ceiling");
+        check_baseline.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        check_baseline.addArgs(&.{ "--on-mismatch", "record" });
+        check_baseline.addArg("--check-baseline");
+        check_baseline.addFileArg(b.path("conformance/native_baseline.tsv"));
+        const native_baseline_check_step = b.step(
+            "native-baseline-check",
+            "Fail when any member is worse than the published native-vs-oracle baseline",
+        );
+        native_baseline_check_step.dependOn(&check_baseline.step);
         conformance_step.dependOn(native_diff_step);
 
         conformance_step.dependOn(oracle_step);
