@@ -29,6 +29,10 @@ pub const Outcome = struct {
     minimization_required: bool = false,
 };
 
+/// Lay out with a DOF collection this call owns. For callers with no
+/// optimizer to share one with - the residue and component meta-molecule
+/// builders, and the layout tests - collecting here keeps the DOF set
+/// derived from exactly the molecule being laid out.
 pub fn initializeCoordinates(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
@@ -37,9 +41,17 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
-    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, .{});
+    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, membership, fragmentation);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, .{});
 }
 
+/// `dofs` is borrowed for the duration of the call and must have been
+/// collected from this same molecule: `collectAllDofs` is purely topological,
+/// so a generation can collect once before layout and share the result with
+/// the discrete pass afterwards (cgz-7v2.28). Passing another molecule's
+/// collection - an open-cycle temporary's, say - would index atoms and
+/// fragments that do not correspond.
 pub fn initializeCoordinatesWithOptions(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
@@ -47,9 +59,10 @@ pub fn initializeCoordinatesWithOptions(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
+    dofs: core.dof.Collection,
     options: Options,
 ) core.errors.Error!Outcome {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, options);
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, options);
 }
 
 fn initializeCoordinatesInternal(
@@ -59,8 +72,12 @@ fn initializeCoordinatesInternal(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
+    dofs: core.dof.Collection,
     options: Options,
 ) core.errors.Error!Outcome {
+    // Held for the layout-phase stages that upstream gates on
+    // `fragment->getDofsOfAtom(a).empty()`; see cgz-7v2.24.
+    _ = dofs;
     var outcome: Outcome = .{};
     // Ring fusion structure is needed by the central-ring priority, and is
     // derived once for the whole molecule rather than per fragment.
@@ -669,6 +686,17 @@ fn openCycleAndGenerateCoordinates(
     defer temporary_rings.deinit();
     var temporary_fragments = try fragments.Fragmentation.init(allocator, temporary_atoms, temporary_bonds, temporary_graph, temporary_rings);
     defer temporary_fragments.deinit();
+    // The temporary molecule has a bond removed and therefore its own
+    // fragmentation, so it needs its own DOF collection. Reusing the caller's
+    // here would describe a different graph.
+    var temporary_dofs = try macrocycle.collectAllDofs(
+        allocator,
+        temporary_bonds,
+        temporary_graph,
+        temporary_rings,
+        temporary_fragments,
+    );
+    defer temporary_dofs.deinit();
     _ = try initializeCoordinatesInternal(
         allocator,
         temporary_atoms,
@@ -676,6 +704,7 @@ fn openCycleAndGenerateCoordinates(
         temporary_graph,
         temporary_rings,
         temporary_fragments,
+        temporary_dofs,
         .{ .force_open_macrocycles = true },
     );
     for (atoms, temporary_atoms, placed) |*atom, temporary_atom, *is_placed| {
@@ -1919,7 +1948,9 @@ test "macrocycles dispatch through native polyomino placement" {
     try std.testing.expect(hex_edges > 0);
 
     const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
-    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, .{ .force_open_macrocycles = true });
+    var opened_dofs = try macrocycle.collectAllDofs(std.testing.allocator, &bonds, graph, rings, split);
+    defer opened_dofs.deinit();
+    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, opened_dofs, .{ .force_open_macrocycles = true });
     for (bonds) |bond| {
         if (bond.id == opened) continue;
         try std.testing.expectApproxEqAbs(
@@ -1973,7 +2004,9 @@ fn layoutWithOptionsAndDiscard(
 ) !void {
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
-    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, .{ .force_open_macrocycles = force_open_macrocycles });
+    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, rings, split);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, dofs, .{ .force_open_macrocycles = force_open_macrocycles });
 }
 
 fn captureFramesAndDiscard(
