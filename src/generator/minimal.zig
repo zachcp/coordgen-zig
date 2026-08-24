@@ -466,7 +466,7 @@ fn optimizeDiscrete(
     }
     if (dofs.items.len == 0) return false;
 
-    var frame_data = try layout.captureFragmentFrames(allocator, atoms, bonds, fragmentation);
+    var frame_data = try layout.captureFragmentFrames(allocator, atoms, fragmentation);
     defer frame_data.deinit();
     const local_atoms = allocator.dupe(core.math.Vec2, frame_data.atom_coordinates) catch return error.OutOfMemory;
     defer allocator.free(local_atoms);

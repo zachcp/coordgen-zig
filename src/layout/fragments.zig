@@ -15,6 +15,17 @@ pub const Fragment = struct {
     component: core.ids.MoleculeId,
     parent: core.ids.FragmentId = .invalid,
     bond_to_parent: core.ids.BondId = .invalid,
+    /// The two ends of `bond_to_parent`, resolved once by fragment membership
+    /// so no caller has to work them out from the bond's stored direction.
+    ///
+    /// Upstream can read `_bondToParent->startAtom` directly because
+    /// CoordgenFragmenter mutates the molecule to guarantee it is the parent's
+    /// end (CoordgenFragmenter.cpp:406-422, with an assert). Native keeps
+    /// bonds in canonical input order, which on the drug_like corpus is
+    /// child-first, so that guarantee does not hold and reading `.start`
+    /// selects the wrong atom - silently (cgz-jg4).
+    attachment_atom: core.ids.AtomId = .invalid,
+    parent_atom: core.ids.AtomId = .invalid,
     atom_start: u32,
     atom_count: u32,
     ring_count: u32,
@@ -325,6 +336,12 @@ fn assignParents(allocator: std.mem.Allocator, records: []Fragment, atom_fragmen
                 if (child == main or records[child.index()].parent.isValid()) continue;
                 records[child.index()].parent = current;
                 records[child.index()].bond_to_parent = bond_id;
+                // Orientation is known here - `child` is the fragment being
+                // attached - so it is resolved once rather than rediscovered
+                // at every use site.
+                const child_is_start = start == child;
+                records[child.index()].attachment_atom = if (child_is_start) bond.start else bond.end;
+                records[child.index()].parent_atom = if (child_is_start) bond.end else bond.start;
                 queue[tail] = child;
                 tail += 1;
             }
