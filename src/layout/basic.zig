@@ -772,11 +772,24 @@ fn alignFusedRing(
         mirror_score += distance(mirror, parent_center);
     }
     const use_mirror = mirror_score > first_score;
-    for (ordered, local) |atom, coordinate| if (!placed[atom.index()]) {
+    // Every atom of the ring is written, the shared ones included, which
+    // overwrites what the parent ring gave them. Upstream does exactly this -
+    // `buildRing`'s two-or-more fusion-atom branch ends in an unconditional
+    // `atoms[i]->setCoordinates(targetCoords[i])` over the whole ring
+    // (CoordgenFragmentBuilder.cpp:532-534).
+    //
+    // Skipping already-placed atoms looks conservative and is not. On a
+    // BRIDGED system the rings share three atoms rather than two, so leaving
+    // those three where the first ring put them pins the second ring at three
+    // points and it can no longer hold its own shape. Measured on drug_like/3,
+    // whose 7-ring is bridged to a 13-macrocycle across atoms 5, 10 and 16:
+    // upstream's heptagon is regular, every atom 1.150 to 1.154 from the
+    // centre, and native's spanned 1.140 to 1.171 (cgz-vu0).
+    for (ordered, local) |atom, coordinate| {
         const candidate = transformFromPivot(coordinate, source_first, target_first, rotation);
         atoms[atom.index()].coordinates = if (use_mirror) reflectAcrossLine(candidate, target_first, target_last) else candidate;
         placed[atom.index()] = true;
-    };
+    }
 }
 
 fn transformFromPivot(point: core.math.Vec2, source: core.math.Vec2, target: core.math.Vec2, rotation: f32) core.math.Vec2 {
