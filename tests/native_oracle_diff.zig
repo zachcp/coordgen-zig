@@ -163,6 +163,9 @@ pub fn main(init: std.process.Init) !void {
 
     var counters: [public_observables.len]Counter = @splat(.{});
     var totals = Totals{};
+    // Owned by the run, not the arena: the list grows through `gpa` in
+    // compareCoordinateObservable, so it has to be returned there too.
+    defer totals.member_deviations.deinit(gpa);
 
     for (0..count) |raw_index| {
         const member_index: u32 = @intCast(raw_index);
