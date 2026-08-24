@@ -111,6 +111,14 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.rings,
     );
     defer fragmentation.deinit();
+    var dofs = try layout.macrocycle.collectAllDofs(
+        allocator,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        fragmentation,
+    );
+    defer dofs.deinit();
     const layout_outcome = try layout.initializeCoordinatesWithOptions(
         allocator,
         prepared.working.atoms,
@@ -118,6 +126,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.graph,
         prepared.rings,
         fragmentation,
+        dofs,
         .{
             .force_open_macrocycles = input.options.force_open_macrocycles,
             .templates = .{
@@ -133,6 +142,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.graph,
         prepared.rings,
         fragmentation,
+        dofs,
         input.options.precision,
         residue_atoms,
     );
@@ -372,12 +382,11 @@ fn optimizeDiscrete(
     graph: topology.Graph,
     rings: topology.RingMembership,
     fragmentation: layout.Fragmentation,
+    dofs: core.dof.Collection,
     precision: f32,
     excluded_atoms: []const bool,
 ) core.errors.Error!bool {
     if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
-    var dofs = try layout.macrocycle.collectAllDofs(allocator, bonds, graph, rings, fragmentation);
-    defer dofs.deinit();
 
     const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_has_dofs);

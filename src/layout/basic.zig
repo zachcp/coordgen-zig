@@ -37,7 +37,9 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
-    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, .{});
+    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, membership, fragmentation);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, .{});
 }
 
 pub fn initializeCoordinatesWithOptions(
@@ -47,9 +49,10 @@ pub fn initializeCoordinatesWithOptions(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
+    dofs: core.dof.Collection,
     options: Options,
 ) core.errors.Error!Outcome {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, options);
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, options);
 }
 
 fn initializeCoordinatesInternal(
@@ -59,8 +62,10 @@ fn initializeCoordinatesInternal(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
+    dofs: core.dof.Collection,
     options: Options,
 ) core.errors.Error!Outcome {
+    _ = dofs;
     var outcome: Outcome = .{};
     // Ring fusion structure is needed by the central-ring priority, and is
     // derived once for the whole molecule rather than per fragment.
@@ -669,6 +674,14 @@ fn openCycleAndGenerateCoordinates(
     defer temporary_rings.deinit();
     var temporary_fragments = try fragments.Fragmentation.init(allocator, temporary_atoms, temporary_bonds, temporary_graph, temporary_rings);
     defer temporary_fragments.deinit();
+    var temporary_dofs = try macrocycle.collectAllDofs(
+        allocator,
+        temporary_bonds,
+        temporary_graph,
+        temporary_rings,
+        temporary_fragments,
+    );
+    defer temporary_dofs.deinit();
     _ = try initializeCoordinatesInternal(
         allocator,
         temporary_atoms,
@@ -676,6 +689,7 @@ fn openCycleAndGenerateCoordinates(
         temporary_graph,
         temporary_rings,
         temporary_fragments,
+        temporary_dofs,
         .{ .force_open_macrocycles = true },
     );
     for (atoms, temporary_atoms, placed) |*atom, temporary_atom, *is_placed| {
@@ -1919,7 +1933,9 @@ test "macrocycles dispatch through native polyomino placement" {
     try std.testing.expect(hex_edges > 0);
 
     const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
-    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, .{ .force_open_macrocycles = true });
+    var dofs = try macrocycle.collectAllDofs(std.testing.allocator, &bonds, graph, rings, split);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, dofs, .{ .force_open_macrocycles = true });
     for (bonds) |bond| {
         if (bond.id == opened) continue;
         try std.testing.expectApproxEqAbs(
@@ -1973,7 +1989,9 @@ fn layoutWithOptionsAndDiscard(
 ) !void {
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
-    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, .{ .force_open_macrocycles = force_open_macrocycles });
+    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, rings, split);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, dofs, .{ .force_open_macrocycles = force_open_macrocycles });
 }
 
 fn captureFramesAndDiscard(
