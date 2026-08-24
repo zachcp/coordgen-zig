@@ -439,6 +439,22 @@ pub fn build(b: *std.Build) !void {
         .root_module = native_minimal_module,
     });
     const run_native_minimal_tests = b.addRunArtifact(native_minimal_tests);
+    const native_determinism_module = b.createModule(.{
+        .root_source_file = b.path("tests/native_determinism.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api", .module = api },
+            .{ .name = "core", .module = core },
+        },
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    const native_determinism_tests = b.addTest(.{
+        .name = "native-determinism-test",
+        .root_module = native_determinism_module,
+    });
+    const run_native_determinism_tests = b.addRunArtifact(native_determinism_tests);
     const layer_tests = b.addTest(.{
         .name = "module-layer-test",
         .root_module = module_layers,
@@ -465,6 +481,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_conformance_tests.step);
     test_step.dependOn(&run_corpus_classify_tests.step);
     test_step.dependOn(&run_native_minimal_tests.step);
+    test_step.dependOn(&run_native_determinism_tests.step);
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 

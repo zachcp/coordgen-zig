@@ -698,6 +698,69 @@ test "coordgen_generate is repeatable and independent across concurrent contexts
     try std.testing.expectEqualSlices(core.math.Vec2, &first, &second);
 }
 
+/// The seam `coordgen_generate` delegates to, driven with an injectable
+/// allocator. The export itself pins `generation_allocator` because the
+/// installed library is std-only and the ABI promises thread safety, so it
+/// cannot take one from the caller; everything it does before delegating is
+/// field validation that allocates nothing. Sweeping the seam is therefore
+/// sweeping the entry point.
+fn generateThroughSafeApiAndDiscard(allocator: std.mem.Allocator, input: *const Input) !void {
+    var result: Result = .{};
+    switch (generateThroughSafeApi(allocator, input, &result)) {
+        .ok => {},
+        .out_of_memory => {
+            // The contract in coordgen_abi.h is that a failed generation
+            // leaves the result zeroed and needing no cleanup. Assert that
+            // rather than assuming it, since a partially published result
+            // escaping here would leak through the C boundary where no
+            // errdefer can reach it.
+            if (result.owner != null) return error.PartialResultEscaped;
+            return error.OutOfMemory;
+        },
+        else => |code| {
+            std.debug.print("unexpected error code: {t}\n", .{code});
+            return error.UnexpectedErrorCode;
+        },
+    }
+    coordgen_result_free(&result);
+}
+
+test "coordgen_generate reports and cleans up failure at every allocation index" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{}, .{} };
+    // Atom 3 carries the residue and must therefore have no structural bond:
+    // a residue representative is placed by the residue phase, not laid out.
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = 1 },
+        .{ .start = 1, .end = 2, .order = 2 },
+    };
+    const residues = [_]ResidueInput{
+        .{ .atom = 3, .chain = .{ .ptr = "A", .len = 1 }, .residue_number = 9, .closest_ligand_atom = 1 },
+    };
+    const interactions = [_]ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    // Residues and interactions are included so the sweep reaches the
+    // conversion allocations that a bare atoms-and-bonds input never makes.
+    const input: Input = .{
+        .atoms = .{ .ptr = &atoms, .len = atoms.len },
+        .bonds = .{ .ptr = &bonds, .len = bonds.len },
+        .residues = .{ .ptr = &residues, .len = residues.len },
+        .residue_interactions = .{ .ptr = &interactions, .len = interactions.len },
+    };
+
+    // Discharge the first-call warm-up, so the counting run inside
+    // checkAllocationFailures does not overcount and leave the last index
+    // unexercised.
+    try generateThroughSafeApiAndDiscard(std.testing.allocator, &input);
+    var leak_check = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try generateThroughSafeApiAndDiscard(leak_check.allocator(), &input);
+    try std.testing.expectEqual(leak_check.allocated_bytes, leak_check.freed_bytes);
+
+    try core.oom.checkAllocationFailures(
+        std.testing.allocator,
+        generateThroughSafeApiAndDiscard,
+        .{&input},
+    );
+}
+
 test "coordgen_result_free is a safe no-op on a zeroed (failure) result" {
     var result: Result = .{};
     coordgen_result_free(&result);
