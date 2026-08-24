@@ -1115,7 +1115,12 @@ fn componentsClash(atoms: []const model.Atom, graph: topology.Graph, distance: f
     return false;
 }
 
-fn singleAdditionVector(
+/// `sketcherMinimizerAtom::getSingleAdditionVector`: the direction away from
+/// an atom's neighbours, weighted four to one in favour of ring neighbours.
+/// It is a function of the pose, so a caller scoring a candidate pose has to
+/// recompute it rather than reuse a stored one - see
+/// `proximityScoreSites`.
+pub fn singleAdditionVector(
     atoms: []const model.Atom,
     graph: topology.Graph,
     rings: topology.RingMembership,
@@ -1133,6 +1138,61 @@ fn singleAdditionVector(
     }
     if (total_weight != 0) output = geometry.scale(output, 1 / total_weight);
     return geometry.scale(output, -1);
+}
+
+/// The static half of upstream's per-molecule proximity relation lists, in
+/// upstream's iteration order: molecules outer, that molecule's relations
+/// inner (`CoordgenMinimizer::scoreProximityRelationsOnOppositeSides`).
+///
+/// A relation is pushed into BOTH endpoint molecules' `m_proximityRelations`
+/// (sketcherMinimizer.cpp:266-270), so one joining two molecules produces two
+/// sites, each seeing the other molecule as the far side. Upstream skips a
+/// molecule with fewer than two atoms, and so does this.
+///
+/// Only the addition vector is missing, because only it depends on the pose.
+pub const ProximityScoreSite = struct {
+    local_atom: core.ids.AtomId,
+    local_molecule: core.ids.MoleculeId,
+    local_fragment: core.ids.FragmentId,
+    other_molecule: core.ids.MoleculeId,
+};
+
+pub fn proximityScoreSites(
+    allocator: std.mem.Allocator,
+    graph: topology.Graph,
+    atom_fragment: []const core.ids.FragmentId,
+    relations: []const ProximityRelation,
+) core.errors.Error![]ProximityScoreSite {
+    var sites: std.ArrayList(ProximityScoreSite) = .empty;
+    defer sites.deinit(allocator);
+    for (0..graph.component_count) |raw_component| {
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+        if (graph.componentMembers(component).len < 2) continue;
+        for (relations) |relation| {
+            // Upstream pushes the start endpoint unconditionally and the end
+            // endpoint whenever it is a different ATOM - not a different
+            // molecule - so a relation with both ends inside one molecule
+            // appears twice in that molecule's list. Both copies are then
+            // skipped by the scorer's own `otherMol == m` guard, but they are
+            // emitted here so the list is the same list upstream builds.
+            const ends = [_]struct { local: core.ids.AtomId, other: core.ids.AtomId }{
+                .{ .local = relation.start, .other = relation.end },
+                .{ .local = relation.end, .other = relation.start },
+            };
+            for (ends, 0..) |end, index| {
+                if (index == 1 and relation.end == relation.start) continue;
+                if ((graph.component(end.local) orelse return error.InvalidMapping) != component) continue;
+                if (end.local.index() >= atom_fragment.len) return error.InvalidMapping;
+                sites.append(allocator, .{
+                    .local_atom = end.local,
+                    .local_molecule = component,
+                    .local_fragment = atom_fragment[end.local.index()],
+                    .other_molecule = graph.component(end.other) orelse return error.InvalidMapping,
+                }) catch return error.OutOfMemory;
+            }
+        }
+    }
+    return sites.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 fn shareRing(rings: topology.RingMembership, first: core.ids.AtomId, second: core.ids.AtomId) bool {
@@ -1443,6 +1503,100 @@ test "proximity center uses relation count then size with first-wins ties" {
         .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(0) },
     };
     try std.testing.expectEqual(core.ids.MoleculeId.fromIndex(1), try selectProximityCenter(graph, &more_relations));
+}
+
+test "proximity score sites follow upstream's molecule-outer order and both-endpoint push" {
+    // Two two-atom molecules, 0-1 and 2-3, with no bond between them.
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 200), testAtom(3, 250) };
+    const pairs = [_][2]u32{ .{ 0, 1 }, .{ 2, 3 } };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const atom_fragment = [_]core.ids.FragmentId{
+        core.ids.FragmentId.fromIndex(0),
+        core.ids.FragmentId.fromIndex(0),
+        core.ids.FragmentId.fromIndex(1),
+        core.ids.FragmentId.fromIndex(1),
+    };
+    const relations = [_]ProximityRelation{
+        .{ .start = core.ids.AtomId.fromIndex(1), .end = core.ids.AtomId.fromIndex(2) },
+        .{ .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(1) },
+    };
+
+    const sites = try proximityScoreSites(std.testing.allocator, graph, &atom_fragment, &relations);
+    defer std.testing.allocator.free(sites);
+    // Molecule 0 first, its relations in list order; the intramolecular
+    // relation 0-1 contributes BOTH its endpoints, as upstream's list does.
+    // Then molecule 1, which only sees the crossing relation, from the other
+    // side.
+    const expected = [_]ProximityScoreSite{
+        .{
+            .local_atom = core.ids.AtomId.fromIndex(1),
+            .local_molecule = core.ids.MoleculeId.fromIndex(0),
+            .local_fragment = core.ids.FragmentId.fromIndex(0),
+            .other_molecule = core.ids.MoleculeId.fromIndex(1),
+        },
+        .{
+            .local_atom = core.ids.AtomId.fromIndex(0),
+            .local_molecule = core.ids.MoleculeId.fromIndex(0),
+            .local_fragment = core.ids.FragmentId.fromIndex(0),
+            .other_molecule = core.ids.MoleculeId.fromIndex(0),
+        },
+        .{
+            .local_atom = core.ids.AtomId.fromIndex(1),
+            .local_molecule = core.ids.MoleculeId.fromIndex(0),
+            .local_fragment = core.ids.FragmentId.fromIndex(0),
+            .other_molecule = core.ids.MoleculeId.fromIndex(0),
+        },
+        .{
+            .local_atom = core.ids.AtomId.fromIndex(2),
+            .local_molecule = core.ids.MoleculeId.fromIndex(1),
+            .local_fragment = core.ids.FragmentId.fromIndex(1),
+            .other_molecule = core.ids.MoleculeId.fromIndex(0),
+        },
+    };
+    try std.testing.expectEqualSlices(ProximityScoreSite, &expected, sites);
+
+    // A one-atom molecule is skipped, as upstream skips `m->_atoms.size() < 2`.
+    var lone = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 200) };
+    const lone_bonds = [_]model.Bond{bonds[0]};
+    var lone_graph = try topology.Graph.init(std.testing.allocator, &lone, &lone_bonds);
+    defer lone_graph.deinit();
+    const lone_relations = [_]ProximityRelation{
+        .{ .start = core.ids.AtomId.fromIndex(1), .end = core.ids.AtomId.fromIndex(2) },
+    };
+    const lone_sites = try proximityScoreSites(
+        std.testing.allocator,
+        lone_graph,
+        atom_fragment[0..3],
+        &lone_relations,
+    );
+    defer std.testing.allocator.free(lone_sites);
+    try std.testing.expectEqual(@as(usize, 1), lone_sites.len);
+    try std.testing.expectEqual(core.ids.AtomId.fromIndex(1), lone_sites[0].local_atom);
+
+    try core.oom.checkAllocationFailures(
+        std.testing.allocator,
+        proximityScoreSitesAndDiscard,
+        .{ graph, @as([]const core.ids.FragmentId, &atom_fragment), @as([]const ProximityRelation, &relations) },
+    );
+}
+
+fn proximityScoreSitesAndDiscard(
+    allocator: std.mem.Allocator,
+    graph: topology.Graph,
+    atom_fragment: []const core.ids.FragmentId,
+    relations: []const ProximityRelation,
+) !void {
+    allocator.free(try proximityScoreSites(allocator, graph, atom_fragment, relations));
 }
 
 test "residue interactions are reserved for residue placement" {

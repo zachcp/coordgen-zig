@@ -431,6 +431,40 @@ test "public generation reports and cleans up every allocation failure" {
     );
 }
 
+test "a zero-order bond between two components generates and reaches the proximity term" {
+    // Two three-atom chains joined only by a zero-order bond, which
+    // preparation turns into a proximity relation rather than a graph edge.
+    // This is the input class that makes
+    // `scoreProximityRelationsOnOppositeSides` contribute to the discrete
+    // score; the drug_like differential partition contains no such member, so
+    // this is where the path is exercised at all (cgz-7v2.24).
+    // Eight atoms: a six-atom chain 0..5 and a two-atom partner 6-7, with
+    // BOTH ends of the chain zero-order bonded to atom 6. Two relations from
+    // one molecule to the same other molecule is what makes the term able to
+    // be non-zero: with a single relation the pairing loop has nothing to pair
+    // and the penalty is structurally zero.
+    const atoms = [_]AtomInput{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} };
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 4 },
+        .{ .start = 4, .end = 5 },
+        .{ .start = 6, .end = 7 },
+        .{ .start = 0, .end = 6, .order = .zero },
+        .{ .start = 5, .end = 6, .order = .zero },
+    };
+    var result = try generate(std.testing.allocator, .{ .atoms = &atoms, .bonds = &bonds });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, atoms.len), result.coordinates.len);
+    for (result.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    // The two components are placed apart rather than left on top of each
+    // other, which is what proves the proximity arrangement ran at all.
+    const first = result.coordinates[0];
+    const last = result.coordinates[7];
+    try std.testing.expect(@abs(first.x - last.x) + @abs(first.y - last.y) > bond_length);
+}
+
 test "bond length and named precision values are conserved" {
     try std.testing.expectEqual(@as(f32, 50), bond_length);
     try std.testing.expectEqual(@as(f32, 0.2), Precision.quick);
