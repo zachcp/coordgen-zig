@@ -2,11 +2,20 @@
 #include <cstring>
 #include <new>
 
+#ifndef CGZ_ALLOCATOR_DESCENDING
+#define CGZ_ALLOCATOR_DESCENDING 1
+#endif
+
 int main()
 {
     void* first = ::operator new(0);
     void* second = ::operator new(0);
     if (first == nullptr || second == nullptr || first == second) return 1;
+#if CGZ_ALLOCATOR_DESCENDING
+    if (reinterpret_cast<std::uintptr_t>(first) <= reinterpret_cast<std::uintptr_t>(second)) return 3;
+#else
+    if (reinterpret_cast<std::uintptr_t>(first) >= reinterpret_cast<std::uintptr_t>(second)) return 3;
+#endif
     std::memset(first, 0xA5, 1);
     std::memset(second, 0x5A, 1);
     ::operator delete(first);

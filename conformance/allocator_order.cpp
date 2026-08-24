@@ -1,18 +1,21 @@
-/* Heap-address-order adversary for the oracle stability classification.
+/* Deterministic heap-address-order control for the oracle stability
+ * classification.
  *
  * Upstream keys 94 std::set/std::map declarations on pointers to
  * sketcherMinimizerAtom, Ring, Molecule, and Fragment, so their iteration
- * order is heap address order. An allocator that hands out *descending* addresses
- * inverts every one of those comparisons without changing a line of upstream
- * source: `atom0 < atom1` becomes false where it was true.
+ * order is heap address order. The baseline and architecture runners define
+ * CGZ_ALLOCATOR_DESCENDING=0 and receive ascending addresses. The adversarial
+ * runner defines it to 1 and receives descending addresses, inverting every
+ * one of those comparisons without changing upstream source: `atom0 < atom1`
+ * becomes false where it was true.
  *
- * Linking this translation unit into an oracle build is therefore the whole
- * pointer-order axis of the 2x2 classification. It is linked only into the
- * descending variant; the ascending variant keeps the platform allocator.
+ * Both sides must use this translation unit. A platform allocator does not
+ * promise ascending addresses, so comparing it with the descending allocator
+ * made the measured member set depend on the host and residual heap layout.
  *
- * Nothing is ever returned to the pool, because reusing an address would hand
- * out one that is no longer monotonically descending. The reservation is
- * therefore sized for a whole corpus run: address space, not memory. A
+ * Nothing is ever returned to the pool, because reuse would break monotonic
+ * address order. The reservation is therefore sized for a whole corpus run:
+ * address space, not memory. A
  * 2000-member adversarial run walks about 8 GiB of addresses while touching
  * roughly 330 MiB of pages, so the reservation is large and the resident set
  * is not.
@@ -28,12 +31,16 @@
 #include <new>
 #include <sys/mman.h>
 
+#ifndef CGZ_ALLOCATOR_DESCENDING
+#define CGZ_ALLOCATOR_DESCENDING 1
+#endif
+
 namespace
 {
 
-/* One large reservation, consumed downward. The bump pointer never wraps or
- * reuses - either behaviour would reintroduce ascending addresses - so the
- * reservation has to cover every allocation a corpus run makes. */
+/* One large reservation, consumed in the selected direction. The bump pointer
+ * never wraps or reuses, so the reservation has to cover every allocation a
+ * corpus run makes. */
 constexpr std::size_t kPoolBytes = 1ull << 35;
 constexpr std::size_t kAlignment = 64;
 
@@ -57,10 +64,14 @@ void initPool()
     void* reservation = mmap(nullptr, kPoolBytes, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (reservation == MAP_FAILED) std::abort();
     pool_base = static_cast<char*>(reservation);
+#if CGZ_ALLOCATOR_DESCENDING
     pool_cursor = pool_base + kPoolBytes;
+#else
+    pool_cursor = pool_base;
+#endif
 }
 
-void* allocateDescending(std::size_t size, std::size_t alignment)
+void* allocateMonotonic(std::size_t size, std::size_t alignment)
 {
     if (pool_base == nullptr) initPool();
     if (alignment < kAlignment) alignment = kAlignment;
@@ -71,11 +82,21 @@ void* allocateDescending(std::size_t size, std::size_t alignment)
     }
     const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(pool_base);
     const std::uintptr_t cursor = reinterpret_cast<std::uintptr_t>(pool_cursor);
+#if CGZ_ALLOCATOR_DESCENDING
     if (cursor - base < requested) allocationFailure("descending pool exhausted");
     const std::uintptr_t next = (cursor - requested) & ~(alignment - 1);
     if (next < base) allocationFailure("descending pool exhausted after alignment");
     pool_cursor = reinterpret_cast<char*>(next);
     return pool_cursor;
+#else
+    const std::uintptr_t aligned = (cursor + alignment - 1) & ~(alignment - 1);
+    const std::uintptr_t end = base + kPoolBytes;
+    if (aligned < cursor || aligned > end || requested > end - aligned) {
+        allocationFailure("ascending pool exhausted");
+    }
+    pool_cursor = reinterpret_cast<char*>(aligned + requested);
+    return reinterpret_cast<void*>(aligned);
+#endif
 }
 
 bool isPoolPointer(void* pointer)
@@ -90,18 +111,18 @@ bool isPoolPointer(void* pointer)
 
 void* operator new(std::size_t size)
 {
-    return allocateDescending(size, alignof(std::max_align_t));
+    return allocateMonotonic(size, alignof(std::max_align_t));
 }
 
 void* operator new(std::size_t size, std::align_val_t alignment)
 {
-    return allocateDescending(size, static_cast<std::size_t>(alignment));
+    return allocateMonotonic(size, static_cast<std::size_t>(alignment));
 }
 
 void operator delete(void* pointer) noexcept
 {
     /* Pool memory is never reused: reuse would hand out an address that is no
-     * longer monotonically descending. The pool is released with the process. */
+     * longer monotonic. The pool is released with the process. */
     if (isPoolPointer(pointer)) return;
     std::free(pointer);
 }

@@ -50,13 +50,13 @@ drug_like	component_transforms	1.0	0.0
 drug_like	component_transforms_set	1.0	0.0
 
 adversarial	*	0.0	0.0
-# Measured 1414/2000 arch (70.7%), 1/2000 order (0.05%). The arch number is
-# floating-point jitter moving the discrete search into a different local
-# minimum; it is bounded here, not excused, and the same-build rule keeps it
-# out of differential comparison entirely. The order number is the parity
-# ceiling population: one member, adversarial/1695, at 0.580 bond lengths.
-# Order headroom 0.002 allows 4 of 2000 against 1 measured; arch headroom 0.75
-# allows 1500 against 1414.
+# Measured 1414/2000 arch (70.7%). The arch number is floating-point jitter
+# moving the discrete search into a different local minimum; it is bounded
+# here, not excused, and the same-build rule keeps it out of differential
+# comparison entirely. Deterministic ascending/descending controls measure
+# four order members in the portable union: 680, 811, 1538, and 1695. The
+# 0.002 ceiling admits exactly those 4 of 2000; arch headroom 0.75 allows 1500
+# against 1414.
 adversarial	coordinates	0.75	0.002
 # Measured 36/2000 and 33/2000 arch, 0 order. Divergent coordinates carry the
 # discrete DOF search with them on a small fraction of members.
@@ -65,11 +65,10 @@ adversarial	dofs_set	0.03	0.0
 # Measured 19/2000 arch, 0 order.
 adversarial	dof_penalties	0.02	0.0
 adversarial	dof_penalties_set	0.02	0.0
-# Measured 1972/2000 arch (98.6%), 4/2000 order (0.2%). Same derived-float
-# reason as the drug-like rows; component membership itself stayed exact.
-# The four order-unstable members are adversarial/917, 1538, 1588 and 1695;
-# three of them have bit-identical coordinates, so the divergence is one to
-# two units in the last place of the transform, not a different placement.
-# Order headroom 0.005 allows 10 of 2000 against 4 measured.
+# Measured 1972/2000 arch (98.6%). Deterministic ascending/descending controls
+# measure ten order members in the portable union: 663, 680, 811, 905, 917,
+# 957, 1370, 1538, 1588 and 1695. Component membership itself stays exact; the
+# transform divergence is derived-float jitter. The 0.005 ceiling admits
+# exactly those 10 of 2000.
 adversarial	component_transforms	1.0	0.005
 adversarial	component_transforms_set	1.0	0.005

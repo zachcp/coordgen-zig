@@ -1,12 +1,13 @@
 //! Turns oracle corpus dumps into the stability classification and checks it
 //! against the recorded expectations.
 //!
-//! Three dumps of the same corpus are compared: a baseline build, a build for
-//! a different architecture, and a build whose global `operator new` hands out
-//! descending addresses. For every member and every observable the classifier
-//! records whether that observable survived each perturbation, which is the
-//! per-input-per-observable classification cgz-r13 requires: coordinates going
-//! unstable must not silently demote ring sets or fragment trees.
+//! Three dumps of the same corpus are compared: an ascending-address baseline,
+//! an ascending-address build for a different architecture, and a native build
+//! whose global `operator new` hands out descending addresses. For every member
+//! and every observable the classifier records whether that observable survived
+//! each perturbation, which is the per-input-per-observable classification
+//! cgz-r13 requires: coordinates going unstable must not silently demote ring
+//! sets or fragment trees.
 //!
 //! What is gated and what is published are deliberately different things.
 //! Coordinate values and their deviations are per-(architecture, toolchain,

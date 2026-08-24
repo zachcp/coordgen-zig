@@ -1335,7 +1335,7 @@ fn allocateSearchState(allocator: std.mem.Allocator) !void {
 }
 
 test "solution bookkeeping and tuple construction clean every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocateSearchState, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, allocateSearchState, .{});
 }
 
 test "the affected-atom range is bounds-checked rather than trusted" {

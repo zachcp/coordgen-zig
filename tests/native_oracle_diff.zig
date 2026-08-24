@@ -19,6 +19,7 @@
 //!
 //! Usage: native-oracle-diff --partition NAME [--count N] --ceiling PATH
 //!        [--tolerance BOND_LENGTHS] [--baseline PATH]
+//!        [--on-mismatch fail|record]
 
 const std = @import("std");
 const api = @import("api");
@@ -102,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
     var ceiling_path: ?[]const u8 = null;
     var baseline_path: ?[]const u8 = null;
     var tolerance = default_tolerance_bond_lengths;
+    var on_mismatch: OnMismatch = .fail;
 
     const args = try init.minimal.args.toSlice(arena);
     var index: usize = 1;
@@ -118,6 +120,9 @@ pub fn main(init: std.process.Init) !void {
             ceiling_path = value;
         } else if (std.mem.eql(u8, args[index], "--baseline")) {
             baseline_path = value;
+        } else if (std.mem.eql(u8, args[index], "--on-mismatch")) {
+            on_mismatch = std.meta.stringToEnum(OnMismatch, value) orelse
+                return fatal("--on-mismatch takes 'fail' or 'record', not '{s}'", .{value});
         } else if (std.mem.eql(u8, args[index], "--tolerance")) {
             tolerance = std.fmt.parseFloat(f64, value) catch
                 return fatal("--tolerance '{s}' is not a number", .{value});
@@ -172,15 +177,37 @@ pub fn main(init: std.process.Init) !void {
         try writeBaseline(&writer.interface, selected, tolerance, &counters, &totals);
         try writer.interface.flush();
     }
+    const status_failed = totals.status_mismatches != 0 or totals.native_unsupported != 0;
+    var parity_failed = false;
+    for (counters) |counter| {
+        if (counter.mismatched != 0) parity_failed = true;
+    }
+
+    if (on_mismatch == .record and (status_failed or parity_failed)) {
+        // Said out loud, in the report, so a zero exit in this mode can never
+        // be read as parity. The verdict above is unchanged; only who acts on
+        // it is.
+        try report.print(
+            "native-oracle-diff: --on-mismatch record, so the mismatches above did not fail this run\n",
+            .{},
+        );
+    }
     try report.flush();
 
-    if (totals.status_mismatches != 0 or totals.native_unsupported != 0) {
-        return error.NativeOracleStatusMismatch;
-    }
-    for (counters) |counter| {
-        if (counter.mismatched != 0) return error.NativeOracleParityMismatch;
-    }
+    if (on_mismatch == .record) return;
+    if (status_failed) return error.NativeOracleStatusMismatch;
+    if (parity_failed) return error.NativeOracleParityMismatch;
 }
+
+/// Whether a mismatch is this run's verdict or merely its output.
+///
+/// `fail` is the gate: `zig build native-diff` is red until the port reaches
+/// parity, which is the point of it (cgz-r20 - a gate that cannot fail is not
+/// a gate). `record` is for the publish step, whose job is to write down what
+/// the measurement currently says; making that depend on the measurement being
+/// good is what left conformance/native_baseline.tsv to be copied out of the
+/// build cache by hand (cgz-7v2.4.2).
+const OnMismatch = enum { fail, record };
 
 fn compareMember(
     gpa: std.mem.Allocator,

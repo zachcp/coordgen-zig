@@ -78,12 +78,19 @@ permits four failures but does not say which four, so a port could trade a
 genuine defect against the allowance and stay green. The excused set is
 therefore enumerated, and a pair not in it is a failure.
 
-At the pin the entire ceiling population is four member × observable groups:
+With deterministic ascending and descending allocator controls, the portable
+union across the supported CI targets is ten member × observable groups:
 
 | Member | Order-unstable observables | Coordinate deviation |
 |---|---|---:|
+| `adversarial/663` | `component_transforms`, `component_transforms_set` | 0.000 |
+| `adversarial/680` | `coordinates`, `component_transforms`, `component_transforms_set` | normal tolerant tier; not widened |
+| `adversarial/811` | `coordinates`, `component_transforms`, `component_transforms_set` | normal tolerant tier; not widened |
+| `adversarial/905` | `component_transforms`, `component_transforms_set` | 0.000 |
 | `adversarial/917` | `component_transforms`, `component_transforms_set` | 0.000 |
-| `adversarial/1538` | `component_transforms`, `component_transforms_set` | 0.000 |
+| `adversarial/957` | `component_transforms`, `component_transforms_set` | 0.000 |
+| `adversarial/1370` | `component_transforms`, `component_transforms_set` | 0.000 |
+| `adversarial/1538` | `coordinates`, `component_transforms`, `component_transforms_set` | normal tolerant tier; not widened |
 | `adversarial/1588` | `component_transforms`, `component_transforms_set` | 0.000 |
 | `adversarial/1695` | `coordinates`, `component_transforms`, `component_transforms_set` | 0.580 |
 

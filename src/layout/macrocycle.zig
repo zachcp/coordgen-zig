@@ -1327,7 +1327,7 @@ fn buildAndTraverse(allocator: std.mem.Allocator) !void {
 }
 
 test "polyomino allocation failures leave no owned lattice state" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, buildAndTraverse, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, buildAndTraverse, .{});
 }
 
 test "squared shape enumeration matches pinned candidate and path order" {
@@ -1361,7 +1361,7 @@ fn enumerateAndDeduplicate(allocator: std.mem.Allocator) !void {
 }
 
 test "shape enumeration equivalence and deduplication clean every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, enumerateAndDeduplicate, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, enumerateAndDeduplicate, .{});
 }
 
 fn matchAndWrite(allocator: std.mem.Allocator) !void {
@@ -1394,7 +1394,7 @@ fn matchAndWrite(allocator: std.mem.Allocator) !void {
 }
 
 test "path matching writes only unset coordinates and cleans allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, matchAndWrite, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, matchAndWrite, .{});
 }
 
 test "invalid hard constraints reject every rotational start" {
@@ -1471,7 +1471,7 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
         try std.testing.expectEqualSlices(core.ids.AtomId, &.{
             core.ids.AtomId.fromIndex(ring_size),
         }, dofs.affected_atoms);
-        try std.testing.checkAllAllocationFailures(
+        try core.oom.checkAllocationFailures(
             std.testing.allocator,
             collectDofsAndDiscard,
             .{ &bonds, graph, membership, fragmentation },
@@ -1495,7 +1495,7 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
         }
         try std.testing.expect(found_scale);
         try std.testing.expect(found_invert);
-        try std.testing.checkAllAllocationFailures(
+        try core.oom.checkAllocationFailures(
             std.testing.allocator,
             collectAllDofsAndDiscard,
             .{ &bonds, graph, membership, fragmentation },
@@ -1631,7 +1631,7 @@ test "topology path extraction and bounded shape orchestration clean every alloc
     // macOS depending on the address reused by the preceding injected-failure
     // run. Page allocation makes those growth decisions stable while
     // FailingAllocator still verifies every allocation index and byte balance.
-    try std.testing.checkAllAllocationFailures(std.heap.page_allocator, collectAndGenerateFixture, .{false});
+    try core.oom.checkAllocationFailures(std.heap.page_allocator, collectAndGenerateFixture, .{false});
 }
 
 test "macrocycle substituents emit invert-bond DOFs for exactly the bound atom" {

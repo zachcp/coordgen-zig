@@ -755,7 +755,7 @@ test "component Morgan scoring reports and cleans every allocation failure" {
     const input_bonds = [_]model.Bond{ makeBond(0, 0, 1), makeBond(1, 0, 2) };
     var graph = try Graph.init(std.testing.allocator, &atoms, &input_bonds);
     defer graph.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         scoreAndDiscard,
         .{ graph, &input_bonds },
@@ -794,7 +794,7 @@ test "complete preparation seam matches pinned oracle maps, components, and Morg
     try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(2), AtomId.fromIndex(3) }, prepared.graph.componentMembers(MoleculeId.fromIndex(1)));
     try std.testing.expectEqualSlices(u32, &.{ 1, 1, 1, 1 }, prepared.component_morgan_scores);
 
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         prepareAndDiscard,
         .{ &atoms, &bonds },
@@ -842,7 +842,7 @@ test "ring perception matches pinned oracle cycle and fused probes" {
     );
     try std.testing.expect(!fusion.flags[0].aromatic);
 
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         prepareAndDiscard,
         .{ &fused_atoms, &fused_bonds },
@@ -1025,14 +1025,14 @@ test "malformed and allocation-failing atom stereo is rejected cleanly" {
         AtomId.fromIndex(0),
     ));
     fixture[0][0].stereo_atom_b = AtomId.fromIndex(3);
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         resolveTetrahedralAndDiscard,
         .{ &fixture[0], &fixture[1], graph },
     );
     var membership = try RingMembership.init(std.testing.allocator, graph, &fixture[1]);
     defer membership.deinit();
-    try std.testing.checkAllAllocationFailures(
+    try core.oom.checkAllocationFailures(
         std.testing.allocator,
         writeTetrahedralAndDiscard,
         .{ &fixture[0], &fixture[1], graph, membership },
@@ -1141,7 +1141,7 @@ test "graph construction reports and cleans up every allocation failure" {
     try constructAndDiscard(counting_allocator.allocator());
     // Seven retained graph arrays plus the temporary adjacency cursor array.
     try std.testing.expectEqual(@as(usize, 8), counting_allocator.alloc_index);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, constructAndDiscard, .{});
+    try core.oom.checkAllocationFailures(std.testing.allocator, constructAndDiscard, .{});
 }
 
 fn traverseAndDiscard(allocator: std.mem.Allocator, graph: Graph) !void {
@@ -1158,7 +1158,7 @@ test "cut traversal reports and cleans up every allocation failure" {
     try traverseAndDiscard(counting_allocator.allocator(), graph);
     // The visited bitmap and caller-owned result are independently fallible.
     try std.testing.expectEqual(@as(usize, 2), counting_allocator.alloc_index);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, traverseAndDiscard, .{graph});
+    try core.oom.checkAllocationFailures(std.testing.allocator, traverseAndDiscard, .{graph});
 }
 
 test "clockwise neighbour order is a rotation anchored on the first neighbour" {

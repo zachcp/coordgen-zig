@@ -69,12 +69,14 @@ variable:
 | Axis | Baseline | Perturbation |
 |---|---|---|
 | Architecture | native target | the other CPU architecture of the same OS, cross-compiled |
-| Heap address order | platform allocator | `conformance/allocator_order.cpp`: a global `operator new` handing out **descending** addresses |
+| Heap address order | `conformance/allocator_order.cpp`: a global `operator new` handing out **ascending** addresses | the same allocator handing out **descending** addresses |
 
 The allocator axis exists because upstream keys 94 `std::set`/`std::map`
 declarations on object pointers, whose iteration order is heap address order.
 Inverting that order changes every one of those comparisons without touching a
-line of upstream source.
+line of upstream source. Both sides use monotonic allocators because a platform
+allocator does not promise ascending addresses; using one as the control would
+conflate the requested inversion with host- and heap-dependent pointer order.
 
 Both perturbations are compared per **member × observable**, never per member
 alone. That distinction is the point: coordinates going unstable must not

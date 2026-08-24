@@ -49,25 +49,45 @@
 # measured it, and state the headroom in a comment above it so a later
 # widening appears as a diff.
 
-# adversarial/917, 1538 and 1588 diverge only in the component transform, by
-# one to two units in the last place; their coordinates are bit-identical
-# (order_max_dev_bl 0.000 in the manifest). Nothing is widened for them.
+# With deterministic ascending and descending controls, the two CI targets
+# measure ten transform members in their union. Transform-only differences are
+# one to a few units in the last place. adversarial/680 and 811 additionally
+# move coordinates on x86_64-linux, and adversarial/1538 moves coordinates on
+# both targets; `-` keeps all three at the normal coordinate tolerance rather
+# than inventing or widening a per-member bound. These rows consume the
+# existing fraction ceilings (4 coordinate and 10 transform members) without
+# widening them.
+adversarial/663	component_transforms	-	cbb3c2ddc5b3f4f9590ff27c5cd55a076a56db82bedca469d55d5186206aa347	cgz-r13
+adversarial/663	component_transforms_set	-	cbb3c2ddc5b3f4f9590ff27c5cd55a076a56db82bedca469d55d5186206aa347	cgz-r13
+adversarial/680	coordinates	-	5dff73701ba2bb661434f23276f875ff5d728d0cfeb5db3a95110ff9dfd7fc0f	cgz-r13
+adversarial/680	component_transforms	-	5dff73701ba2bb661434f23276f875ff5d728d0cfeb5db3a95110ff9dfd7fc0f	cgz-r13
+adversarial/680	component_transforms_set	-	5dff73701ba2bb661434f23276f875ff5d728d0cfeb5db3a95110ff9dfd7fc0f	cgz-r13
+adversarial/811	coordinates	-	0eae5d8a8c6549b220cfdcb78ec0436886ddc4b2fd625608e5bff62db06da06b	cgz-r13
+adversarial/811	component_transforms	-	0eae5d8a8c6549b220cfdcb78ec0436886ddc4b2fd625608e5bff62db06da06b	cgz-r13
+adversarial/811	component_transforms_set	-	0eae5d8a8c6549b220cfdcb78ec0436886ddc4b2fd625608e5bff62db06da06b	cgz-r13
+adversarial/905	component_transforms	-	1f26f477d9bb6cd1f707eb590984d97c10b5941358abb042b942f842250598d3	cgz-r13
+adversarial/905	component_transforms_set	-	1f26f477d9bb6cd1f707eb590984d97c10b5941358abb042b942f842250598d3	cgz-r13
 adversarial/917	component_transforms	-	d87db99cd98ca2874e02632633d4f8b3361bdff22dd7f94c50e8ae44c47a7e6a	cgz-r13
 adversarial/917	component_transforms_set	-	d87db99cd98ca2874e02632633d4f8b3361bdff22dd7f94c50e8ae44c47a7e6a	cgz-r13
+adversarial/957	component_transforms	-	3fe3762182b2f0dcc18550177de17da0c9cf84005faed147420cd3ceabac169f	cgz-r13
+adversarial/957	component_transforms_set	-	3fe3762182b2f0dcc18550177de17da0c9cf84005faed147420cd3ceabac169f	cgz-r13
+adversarial/1370	component_transforms	-	d4b9b0c603b611884747b42a9607e4a4607fca53fefe0f5ba7eaa3bd90c45828	cgz-r13
+adversarial/1370	component_transforms_set	-	d4b9b0c603b611884747b42a9607e4a4607fca53fefe0f5ba7eaa3bd90c45828	cgz-r13
+adversarial/1538	coordinates	-	00f261302d9aacccbc9966f1e3df43e2c53cb92aa771667ef0740cd083b25736	cgz-r13
 adversarial/1538	component_transforms	-	00f261302d9aacccbc9966f1e3df43e2c53cb92aa771667ef0740cd083b25736	cgz-r13
 adversarial/1538	component_transforms_set	-	00f261302d9aacccbc9966f1e3df43e2c53cb92aa771667ef0740cd083b25736	cgz-r13
 adversarial/1588	component_transforms	-	11f18d73b633676d2825477d9be49e4484e7ef1ffe943a60025903dac0c1c0aa	cgz-r13
 adversarial/1588	component_transforms_set	-	11f18d73b633676d2825477d9be49e4484e7ef1ffe943a60025903dac0c1c0aa	cgz-r13
 
-# adversarial/1695 is the whole coordinate population of the ceiling: one
-# member of 2000, measured at 0.580 bond lengths under reversed heap address
-# order. The bound is 0.75, which is 0.17 bond lengths of headroom over that
-# measurement and 0.25 below the 1.0 boundary where a deviation stops being
-# float jitter and becomes a different local minimum. It is stated with
-# headroom because the measurement is per-build and this file is not; it is
-# held below 1.0 because a port that relayouts this member is a failure, not a
-# ceiling hit. Its transforms carry the same divergence but the classifier
-# publishes no magnitude for them, so they are not widened.
+# adversarial/1695 is the only coordinate member that needs a widened bound:
+# 0.580 bond lengths under reversed heap address order. The bound is 0.75,
+# which is 0.17 bond lengths of headroom over that measurement and 0.25 below
+# the 1.0 boundary where a deviation stops being float jitter and becomes a
+# different local minimum. It is stated with headroom because the measurement
+# is per-build and this file is not; it is held below 1.0 because a port that
+# relayouts this member is a failure, not a ceiling hit. Its transforms carry
+# the same divergence but the classifier publishes no magnitude for them, so
+# they are not widened.
 adversarial/1695	coordinates	0.75	9b872879b3441f566576f40f16c9029d80eb696f8c6bd56c1acd0ea5f19889e3	cgz-r13
 adversarial/1695	component_transforms	-	9b872879b3441f566576f40f16c9029d80eb696f8c6bd56c1acd0ea5f19889e3	cgz-r13
 adversarial/1695	component_transforms_set	-	9b872879b3441f566576f40f16c9029d80eb696f8c6bd56c1acd0ea5f19889e3	cgz-r13

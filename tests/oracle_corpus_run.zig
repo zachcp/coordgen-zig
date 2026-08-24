@@ -1,10 +1,11 @@
 //! Runs a corpus partition through the pinned C++ oracle and dumps every
 //! observable in a canonical, diffable form.
 //!
-//! One dump is produced per oracle build under comparison — native, a
-//! cross-compiled architecture, and a build whose global `operator new` hands
-//! out descending addresses. `tests/corpus_classify.zig` turns those dumps
-//! into the stability classification.
+//! One dump is produced per oracle build under comparison — native and
+//! cross-compiled builds whose global `operator new` hands out ascending
+//! addresses, and a native build where it hands out descending addresses.
+//! `tests/corpus_classify.zig` turns those dumps into the stability
+//! classification.
 //!
 //! Order-sensitive collections are emitted twice: once in the order the
 //! oracle produced them, and once canonically sorted. That distinction is the
