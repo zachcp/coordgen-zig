@@ -32,6 +32,10 @@ would be the placeholder-gate defect the bead names.
    measured are named in the same table. There is no summary line that says
    "parity" without saying over what.
 
+Deliberately NOT a `zig build` step. The audit enumerates the build's own step
+list and runs each one; a step that invoked this tool would enumerate itself
+and recurse. Run it directly.
+
 Usage:
     tools/validation-audit [--zig PATH] [--output PATH] [--skip-oracle] [--quick]
 """
@@ -40,6 +44,7 @@ import argparse
 import datetime
 import os
 import pathlib
+import platform
 import re
 import shutil
 import subprocess
@@ -276,6 +281,10 @@ def main(argv):
     add(f"- Generated: {datetime.datetime.now().isoformat(timespec='seconds')}")
     add(f"- Commit: `{commit}`{' (WORKING TREE DIRTY)' if dirty else ''}")
     add(f"- Toolchain: `{version}`")
+    add(
+        f"- Host: `{platform.machine()}-{platform.system().lower()}`"
+        " — **one host only**; see the scope note at the end"
+    )
     add(f"- Reproduce: `tools/validation-audit`")
     add("")
     add(
@@ -357,6 +366,20 @@ def main(argv):
         "While any gate above is RESERVED or FAIL, the validation epic cannot"
         " close: an independent reviewer cannot reproduce a release gate that"
         " does not exist yet. This tool exits non-zero in that case by design."
+    )
+    add("")
+    add(
+        f"**One host.** Every row was measured on"
+        f" `{platform.machine()}-{platform.system().lower()}`. The supported"
+        " target matrix is wider, and nothing here says anything about the"
+        " other legs of it - a gate that passes here may not have been run"
+        " anywhere else. Completing that matrix is cgz-7v2.4.6."
+    )
+    add("")
+    add(
+        "**One optimize mode per run.** Gates were run at the build's default"
+        " mode. Where a criterion names Debug AND ReleaseSafe, both have to be"
+        " run, and this report covers whichever one this invocation used."
     )
     add("")
 
