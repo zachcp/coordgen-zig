@@ -815,3 +815,150 @@ test "coordgen_result_free releases every owned span through the stored allocato
     try std.testing.expect(result.owner == null);
     try std.testing.expect(result.coordinates.ptr == null);
 }
+
+// ---------------------------------------------------------------------------
+// Fuzz target (cgz-7v2.4.4)
+//
+// This lives here rather than in tests/fuzz_targets.zig because the exports
+// are `export fn`, not `pub`, so this file is the only place that can call
+// them without linking the library and re-declaring the symbols.
+//
+// It is a SEPARATE surface from the native targets, not a thin wrapper over
+// them, and the reason is concrete: every enum on this boundary crosses as a
+// bare `u32`. An out-of-range `atomic_number` or `order` is unrepresentable in
+// the Zig API - the type system refuses it - and is trivially representable
+// here. Those values reach the validators only through this door.
+// ---------------------------------------------------------------------------
+
+const fuzz_max_atoms = 10;
+const fuzz_max_bonds = 14;
+
+const FuzzInput = struct {
+    atoms: [fuzz_max_atoms]AtomInput = undefined,
+    bonds: [fuzz_max_bonds]BondInput = undefined,
+    atom_count: u32 = 0,
+    bond_count: u32 = 0,
+
+    fn view(self: *const FuzzInput) Input {
+        return .{
+            .atoms = .{ .ptr = &self.atoms, .len = self.atom_count },
+            .bonds = .{ .ptr = &self.bonds, .len = self.bond_count },
+        };
+    }
+};
+
+/// Each field is drawn mostly in range, occasionally not.
+///
+/// The first version of this drew `atomic_number` from the whole `u16` and
+/// endpoints from the whole `u8`, so nearly every input died at the first
+/// validator: 619 runs, 19 unique, 0.29% coverage - a target that tests the
+/// validator and nothing behind it. With the weights below, a comparable
+/// session reached 650 runs, 43 unique, 0.51%. Out-of-range values have to be
+/// the MINORITY for the generator itself to be reached, while still appearing
+/// often enough that every rejection path is exercised; these weights are that
+/// trade, not a preference for valid input.
+///
+/// Neither number is evidence of good coverage - both are short sessions, and
+/// coverage accumulates across runs. What they show is the direction the
+/// rebalance moved, which is the only claim being made.
+fn buildFuzzInput(smith: *std.testing.Smith) FuzzInput {
+    var built: FuzzInput = .{};
+    built.atom_count = smith.valueRangeAtMost(u8, 0, fuzz_max_atoms);
+    for (built.atoms[0..built.atom_count]) |*atom| {
+        atom.* = .{
+            // Mostly ordinary elements; sometimes a value above 118, which is
+            // representable only here and whose documented answer is
+            // `invalid_atomic_number`.
+            .atomic_number = if (smith.boolWeighted(9, 1))
+                smith.valueRangeAtMost(u8, 1, 30)
+            else
+                smith.value(u16),
+            .formal_charge = smith.valueRangeAtMost(i8, -3, 3),
+            .flags = smith.valueRangeAtMost(u8, 0, 15),
+            .stereo = smith.valueRangeAtMost(u8, 0, 8),
+            .stereo_looking_from = smith.value(u8),
+            .stereo_atom_a = smith.value(u8),
+            .stereo_atom_b = smith.value(u8),
+        };
+    }
+    var count: u32 = 0;
+    while (count < fuzz_max_bonds and !smith.eosWeightedSimple(6, 1)) {
+        built.bonds[count] = .{
+            .start = if (built.atom_count != 0 and smith.boolWeighted(6, 1))
+                @intCast(smith.index(built.atom_count))
+            else
+                smith.value(u8),
+            .end = if (built.atom_count != 0 and smith.boolWeighted(6, 1))
+                @intCast(smith.index(built.atom_count))
+            else
+                smith.value(u8),
+            // Above 3 is not a bond order at all.
+            .order = if (smith.boolWeighted(6, 1))
+                smith.valueRangeAtMost(u8, 0, 3)
+            else
+                smith.valueRangeAtMost(u8, 0, 6),
+            .flags = smith.valueRangeAtMost(u8, 0, 7),
+            .stereo = smith.valueRangeAtMost(u8, 0, 6),
+            .display = smith.valueRangeAtMost(u8, 0, 6),
+            .crossing_penalty_multiplier = 1,
+        };
+        count += 1;
+    }
+    built.bond_count = count;
+    return built;
+}
+
+fn cAbiContract(_: void, smith: *std.testing.Smith) anyerror!void {
+    var built = buildFuzzInput(smith);
+    const input = built.view();
+    var result: Result = undefined;
+    const code = coordgen_generate(&input, &result);
+
+    if (code != .ok) {
+        // coordgen_abi.h promises a zeroed result on failure, needing no
+        // cleanup. A partially published result escaping here would leak
+        // across the C boundary where no errdefer can reach it, and the
+        // caller - following the header - would never free it.
+        try std.testing.expect(result.owner == null);
+        try std.testing.expect(result.coordinates.ptr == null);
+        try std.testing.expect(result.input_to_internal.ptr == null);
+        try std.testing.expect(result.internal_to_input.ptr == null);
+        try std.testing.expect(result.effective_bond_orders.ptr == null);
+        try std.testing.expect(result.bond_displays.ptr == null);
+        try std.testing.expect(result.atom_stereo.ptr == null);
+        // Freeing a zeroed result is documented as a safe no-op, so a caller
+        // that frees unconditionally must not be punished for it.
+        coordgen_result_free(&result);
+        return;
+    }
+
+    try std.testing.expectEqual(built.atom_count, result.coordinates.len);
+    try std.testing.expectEqual(built.atom_count, result.input_to_internal.len);
+    try std.testing.expectEqual(built.atom_count, result.internal_to_input.len);
+    try std.testing.expectEqual(built.atom_count, result.atom_stereo.len);
+    try std.testing.expectEqual(built.bond_count, result.effective_bond_orders.len);
+    try std.testing.expectEqual(built.bond_count, result.bond_displays.len);
+    if (built.atom_count != 0) try std.testing.expect(result.owner != null);
+
+    const coordinates = if (result.coordinates.ptr) |ptr|
+        ptr[0..result.coordinates.len]
+    else
+        &[_]core.math.Vec2{};
+    for (coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+
+    // clean_pose crosses as u32 and is a boolean; anything else means the
+    // encoding drifted.
+    try std.testing.expect(result.clean_pose == 0 or result.clean_pose == 1);
+
+    coordgen_result_free(&result);
+    try std.testing.expect(result.owner == null);
+    // Idempotent by contract: the second free sees the zeroed value the first
+    // left, which is the same state a failed generation leaves.
+    coordgen_result_free(&result);
+}
+
+const c_abi_fuzz_seeds = @import("fuzz_seeds").c_abi_contract_seeds;
+
+test "fuzz: c abi contract holds for any input a C caller can express" {
+    try std.testing.fuzz({}, cAbiContract, .{ .corpus = c_abi_fuzz_seeds });
+}

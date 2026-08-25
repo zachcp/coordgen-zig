@@ -392,6 +392,15 @@ pub fn build(b: *std.Build) !void {
         c_abi_exports.addAnonymousImport("allocation_site_floors", .{
             .root_source_file = b.path("conformance/allocation_sites.tsv"),
         });
+        // The C ABI's fuzz target lives in exports.zig because the entry
+        // points are `export fn` and that file is the only place that can call
+        // them without re-declaring the symbols. Its promoted seeds therefore
+        // have to reach it as a named import.
+        c_abi_exports.addImport("fuzz_seeds", b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_seeds/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
         const layer_modules = [_]struct { name: []const u8, module: *std.Build.Module }{
             .{ .name = "core-test", .module = core },
             .{ .name = "model-test", .module = model },
@@ -1436,6 +1445,15 @@ pub fn build(b: *std.Build) !void {
     });
     const run_fuzz_targets = b.addRunArtifact(fuzz_targets_tests);
     fuzz_step.dependOn(&run_fuzz_targets.step);
+    // The C ABI surface fuzzes from its own binary, filtered the same way. A
+    // second addTest rather than reusing the one on `test`, so the filter
+    // never suppresses that binary's ordinary tests.
+    const c_abi_fuzz_tests = b.addTest(.{
+        .name = "c-abi-fuzz-test",
+        .root_module = c_abi_exports,
+        .filters = if (fuzz_filter) |filter| &.{filter} else &.{"fuzz: "},
+    });
+    fuzz_step.dependOn(&b.addRunArtifact(c_abi_fuzz_tests).step);
     // The driver owns budgets, per-target scoping, crash detection and seed
     // promotion. `zig build fuzz` alone replays the committed corpus and
     // proves the harness is wired; searching is `tools/run-fuzz`, because a

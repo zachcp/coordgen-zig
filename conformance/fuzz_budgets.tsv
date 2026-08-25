@@ -27,3 +27,4 @@
 # target	smoke_iterations	extended_iterations
 generation invariants	2000	50000
 hostile input	2000	50000
+c abi contract	1500	40000

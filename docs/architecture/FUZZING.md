@@ -1,11 +1,25 @@
 # Fuzzing platform and mechanism
 
 Status: decided by `cgz-r15` against the pinned toolchain
-`0.17.0-dev.1516+8a4b5424d`. Implemented by `cgz-7v2.4.4`; the iteration
-budgets and pass conditions are in [`SUCCESS_CRITERIA.md`](SUCCESS_CRITERIA.md).
+`0.17.0-dev.1516+8a4b5424d`. The harness is implemented by `cgz-7v2.4.4`, which
+remains open for the gaps named at the end of this document.
 
-The `fuzz` build step is reserved and fails with its owning bead until that
-implementation lands, per the `cgz-r21` no-relaxation policy.
+The `fuzz` build step is no longer reserved. `zig build fuzz` runs the targets
+against their committed corpora and asserts the harness's own preconditions;
+`tools/run-fuzz` drives the search, with per-target budgets recorded in
+[`conformance/fuzz_budgets.tsv`](../../conformance/fuzz_budgets.tsv).
+
+Targets, and where each lives:
+
+| Surface | Target | Source |
+|---|---|---|
+| Native | `generation invariants` | `tests/fuzz_targets.zig` |
+| Native | `hostile input` | `tests/fuzz_targets.zig` |
+| C ABI | `c abi contract` | `src/c_abi/exports.zig` |
+
+The C ABI target sits beside the `export fn` declarations because they are not
+`pub`, so no other file can call them without re-declaring the symbols. That
+placement is a linkage consequence, not a preference.
 
 ## Decision
 
@@ -177,3 +191,30 @@ respect them.
    requirement they were trying to serve: a promoted seed must be *proven* to
    reproduce before it is committed, and pass/fail must be read from the run's
    output and artifacts rather than from its exit code.
+
+## Known gaps
+
+`cgz-7v2.4.4` stays open for these. Each is a thing the harness does not do,
+stated here so that "the fuzz step is green" is not read as more than it is.
+
+1. **Automatic seed promotion does not complete on this toolchain.** The
+   reproducing input for a failing target is not reliably persisted anywhere
+   the driver can find it (`cgz-1js`). `tools/run-fuzz` detects the failure and
+   prints it, tries every candidate, and refuses to commit one that does not
+   reproduce - so nothing degrades silently, but a finding must currently be
+   captured by hand from the stack trace.
+
+2. **Coverage is not a gate.** The budgets are iteration counts. Nothing
+   asserts that a run reached any particular part of the tree, so a target
+   that stops exercising a module would still pass its budget. The
+   allocation-site ratchet in `conformance/allocation_sites.tsv` does that job
+   for the ordinary test suite; the fuzz targets have no equivalent.
+
+3. **Three targets is not "all major input boundaries and algorithm domains",**
+   which is what `cgz-7v2.4.4` asks for. There is no target for the residue and
+   protein paths, for template loading, or for the `Options` surface.
+
+4. **The C ABI target does not fuzz ownership SEQUENCES.** It exercises one
+   generate/free cycle per iteration. Interleaved generate/free orderings
+   across several results, which is where a lifetime defect would live, are not
+   reached.

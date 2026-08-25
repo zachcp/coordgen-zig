@@ -47,7 +47,13 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BUDGETS = ROOT / "conformance" / "fuzz_budgets.tsv"
-TARGETS_SOURCE = ROOT / "tests" / "fuzz_targets.zig"
+# Fuzz targets live in more than one file: the C ABI's must sit beside the
+# `export fn` declarations it calls. Both are scanned, so a target cannot be
+# added anywhere without also getting a budget row.
+TARGET_SOURCES = (
+    ROOT / "tests" / "fuzz_targets.zig",
+    ROOT / "src" / "c_abi" / "exports.zig",
+)
 SEED_DIR = ROOT / "tests" / "fuzz_seeds"
 
 # `test "fuzz: <name>"` is the declaration form; the budget table keys on a
@@ -91,7 +97,10 @@ def resolve_zig(explicit):
 
 
 def declared_targets():
-    return TARGET_RE.findall(TARGETS_SOURCE.read_text())
+    found = []
+    for source in TARGET_SOURCES:
+        found.extend(TARGET_RE.findall(source.read_text()))
+    return found
 
 
 def read_budgets():
@@ -115,7 +124,10 @@ def check_budgets():
     """
     targets = declared_targets()
     if not targets:
-        fail(f"no `test \"fuzz: ...\"` declarations found in {TARGETS_SOURCE}")
+        fail(
+            "no `test \"fuzz: ...\"` declarations found in "
+            + ", ".join(str(p) for p in TARGET_SOURCES)
+        )
     budgets = read_budgets()
     problems = []
     for key in budgets:
