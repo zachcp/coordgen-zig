@@ -1,0 +1,68 @@
+# Distinct allocation sites reached per public entry point, per representative
+# member, per optimize mode (cgz-7v2.4.3, required by
+# docs/architecture/SUCCESS_CRITERIA.md "OOM and leak gates").
+#
+# Columns are tab separated:
+#   entry_point  member  optimize_mode  minimum_sites
+#
+# entry_point    The public entry point the member is generated through.
+# member         The representative input, named as in tests/native_determinism.zig.
+# optimize_mode  `debug` or `release_safe`. Inlining decides how many machine
+#                call sites one source call site becomes, so the count is only
+#                comparable within a mode. Measured in both because a gate that
+#                is skipped in a mode passes vacuously there (cgz-r20).
+# minimum_sites  A FLOOR, not an equality. The gate fails when the measured
+#                count drops below it.
+#
+# ## Why a floor rather than the allocation count
+#
+# checkAllocationFailures already sweeps every allocation INDEX and proves each
+# one is reported and cleaned. That cannot see coverage shrinking: a
+# representative input that stops reaching a module still passes its sweep - it
+# just silently stops testing that module. This table is the ratchet against
+# that, which is why SUCCESS_CRITERIA calls for it in as many words: without
+# it, "representative inputs" is unfalsifiable.
+#
+# ## Why a floor rather than an exact number
+#
+# A decrease is the regression the criterion names, and it fails here. An
+# increase is coverage growing and is allowed, so a change that reaches more of
+# the tree does not have to touch this file to land. The addresses themselves
+# are deliberately never recorded: they are not stable across builds and would
+# be noise in a diff.
+#
+# ## Provenance
+#
+# Measured on aarch64-macos with the toolchain.lock pin, 0.17.0-dev.1516+8a4b5424d.
+# Debug has no inlining, so its count is the number of source-level allocation
+# call sites the member reaches; ReleaseSafe's is lower because std's own
+# wrappers collapse into their callers.
+#
+# A host that legitimately reaches FEWER sites - a target-specific path in std,
+# say - fails this gate, and the fix is a reviewed diff lowering the row with
+# the reason, not a silent adjustment.
+#
+# entry_point	member	optimize_mode	minimum_sites
+schema_version	1	-	-
+api.generate	chain	debug	83
+api.generate	ring	debug	98
+api.generate	fused rings	debug	103
+api.generate	macrocycle	debug	121
+api.generate	components	debug	101
+api.generate	proximity	debug	120
+api.generate	counterion	debug	101
+api.generate	metal zero-order	debug	110
+api.generate	heteroatoms	debug	108
+api.generate	residue	debug	110
+api.generate	chain	release_safe	45
+api.generate	ring	release_safe	51
+api.generate	fused rings	release_safe	57
+api.generate	macrocycle	release_safe	78
+api.generate	components	release_safe	61
+api.generate	proximity	release_safe	79
+api.generate	counterion	release_safe	60
+api.generate	metal zero-order	release_safe	72
+api.generate	heteroatoms	release_safe	64
+api.generate	residue	release_safe	72
+coordgen_generate	residue ligand	debug	118
+coordgen_generate	residue ligand	release_safe	76

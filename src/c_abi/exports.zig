@@ -761,6 +761,35 @@ test "coordgen_generate reports and cleans up failure at every allocation index"
     );
 }
 
+/// The C ABI's own allocation-site floor. coordgen_generate pins
+/// generation_allocator, so the seam it delegates to is the injectable point;
+/// everything before that delegation is non-allocating field validation.
+const allocation_site_table = @embedFile("allocation_site_floors");
+
+test "the C entry point does not silently stop reaching allocation sites" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = 1 },
+        .{ .start = 1, .end = 2, .order = 2 },
+    };
+    const residues = [_]ResidueInput{
+        .{ .atom = 3, .chain = .{ .ptr = "A", .len = 1 }, .residue_number = 9, .closest_ligand_atom = 1 },
+    };
+    const interactions = [_]ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input: Input = .{
+        .atoms = .{ .ptr = &atoms, .len = atoms.len },
+        .bonds = .{ .ptr = &bonds, .len = bonds.len },
+        .residues = .{ .ptr = &residues, .len = residues.len },
+        .residue_interactions = .{ .ptr = &interactions, .len = interactions.len },
+    };
+    const measured = try core.oom.countAllocationSites(
+        std.testing.allocator,
+        generateThroughSafeApiAndDiscard,
+        .{&input},
+    );
+    try core.oom.expectSiteFloor(allocation_site_table, "coordgen_generate", "residue ligand", measured);
+}
+
 test "coordgen_result_free is a safe no-op on a zeroed (failure) result" {
     var result: Result = .{};
     coordgen_result_free(&result);

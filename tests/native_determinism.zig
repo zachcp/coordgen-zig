@@ -444,3 +444,20 @@ test "a reversed caller order is itself deterministic, and invariance is pinned 
         try std.testing.expectEqual(family.order, measured);
     }
 }
+
+/// The committed floors. Embedded rather than read from disk so the test has
+/// no working-directory assumption and the table travels with the binary. The
+/// parser and the comparison live in core.oom, shared with the C ABI suite.
+const allocation_site_table = @embedFile("allocation_site_floors");
+
+test "no family silently stops reaching allocation sites it used to reach" {
+    for (families) |family| {
+        errdefer std.debug.print("family: {s}\n", .{family.name});
+        const measured = try core.oom.countAllocationSites(
+            std.testing.allocator,
+            generateAndDiscard,
+            .{family},
+        );
+        try core.oom.expectSiteFloor(allocation_site_table, "api.generate", family.name, measured);
+    }
+}

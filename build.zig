@@ -385,6 +385,13 @@ pub fn build(b: *std.Build) !void {
     // test binary: aggregating them behind a source-relative import in
     // src/coordgen.zig would silently stop running them.
     const layer_test_runs = blk: {
+        // Test-only: the anonymous import is referenced solely from a test
+        // block, so no conformance bytes reach the installed library, but the
+        // C ABI seam is private to its own file and its site-coverage gate has
+        // to live there.
+        c_abi_exports.addAnonymousImport("allocation_site_floors", .{
+            .root_source_file = b.path("conformance/allocation_sites.tsv"),
+        });
         const layer_modules = [_]struct { name: []const u8, module: *std.Build.Module }{
             .{ .name = "core-test", .module = core },
             .{ .name = "model-test", .module = model },
@@ -449,6 +456,13 @@ pub fn build(b: *std.Build) !void {
         },
         .link_libc = false,
         .link_libcpp = false,
+    });
+    // The committed allocation-site floors travel with the test binary rather
+    // than being read from disk, so the suite has no working-directory
+    // assumption. Test-only: the production package stays std-only with no
+    // embedded conformance data.
+    native_determinism_module.addAnonymousImport("allocation_site_floors", .{
+        .root_source_file = b.path("conformance/allocation_sites.tsv"),
     });
     const native_determinism_tests = b.addTest(.{
         .name = "native-determinism-test",
