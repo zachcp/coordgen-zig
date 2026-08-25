@@ -1458,7 +1458,7 @@ pub fn build(b: *std.Build) !void {
     // promotion. `zig build fuzz` alone replays the committed corpus and
     // proves the harness is wired; searching is `tools/run-fuzz`, because a
     // search needs an iteration budget and a place to put what it finds.
-    const fuzz_driver_check = b.addSystemCommand(&.{ "python3", "tools/run-fuzz", "--check-budgets" });
+    const fuzz_driver_check = b.addSystemCommand(&.{ "python3", "tools/run-fuzz", "--self-test" });
     fuzz_step.dependOn(&fuzz_driver_check.step);
     // Committed seeds replay on the ordinary gate, which is the whole reason
     // to promote them.

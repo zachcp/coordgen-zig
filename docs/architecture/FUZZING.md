@@ -150,11 +150,22 @@ rather than committing one that tests nothing.
 `tools/check-fuzz-seed-promotion` reports which source is winning on a given
 toolchain.
 
-**A crashing fuzz run exits 0.** Measured for both failure shapes — a returned
-error and a `@panic` reporting `signal ABRT`, the exact case the line above
-described. In each, the crash is printed, the seed is written, and
-`zig build test --fuzz=N` exits **0**. The identical failure replayed in a
-normal run exits 1.
+**A DISCOVERED crash exits 0, and that is narrower and worse than it sounds.**
+Measured for both failure shapes — a returned error and a `@panic` reporting
+`signal ABRT`, the exact case the line above described. In each, the crash is
+printed, the seed is written, and `zig build test --fuzz=N` exits **0**.
+
+The exit status is not uniformly broken, which is precisely what makes it a
+trap. Measured on one target minutes apart:
+
+| plant | when it fires | `zig build --fuzz` exit |
+|---|---|---|
+| fires on every input | the initial smoke input, before the search | **1** |
+| needs discovery | found at run ~3400 | **0** |
+
+So the exit status is correct for failures the fuzzer did not have to find, and
+wrong for exactly the ones it exists to find. Anyone spot-checking it with a
+trivially-failing target would conclude it works.
 
 This is a third silent failure in the family cgz-r27 names, and the most
 dangerous of the three: the backend can be right, the seed can be written, the

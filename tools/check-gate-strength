@@ -72,7 +72,7 @@ _REQUIRED_TEXT = [
     # Deleting any of these leaves `zig build fuzz` green while covering less
     # than it claims, which is exactly what this file exists to catch.
     'fuzz_step.dependOn(&b.addRunArtifact(fuzz_backend_tests).step)',
-    '"tools/run-fuzz", "--check-budgets"',
+    '"tools/run-fuzz", "--self-test"',
     'b.option([]const u8, "fuzz-filter"',
     # The real, graph-level false-green assertion. Whether each step actually
     # has dependencies is checked by build.zig itself at configure time, where

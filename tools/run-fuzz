@@ -5,11 +5,21 @@ promote any crash into a committed regression seed (cgz-7v2.4.4).
 Three properties of the pinned toolchain were measured, and each one dictates
 part of this driver. None of them is theoretical - each was reproduced.
 
-1. A CRASHING FUZZ RUN EXITS 0 (cgz-8hm). Measured for both a returned error
-   and a `@panic` reporting `signal ABRT`. The crash is printed, the seed is
-   written, and `zig build --fuzz` still reports success. So pass/fail here is
-   read from the run's OUTPUT and the artifacts it leaves. `returncode` is
-   never consulted for that decision.
+1. A DISCOVERED CRASH EXITS 0 (cgz-8hm). Measured for both a returned error
+   and a `@panic` reporting `signal ABRT`: the crash is printed, the seed is
+   written, and `zig build --fuzz` still reports success.
+
+   The exit status is not uniformly useless, which is what makes it a trap. A
+   target that fails on the INITIAL smoke input - before the search begins -
+   does exit 1. Measured on the same target minutes apart: a plant firing on
+   every input exited 1, and a plant requiring discovery, found at run ~3400,
+   exited 0. So the exit status is right for failures the fuzzer did not have
+   to find, and wrong for exactly the ones it exists to find. A harness that
+   spot-checked it would see it work.
+
+   So pass/fail here is read from the run's OUTPUT and the artifacts it leaves.
+   `returncode` is never consulted for that decision, and --self-test pins
+   that.
 
 2. THE FUZZING REPORT NAMES ONLY ONE TARGET, even when more ran. Measured by
    planting a failure in the second of two targets: it fired, while the report
@@ -215,11 +225,23 @@ def run_target(zig, target, iterations):
         text=True,
     )
     output = result.stdout + result.stderr
-    # Property 1: never the exit status.
-    crashed = bool(
-        re.search(r"terminated with signal|exited with code \d|failed with error\.", output)
-    )
-    return crashed, candidate_seeds(started - 1), output
+    return crashedFromOutput(output), candidate_seeds(started - 1), output
+
+
+# Every way the test runner announces a failing fuzz iteration. Matched against
+# the run's OUTPUT because its EXIT STATUS is 0 either way (cgz-8hm).
+_CRASH_RE = re.compile(
+    r"terminated with signal|exited with code \d|failed with error\.|thread \d+ panic"
+)
+
+
+def crashedFromOutput(output):
+    """Property 1, factored out so it can be pinned by --self-test.
+
+    Deliberately takes no returncode argument. A signature that accepted one
+    would invite someone to start consulting it.
+    """
+    return bool(_CRASH_RE.search(output))
 
 
 def replay_reproduces(zig, target, data):
@@ -250,15 +272,85 @@ def replay_reproduces(zig, target, data):
     return reproduced
 
 
+# Real output captured from a crashing fuzz run on the pin. Both shapes are
+# included because they exit 0 for different reasons: an orderly
+# `std.process.exit(1)` from a returned error, and an abort from a panic.
+_CRASHING_RUN_SAMPLES = (
+    (
+        "returned error",
+        "run test fuzz-targets-test failure\n"
+        "failed with error.PlantedCrash\n"
+        "error: test 'x' exited with code 1; input saved to '.zig-cache/f/crash'\n",
+    ),
+    (
+        "panic",
+        "thread 3243466 panic: planted panic\n"
+        "error: test 'x' terminated with signal ABRT;"
+        " input saved to '.zig-cache/f/crash'\n",
+    ),
+)
+
+_CLEAN_RUN_SAMPLE = (
+    "======= FUZZING REPORT =======\n"
+    'Fuzz test: "x" (abc123)\n'
+    "Runs: 0 -> 48727\n"
+    "Coverage: 4771/19369 -> 4773/19369 (24.64%)\n"
+)
+
+
+def self_test():
+    """Pin the property cgz-8hm names: a crash is detected from OUTPUT.
+
+    A crashing fuzz run exits 0 on this toolchain, so a harness that gated on
+    the exit status would report green while the fuzzer was finding crashes.
+    These samples are real output from such runs; if detection ever starts
+    depending on the exit status, the samples still carry none and this fails.
+    """
+    problems = []
+    for label, sample in _CRASHING_RUN_SAMPLES:
+        if not crashedFromOutput(sample):
+            problems.append(f"a crashing run ({label}) was not detected from its output")
+    if crashedFromOutput(_CLEAN_RUN_SAMPLE):
+        problems.append("a clean run was reported as a crash")
+
+    # And nothing in the tree may gate on that exit status. The replay in
+    # `replay_reproduces` DOES read returncode, and legitimately: it runs
+    # `zig build test` WITHOUT --fuzz, where a failing test does exit non-zero.
+    # That distinction is the whole point, so it is checked rather than assumed.
+    source = pathlib.Path(__file__).read_text()
+    fuzz_call = source.index('"build", "fuzz"')
+    window = source[fuzz_call : fuzz_call + 400]
+    if "returncode" in window:
+        problems.append(
+            "the --fuzz invocation's returncode is read within 400 characters"
+            " of the call; cgz-8hm requires it not be a pass condition"
+        )
+
+    for problem in problems:
+        print(f"run-fuzz: {problem}", file=sys.stderr)
+    if problems:
+        return 2
+    print(
+        "run-fuzz: self-test verified both crashing-run shapes are detected from"
+        " output, a clean run is not, and the --fuzz call does not consult its"
+        " exit status",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def main(argv):
     parser = argparse.ArgumentParser(add_help=True)
     parser.add_argument("--zig")
     parser.add_argument("--check-budgets", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--extended", action="store_true")
     parser.add_argument("--target")
     args = parser.parse_args(argv)
 
     targets, budgets = check_budgets()
+    if args.self_test:
+        return self_test()
     if args.check_budgets:
         return 0
 
