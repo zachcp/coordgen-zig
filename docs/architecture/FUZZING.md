@@ -93,28 +93,48 @@ seeds must be regenerated when its decode sequence changes.
 
 ## Corrections, 2026-08-24 (cgz-r27)
 
-Two claims above were measured false on the same pin they were recorded
-against. Both are corrected here rather than edited away, because a harness
-built on either would have failed silently in the way this document exists to
-prevent. Reproduce with `tools/check-fuzz-seed-promotion --self-test`, which
-plants a fuzz target that fails on a discoverable input and replays every
-candidate seed.
+Claims above were measured against the same pin they were recorded on, and
+corrected here rather than edited away, because a harness built on any of them
+would have failed silently in the way this document exists to prevent.
 
-**`.zig-cache/f/crash` is not 0 bytes, and it is the seed that reproduces.**
-Three runs from cleared caches, planted two-byte failure condition:
+One of these corrections is a correction to an earlier correction in this same
+section, and that is left visible on purpose: a single probe was generalised
+into a rule, and the real harness then contradicted it. Reproduce with
+`tools/check-fuzz-seed-promotion --self-test` and with `tools/run-fuzz`.
+
+**Which file holds the reproducing seed is not fixed, and neither source can
+be trusted.** Both behaviours occur on this same pin.
+
+In a small standalone probe, three runs from cleared caches:
 
 | source | size | reproduces |
 |---|---|---|
 | `.zig-cache/f/crash` | 16 bytes, the crashing input, identical every run | yes, 3/3 |
 | `.zig-cache/f/<coverage_id>/{0,1}` | 16 bytes, near misses, different every run | no, 0/3 |
 
-The coverage directory holds the *corpus* — inputs kept for being interesting,
-not for failing. Promoting from it, as this document previously instructed,
-commits a seed that reproduces nothing: precisely the outcome the instruction
-was written to avoid. Verified by replaying each seed as a `corpus` entry in a
-non-fuzz build, where `std.testing.fuzz` runs the target over the corpus and
-nothing else: the `crash` seed fails the replay and the coverage-directory
-seeds pass it.
+That probe is what an earlier revision of this section generalised from, when
+it asserted `crash` is always the right source. **That was wrong.** In the real
+harness (`tests/fuzz_targets.zig`), with a deliberately planted failure,
+`.zig-cache/f/crash` is written **0 bytes** and stays 0 bytes — which is what
+`cgz-r27` reported in the first place, and what the small probe simply failed
+to reproduce.
+
+Ruled out as the cause, each by measurement:
+
+- **Not input size.** A probe drawing up to 40 values before failing still
+  produced a 17-byte `crash`; the fuzzer minimises, so a large draw does not
+  mean a large recorded input.
+- **Not `-Dfuzz-filter`.** Filtered and unfiltered runs of the real harness
+  both produced 0 bytes.
+
+The root cause is not yet identified, and is `cgz-1js`. Until it is, the only
+durable rule is the one that does not depend on knowing: **try every candidate
+and keep whichever reproduces**, and commit nothing that does not.
+`tools/run-fuzz` does exactly that, and refuses to write a seed it could not
+replay — it reports the crash and asks for the input to be captured by hand
+rather than committing one that tests nothing.
+`tools/check-fuzz-seed-promotion` reports which source is winning on a given
+toolchain.
 
 **A crashing fuzz run exits 0.** Measured for both failure shapes — a returned
 error and a `@panic` reporting `signal ABRT`, the exact case the line above

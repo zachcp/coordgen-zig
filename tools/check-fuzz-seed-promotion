@@ -3,13 +3,21 @@
 
 cgz-r27 failure 2 records that the pinned fuzzer wrote `.zig-cache/f/crash` as
 a 0-byte file, and prescribes promoting from `.zig-cache/f/<coverage_id>/`
-instead. On the toolchain currently pinned that is FALSE, and following it
-would produce exactly the outcome the bead exists to prevent - a committed seed
-that reproduces nothing. Measured here, three runs from cleared caches:
+instead. BOTH behaviours occur on the pinned toolchain, which is why this tool
+measures instead of assuming.
+
+In this tool's own small planted fixture, three runs from cleared caches:
 
     .zig-cache/f/crash                 16 bytes, the crashing input, every run
     .zig-cache/f/<coverage_id>/{0,1}   16 bytes, near misses, different every
                                        run, never the crashing input
+
+But in the real harness (tests/fuzz_targets.zig) `crash` is written 0 bytes,
+exactly as the bead reported. Input size and -Dfuzz-filter were both ruled out
+by measurement; the cause is cgz-1js. So a result from this tool describes the
+fixture it planted, and is evidence about the toolchain rather than a rule for
+every target - which is why tools/run-fuzz replays candidates itself rather
+than trusting this answer.
 
 So this tool does not hardcode either answer. It plants a fuzz target that
 fails on a discoverable input, runs the fuzzer until it fails, and then REPLAYS

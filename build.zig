@@ -1407,8 +1407,44 @@ pub fn build(b: *std.Build) !void {
     examples_step.dependOn(&install_isolation.step);
 
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
-    const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
-    fuzz_step.dependOn(&fuzz_pending.step);
+    // The fuzz targets are an ordinary test binary. In a normal build
+    // `std.testing.fuzz` replays only `options.corpus`, so every promoted seed
+    // is a deterministic regression test on `test`; under `--fuzz` the same
+    // binary searches. One shape, both modes.
+    const fuzz_targets_module = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_targets.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api", .module = api },
+            .{ .name = "core", .module = core },
+        },
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    // One target per invocation. The toolchain's FUZZING REPORT names only one
+    // of the fuzz tests that actually ran - measured by planting a failure in
+    // the second target, which fired while the report listed only the first -
+    // so the report cannot say which targets were covered. Running them one at
+    // a time is what makes the scope of a run knowable, and it is also what
+    // lets each target carry its own recorded budget.
+    const fuzz_filter = b.option([]const u8, "fuzz-filter", "Run only the fuzz target whose name contains this");
+    const fuzz_targets_tests = b.addTest(.{
+        .name = "fuzz-targets-test",
+        .root_module = fuzz_targets_module,
+        .filters = if (fuzz_filter) |filter| &.{filter} else &.{},
+    });
+    const run_fuzz_targets = b.addRunArtifact(fuzz_targets_tests);
+    fuzz_step.dependOn(&run_fuzz_targets.step);
+    // The driver owns budgets, per-target scoping, crash detection and seed
+    // promotion. `zig build fuzz` alone replays the committed corpus and
+    // proves the harness is wired; searching is `tools/run-fuzz`, because a
+    // search needs an iteration budget and a place to put what it finds.
+    const fuzz_driver_check = b.addSystemCommand(&.{ "python3", "tools/run-fuzz", "--check-budgets" });
+    fuzz_step.dependOn(&fuzz_driver_check.step);
+    // Committed seeds replay on the ordinary gate, which is the whole reason
+    // to promote them.
+    test_step.dependOn(&run_fuzz_targets.step);
     // Attached now, before the harness exists, so cgz-7v2.4.4 inherits it
     // rather than having to remember it: on a compiler backend whose
     // std.testing.fuzz returns immediately, every fuzz target is a no-op that
