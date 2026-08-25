@@ -54,8 +54,9 @@ Measured on the pin, host aarch64-macos, each run from a cleared `.zig-cache`:
   byte comparisons — was found in **75 and 78 runs** on two independent runs.
   Unique runs climbed 0 → 13 and 0 → 15. That is coverage-guided progress, not
   random search.
-- A crash **fails the build**: non-zero exit,
-  `error: test '...' terminated with signal ABRT`.
+- A crash prints `error: test '...' terminated with signal ABRT; input saved
+  to '.zig-cache/f/crash'` — but **`zig build` still exits 0**. See the
+  correction below; this line previously claimed a non-zero exit.
 - A fuzz-instrumented test binary **cross-compiles cleanly** for
   `x86_64-linux-gnu`.
 - Throughput anchor: 1,000,007 iterations of a trivial target in **15.1 s** wall
@@ -90,6 +91,47 @@ sequence. They are **coupled to that target's decode order**: changing the order
 or type of `Smith` draws in a target reinterprets its existing seeds. A target's
 seeds must be regenerated when its decode sequence changes.
 
+## Corrections, 2026-08-24 (cgz-r27)
+
+Two claims above were measured false on the same pin they were recorded
+against. Both are corrected here rather than edited away, because a harness
+built on either would have failed silently in the way this document exists to
+prevent. Reproduce with `tools/check-fuzz-seed-promotion --self-test`, which
+plants a fuzz target that fails on a discoverable input and replays every
+candidate seed.
+
+**`.zig-cache/f/crash` is not 0 bytes, and it is the seed that reproduces.**
+Three runs from cleared caches, planted two-byte failure condition:
+
+| source | size | reproduces |
+|---|---|---|
+| `.zig-cache/f/crash` | 16 bytes, the crashing input, identical every run | yes, 3/3 |
+| `.zig-cache/f/<coverage_id>/{0,1}` | 16 bytes, near misses, different every run | no, 0/3 |
+
+The coverage directory holds the *corpus* — inputs kept for being interesting,
+not for failing. Promoting from it, as this document previously instructed,
+commits a seed that reproduces nothing: precisely the outcome the instruction
+was written to avoid. Verified by replaying each seed as a `corpus` entry in a
+non-fuzz build, where `std.testing.fuzz` runs the target over the corpus and
+nothing else: the `crash` seed fails the replay and the coverage-directory
+seeds pass it.
+
+**A crashing fuzz run exits 0.** Measured for both failure shapes — a returned
+error and a `@panic` reporting `signal ABRT`, the exact case the line above
+described. In each, the crash is printed, the seed is written, and
+`zig build test --fuzz=N` exits **0**. The identical failure replayed in a
+normal run exits 1.
+
+This is a third silent failure in the family cgz-r27 names, and the most
+dangerous of the three: the backend can be right, the seed can be written, the
+crash can be found, and CI is still green. A harness must decide pass/fail from
+the run's output and the artifacts it leaves, never from that exit status.
+
+**Why the tool does not hardcode the corrected answer.** `cgz-r24` will move to
+released Zig, and either behaviour may change again. The checked-in tool
+determines empirically which source yields a reproducing seed and fails when
+none does, so the answer is re-measured rather than re-argued.
+
 ## Operating constraints
 
 These are properties of the pinned toolchain, each measured. The harness must
@@ -109,8 +151,9 @@ respect them.
    mode, so the harness must assert `builtin.zig_backend` is not a `need_simple`
    backend instead of trusting the default.
 
-3. **Do not promote seeds from the fuzzer's `crash` file.** On the pin,
-   `.zig-cache/f/crash` is written **0 bytes** even when the crashing input is
-   known — reproduced on two independent crashing runs from cleared caches. The
-   persistent corpus directory `.zig-cache/f/<coverage_id>/{0,1,2,…}` does hold
-   real, replayable seeds; promotion must read that directory.
+3. **Do not trust `zig build --fuzz`'s exit status, and verify every promoted
+   seed by replay.** Both of this item's earlier instructions were measured
+   false on the pin and have been corrected below. What survives is the
+   requirement they were trying to serve: a promoted seed must be *proven* to
+   reproduce before it is committed, and pass/fail must be read from the run's
+   output and artifacts rather than from its exit code.

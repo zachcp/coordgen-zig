@@ -1426,6 +1426,21 @@ pub fn build(b: *std.Build) !void {
     });
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_backend_tests).step);
 
+    // cgz-r27 failure 2. The bead prescribed promoting seeds from the coverage
+    // directory because `.zig-cache/f/crash` was observed 0 bytes; on this pin
+    // that is false and following it would commit a seed reproducing nothing.
+    // This determines the answer by measurement instead of hardcoding either
+    // one, and fails when NO source yields a reproducing seed - which is the
+    // hazard the bead is actually about. Deliberately on `fuzz` rather than
+    // `test`: it runs the fuzzer twice and takes about 40 seconds.
+    const fuzz_seed_promotion = b.addSystemCommand(&.{
+        "python3",
+        "tools/check-fuzz-seed-promotion",
+        "--self-test",
+    });
+    fuzz_seed_promotion.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    fuzz_step.dependOn(&fuzz_seed_promotion.step);
+
     // A step with no dependencies succeeds instantly and reports success, which
     // is the cgz-r20 failure mode. tools/check-gate-strength used to assert
     // this by grepping build.zig for the string "<step>.dependOn(" - a text
