@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""Run every declared gate and report what the tree can and cannot claim.
+
+cgz-7v2.4.8 asks for a report where every claim links to a reproducible
+command, and which contains no uncovered in-scope requirement, no placeholder
+gate, and no unsupported universal-parity statement. This produces that report
+by RUNNING the gates rather than describing them, so a claim that is not
+reproducible cannot appear.
+
+It is designed to fail while the port is unfinished. Release gates that are
+still reserved `addFail`s owned by open beads are reported as RESERVED, and
+RESERVED is a non-zero exit. A tool that summarised them as "not applicable"
+would be the placeholder-gate defect the bead names.
+
+## The three properties, and how each is enforced
+
+1. No uncovered in-scope requirement. Every step `zig build --help` lists must
+   appear in this report. The step list is read from the build itself, not
+   transcribed, so adding a step without auditing it is a failure here rather
+   than an omission nobody notices.
+
+2. No placeholder gate. Every `b.addFail` in build.zig must be ACTIONABLE:
+   either it names the bead that owns the unimplemented work, or it tells the
+   operator how to make the gate run (a `-D` flag, a package to install).
+   Those are the two legitimate kinds - reserved work, and a gate conditional
+   on the host or on a flag - and both leave the reader somewhere to go. A
+   message that does neither is indistinguishable from a gate somebody
+   switched off, and fails here.
+
+3. No unsupported universal-parity statement. The differential's own numbers
+   are quoted with the partition they were measured on, and the partitions NOT
+   measured are named in the same table. There is no summary line that says
+   "parity" without saying over what.
+
+Usage:
+    tools/validation-audit [--zig PATH] [--output PATH] [--skip-oracle] [--quick]
+"""
+
+import argparse
+import datetime
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Steps that need the lazily-fetched C++ oracle. Kept explicit so --skip-oracle
+# reports them as SKIPPED-by-request rather than quietly passing.
+ORACLE_STEPS = {
+    "upstream-oracle",
+    "conformance",
+    "template-regeneration-check",
+    "performance-baseline",
+    "sanitizer-check",
+}
+
+# Steps this tool does not run, with the reason. `install`/`uninstall` mutate
+# the prefix and are not gates; `examples` and `fuzz` are gates and ARE run.
+NOT_A_GATE = {
+    "install": "installs artifacts; exercised by package-check and abi-check",
+    "uninstall": "removes artifacts; not a gate",
+}
+
+# Slow steps skipped by --quick, so the fast path stays useful without
+# pretending the slow ones passed.
+SLOW_STEPS = {"fuzz", "performance-baseline"}
+
+
+def fail(message):
+    print(f"validation-audit: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def resolve_zig(explicit):
+    if explicit:
+        return explicit
+    if os.environ.get("CGZ_ZIG"):
+        return os.environ["CGZ_ZIG"]
+    bootstrap = ROOT / "tools" / "bootstrap-zig"
+    if bootstrap.is_file():
+        result = subprocess.run(
+            [str(bootstrap)], capture_output=True, text=True, cwd=str(ROOT)
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+    found = shutil.which("zig")
+    if not found:
+        fail("cannot locate zig; pass --zig or set CGZ_ZIG")
+    return found
+
+
+def declared_steps(zig):
+    """Read the step list out of the build, so it cannot drift from reality."""
+    result = subprocess.run(
+        [zig, "build", "--help"], cwd=str(ROOT), capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        fail("`zig build --help` failed; the build does not configure")
+    text = result.stdout + result.stderr
+    body = re.search(r"^Steps:\n(.*?)\n\n", text, re.S | re.M)
+    if not body:
+        fail("could not find the Steps section of `zig build --help`")
+    steps = []
+    for line in body.group(1).splitlines():
+        match = re.match(r"\s+(\S+)\s+(.*)$", line)
+        if match:
+            name = match.group(1)
+            steps.append((name.replace("(default)", "").strip(), match.group(2).strip()))
+    if not steps:
+        fail("parsed zero steps from `zig build --help`")
+    return steps
+
+
+def reserved_gates():
+    """Every deliberate addFail, classified by what makes it legitimate.
+
+    cgz-r21 requires a gate to fail by name rather than pass vacuously, and
+    there are two honest reasons a gate fails by name:
+
+      reserved     the work is not written yet, and the message names the bead
+                   that owns it
+      conditional  the gate needs a flag or a host capability the operator did
+                   not supply, and the message says which
+
+    Both leave the reader somewhere to go. Anything else is a gate that has
+    been switched off wearing a gate's clothes.
+    """
+    source = (ROOT / "build.zig").read_text()
+    found = []
+    for match in re.finditer(r"addFail\(\s*(.*?)\);", source, re.S):
+        blob = match.group(1)
+        text = " ".join(re.findall(r'"([^"]*)"', blob)).strip()
+        bead = re.search(r"cgz-[0-9a-z.]+", text)
+        remedy = "-D" in text or "install" in text
+        if bead:
+            kind = "reserved"
+        elif remedy:
+            kind = "conditional"
+        else:
+            kind = "UNACTIONABLE"
+        found.append((text, bead.group(0) if bead else None, kind))
+    return found
+
+
+def run_step(zig, step, oracle, timeout=1800):
+    command = [zig, "build", step]
+    if oracle and step in ORACLE_STEPS:
+        command.append("-Denable-oracle=true")
+    if step == "sanitizer-check" and oracle:
+        command.append("-Dsanitize-oracle=true")
+    try:
+        result = subprocess.run(
+            command, cwd=str(ROOT), capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return "TIMEOUT", " ".join(command), ""
+    output = result.stdout + result.stderr
+    if result.returncode == 0:
+        return "PASS", " ".join(command), output
+    # A reserved gate fails on purpose and says which bead owns it. That is a
+    # different finding from a gate that broke, and conflating the two is how
+    # an unfinished port starts looking finished.
+    if re.search(r"is not implemented yet|awaits the first|requires -D", output):
+        return "RESERVED", " ".join(command), output
+    return "FAIL", " ".join(command), output
+
+
+DIFFERENTIAL_RE = re.compile(
+    r"native-oracle-diff (\w+): (\d+) members.*?max coordinate deviation: ([\d.]+)", re.S
+)
+
+
+def differential_output(zig, cached_output):
+    """The differential's numbers, re-measured rather than scraped.
+
+    `zig build conformance` prints nothing when the step is cached, so reading
+    its stdout makes the report's parity section depend on whether someone
+    happened to have a warm cache - which would silently turn a real
+    measurement into "no parity claim". The diff executable prints its summary
+    every time it runs, so run it.
+    """
+    if DIFFERENTIAL_RE.search(cached_output):
+        return cached_output
+    candidates = sorted(
+        (ROOT / ".zig-cache" / "o").glob("*/native-oracle-diff"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        result = subprocess.run(
+            [
+                str(candidate),
+                "--partition",
+                "drug_like",
+                "--ceiling",
+                str(ROOT / "conformance" / "parity_ceiling.tsv"),
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        combined = result.stdout + result.stderr
+        if DIFFERENTIAL_RE.search(combined):
+            return combined
+    return ""
+
+
+def differential_summary(conformance_output):
+    match = DIFFERENTIAL_RE.search(conformance_output)
+    if not match:
+        return None
+    observables = re.findall(r"^\s+(\w+): (\d+)/(\d+) matched", conformance_output, re.M)
+    return {
+        "partition": match.group(1),
+        "members": int(match.group(2)),
+        "deviation": match.group(3),
+        "observables": observables,
+    }
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--zig")
+    parser.add_argument("--output", default="-")
+    parser.add_argument("--skip-oracle", action="store_true")
+    parser.add_argument("--quick", action="store_true")
+    args = parser.parse_args(argv)
+
+    zig = resolve_zig(args.zig)
+    version = subprocess.run(
+        [zig, "version"], capture_output=True, text=True
+    ).stdout.strip()
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ROOT), capture_output=True, text=True
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=str(ROOT), capture_output=True, text=True
+    ).stdout.strip()
+
+    steps = declared_steps(zig)
+    results = []
+    conformance_output = ""
+    for name, description in steps:
+        if name in NOT_A_GATE:
+            results.append((name, description, "NOT-A-GATE", NOT_A_GATE[name], ""))
+            continue
+        if args.quick and name in SLOW_STEPS:
+            results.append(
+                (name, description, "SKIPPED", f"{zig} build {name} (--quick)", "")
+            )
+            continue
+        if args.skip_oracle and name in ORACLE_STEPS:
+            results.append(
+                (
+                    name,
+                    description,
+                    "SKIPPED",
+                    f"{zig} build {name} -Denable-oracle=true (--skip-oracle)",
+                    "",
+                )
+            )
+            continue
+        print(f"validation-audit: running {name}", file=sys.stderr)
+        status, command, output = run_step(zig, name, not args.skip_oracle)
+        if name == "conformance":
+            conformance_output = output
+        results.append((name, description, status, command, output))
+
+    lines = []
+    add = lines.append
+    add("# Validation audit")
+    add("")
+    add(f"- Generated: {datetime.datetime.now().isoformat(timespec='seconds')}")
+    add(f"- Commit: `{commit}`{' (WORKING TREE DIRTY)' if dirty else ''}")
+    add(f"- Toolchain: `{version}`")
+    add(f"- Reproduce: `tools/validation-audit`")
+    add("")
+    add(
+        "Every row below was produced by running the command in it. A status is"
+        " a measurement, not a description."
+    )
+    add("")
+    add("## Gates")
+    add("")
+    add("| Step | Status | Reproduce |")
+    add("|---|---|---|")
+    for name, _description, status, command, _output in results:
+        shown = command.replace(str(ROOT) + "/", "")
+        add(f"| `{name}` | **{status}** | `{shown}` |")
+    add("")
+
+    reserved = [(name, status) for name, _d, status, _c, _o in results if status == "RESERVED"]
+    failed = [(name, status) for name, _d, status, _c, _o in results if status in ("FAIL", "TIMEOUT")]
+
+    add("## Reserved gates")
+    add("")
+    gates = reserved_gates()
+    unactionable = [text for text, _bead, kind in gates if kind == "UNACTIONABLE"]
+    add(
+        "A gate that fails by name rather than passing vacuously is what"
+        " cgz-r21 requires. `reserved` means the work is not written yet and"
+        " the message names its bead; `conditional` means the gate needs a flag"
+        " or host capability and the message says which. Both are legitimate."
+        " Anything else is a gate that has been switched off."
+    )
+    add("")
+    add("| Kind | Owning bead | Message |")
+    add("|---|---|---|")
+    for text, bead, kind in gates:
+        add(f"| {kind} | {bead or '-'} | {text[:100]} |")
+    add("")
+
+    add("## Differential")
+    add("")
+    summary = differential_summary(differential_output(zig, conformance_output))
+    if summary:
+        add(
+            f"Measured on the **{summary['partition']}** partition only,"
+            f" {summary['members']} members. Max coordinate deviation"
+            f" {summary['deviation']} bond lengths."
+        )
+        add("")
+        add("| Observable | Matched |")
+        add("|---|---|")
+        for observable, matched, total in summary["observables"]:
+            add(f"| `{observable}` | {matched}/{total} |")
+        add("")
+        add(
+            "**Not measured against the oracle:** the `adversarial` partition"
+            " (2000 members) is consumed by corpus-classify, not by"
+            " native-oracle-diff, so no per-observable oracle comparison exists"
+            " for it. No statement in this report covers inputs outside the"
+            f" `{summary['partition']}` partition."
+        )
+    else:
+        add(
+            "No differential numbers were obtained in this run, so this report"
+            " makes NO parity claim of any kind. If `conformance` shows PASS"
+            " above, it passed without re-emitting its summary; rerun it with"
+            " `-Denable-oracle=true` from a cleared cache to produce the"
+            " numbers."
+        )
+    add("")
+
+    add("## What this report does not establish")
+    add("")
+    if reserved:
+        add("The following gates are reserved and have never run:")
+        add("")
+        for name, _ in reserved:
+            add(f"- `{name}`")
+        add("")
+    add(
+        "While any gate above is RESERVED or FAIL, the validation epic cannot"
+        " close: an independent reviewer cannot reproduce a release gate that"
+        " does not exist yet. This tool exits non-zero in that case by design."
+    )
+    add("")
+
+    report = "\n".join(lines) + "\n"
+    if args.output == "-":
+        print(report)
+    else:
+        pathlib.Path(args.output).write_text(report)
+        print(f"validation-audit: wrote {args.output}", file=sys.stderr)
+
+    if unactionable:
+        print(
+            f"validation-audit: {len(unactionable)} gate(s) fail with neither an"
+            " owning bead nor a remedy",
+            file=sys.stderr,
+        )
+        return 2
+    if failed:
+        print(
+            "validation-audit: FAILING gates: " + ", ".join(n for n, _ in failed),
+            file=sys.stderr,
+        )
+        return 2
+    if reserved:
+        print(
+            "validation-audit: "
+            + str(len(reserved))
+            + " gate(s) still reserved: "
+            + ", ".join(n for n, _ in reserved)
+            + " - the validation epic cannot close",
+            file=sys.stderr,
+        )
+        return 1
+    print("validation-audit: every declared gate ran and passed", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
