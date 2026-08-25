@@ -729,10 +729,7 @@ pub fn build(b: *std.Build) !void {
     );
     const performance_step = b.step("performance-check", "Enforce native/oracle performance thresholds");
     const sanitizer_step = b.step("sanitizer-check", "Run oracle facade consumers with UB instrumentation");
-    const performance_pending = b.addFail(
-        "performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cgz-7v2.4.7",
-    );
-    performance_step.dependOn(&performance_pending.step);
+
     const template_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/template_generate.zig"),
         .target = target,
@@ -1083,9 +1080,18 @@ pub fn build(b: *std.Build) !void {
             .imports = &.{
                 .{ .name = "conformance", .module = corpus_layers.conformance },
                 .{ .name = "c_abi", .module = corpus_layers.c_abi },
+                // Native is timed in THIS process, against the same members in
+                // the same build, target and optimize mode. It is reached
+                // through the Zig API rather than the C one because the linked
+                // oracle already provides the `coordgen_*` symbols and a
+                // second definition is the cgz-r28 duplicate-symbol defect.
+                .{ .name = "api", .module = corpus_layers.api },
             },
             .link_libc = true,
             .link_libcpp = true,
+        });
+        benchmark_module.addAnonymousImport("performance_thresholds", .{
+            .root_source_file = b.path("conformance/performance_thresholds.tsv"),
         });
         benchmark_module.addCSourceFile(.{
             .file = b.path("conformance/benchmark_clock.c"),
@@ -1106,6 +1112,14 @@ pub fn build(b: *std.Build) !void {
         // for capture by the caller and rerun the process on every invocation.
         run_benchmark.stdio = .inherit;
         performance_baseline_step.dependOn(&run_benchmark.step);
+        // The same binary, with --enforce, compares each bucket's native/oracle
+        // ratio against the committed thresholds and exits non-zero on a
+        // regression. One implementation times and judges, so the numbers the
+        // gate reads are the numbers the baseline printed.
+        const run_performance_check = b.addRunArtifact(benchmark);
+        run_performance_check.addArg("--enforce");
+        run_performance_check.stdio = .inherit;
+        performance_step.dependOn(&run_performance_check.step);
         const allocator_smoke_module = b.createModule(.{
             .target = target,
             .optimize = corpus_optimize,
@@ -1404,6 +1418,7 @@ pub fn build(b: *std.Build) !void {
         conformance_step.dependOn(&oracle_disabled.step);
         regeneration_step.dependOn(&oracle_disabled.step);
         performance_baseline_step.dependOn(&oracle_disabled.step);
+        performance_step.dependOn(&oracle_disabled.step);
         sanitizer_step.dependOn(&oracle_disabled.step);
     }
 

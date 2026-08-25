@@ -52,10 +52,14 @@ _FLAGS_RE = re.compile(r'\.flags = &\.\{([^}]*)\}')
 _STRING_RE = re.compile(r'"([^"]*)"')
 
 _REQUIRED_TEXT = [
-    # The remaining placeholder gate must fail loudly rather than pass
-    # vacuously until its owning bead attaches real artifacts. Examples and
-    # template regeneration are real gates covered by the graph assertion.
-    'const performance_pending = b.addFail(',
+    # `performance-check` used to be a placeholder required here by its addFail
+    # text. cgz-7v2.4.7 implemented it, so what is pinned instead is that the
+    # gate actually enforces: the same binary that prints the baseline is run
+    # again with --enforce, and the committed thresholds are compiled into it.
+    # Dropping either leaves a performance step that measures and then ignores
+    # what it measured.
+    'run_performance_check.addArg("--enforce")',
+    'benchmark_module.addAnonymousImport("performance_thresholds"',
     # `fuzz` used to be a placeholder required here by its addFail text. Now
     # that cgz-7v2.4.4 has implemented it, what has to be pinned instead are
     # the three things that keep it from certifying nothing - each one a
