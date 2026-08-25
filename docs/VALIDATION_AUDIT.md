@@ -1,7 +1,7 @@
 # Validation audit
 
-- Generated: 2026-08-24T21:36:46
-- Commit: `490dccd1e1369e325fa66dcfe318e2514b668b9c` (WORKING TREE DIRTY)
+- Generated: 2026-08-25T18:57:42
+- Commit: `0f715ef010ed9319f88eaab0519f52ce5ef57c5d` (WORKING TREE DIRTY)
 - Toolchain: `0.17.0-dev.1516+8a4b5424d`
 - Host: `arm64-darwin` — **one host only**; see the scope note at the end
 - Reproduce: `tools/validation-audit`
@@ -25,10 +25,10 @@ Every row below was produced by running the command in it. A status is a measure
 | `conformance` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build conformance -Denable-oracle=true` |
 | `template-regeneration-check` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build template-regeneration-check -Denable-oracle=true` |
 | `performance-baseline` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build performance-baseline -Denable-oracle=true` |
-| `performance-check` | **RESERVED** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build performance-check` |
+| `performance-check` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build performance-check -Denable-oracle=true` |
 | `sanitizer-check` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build sanitizer-check -Denable-oracle=true -Dsanitize-oracle=true` |
 | `examples` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build examples` |
-| `fuzz` | **RESERVED** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build fuzz` |
+| `fuzz` | **PASS** | `.tools/toolchains/aarch64-macos/0.17.0-dev.1516+8a4b5424d/zig build fuzz` |
 
 ## Reserved gates
 
@@ -36,11 +36,9 @@ A gate that fails by name rather than passing vacuously is what cgz-r21 requires
 
 | Kind | Owning bead | Message |
 |---|---|---|
-| reserved | cgz-7v2.4.7 | performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cg |
 | conditional | - | sanitizer-check requires -Denable-oracle=true -Dsanitize-oracle=true |
 | conditional | - | corpus-check needs to run {s}-{s} binaries for the architecture axis;  on Linux install qemu-user an |
 | conditional | - | oracle steps require -Denable-oracle=true; ordinary builds never fetch conformance sources |
-| reserved | cgz-7v2.4.4 | fuzz is not implemented yet; see cgz-7v2.4.4 |
 
 ## Differential
 
@@ -59,11 +57,6 @@ Measured on the **drug_like** partition only, 7 members. Max coordinate deviatio
 **Not measured against the oracle:** the `adversarial` partition (2000 members) is consumed by corpus-classify, not by native-oracle-diff, so no per-observable oracle comparison exists for it. No statement in this report covers inputs outside the `drug_like` partition.
 
 ## What this report does not establish
-
-The following gates are reserved and have never run:
-
-- `performance-check`
-- `fuzz`
 
 While any gate above is RESERVED or FAIL, the validation epic cannot close: an independent reviewer cannot reproduce a release gate that does not exist yet. This tool exits non-zero in that case by design.
 

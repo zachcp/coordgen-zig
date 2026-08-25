@@ -59,6 +59,11 @@ ORACLE_STEPS = {
     "conformance",
     "template-regeneration-check",
     "performance-baseline",
+    # Comparing native against the oracle needs the oracle. Omitting this ran
+    # the gate without it and reported the resulting "requires -Denable-oracle"
+    # refusal as a FAILURE, which is how a conditional gate gets mistaken for a
+    # broken one.
+    "performance-check",
     "sanitizer-check",
 }
 
@@ -168,7 +173,9 @@ def run_step(zig, step, oracle, timeout=1800):
     # A reserved gate fails on purpose and says which bead owns it. That is a
     # different finding from a gate that broke, and conflating the two is how
     # an unfinished port starts looking finished.
-    if re.search(r"is not implemented yet|awaits the first|requires -D", output):
+    # `require -D` and `requires -D` both appear in the tree's conditional-gate
+    # messages; matching only the second read one of them as a hard failure.
+    if re.search(r"is not implemented yet|awaits the first|requires? -D", output):
         return "RESERVED", " ".join(command), output
     return "FAIL", " ".join(command), output
 
