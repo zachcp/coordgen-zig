@@ -41,12 +41,21 @@ part of this driver. None of them is theoretical - each was reproduced.
    not replay. `tools/check-fuzz-seed-promotion` reports which source is
    winning on a given toolchain.
 
+   On this pin the real targets here hit the 0-byte case (cgz-1js), so a
+   finding often cannot be promoted as bytes at all. Rather than lose it, the
+   driver records a REPRODUCTION RECIPE - the exact command, the runner's seed,
+   and the failure text - into the target's seed file as a comment. A recipe is
+   worth less than a seed, because re-finding the input costs another search
+   and the search is not guaranteed to be deterministic. It is worth much more
+   than nothing, which is what a crash detected and then dropped is worth.
+
 Usage:
     tools/run-fuzz --check-budgets        validate the budget table only
     tools/run-fuzz [--extended] [--target NAME] [--zig PATH]
 """
 
 import argparse
+import datetime
 import os
 import pathlib
 import re
@@ -178,6 +187,45 @@ def zig_escape(data):
     return "".join(f"\\x{byte:02x}" for byte in data)
 
 
+_SEED_RE = re.compile(r"--seed=(0x[0-9a-f]+)")
+_FAILURE_RE = re.compile(r"^.*(?:terminated with signal|exited with code \d|failed with error\.).*$", re.M)
+
+
+def recordRecipe(target, iterations, output):
+    """Write a reproduction recipe into the target's seed file.
+
+    Used when a crash was found but no candidate seed reproduced it, which on
+    this toolchain is the common case (cgz-1js). The recipe is a comment, not a
+    corpus entry: it changes nothing about what `zig build test` runs, and it
+    cannot be mistaken for a seed that reproduces.
+    """
+    path = seed_path(target)
+    seed = _SEED_RE.search(output)
+    failure = _FAILURE_RE.search(output)
+    existing = path.read_text() if path.is_file() else ""
+    body = existing.split("pub const seeds", 1)
+    header = body[0] if len(body) == 2 else ""
+    tail = "pub const seeds" + body[1] if len(body) == 2 else "pub const seeds: []const []const u8 = &.{};\n"
+    recipe = (
+        "//\n"
+        f"// UNPROMOTED FINDING, {datetime.date.today().isoformat()}\n"
+        "//\n"
+        "// The fuzzer found a failure in this target and none of the candidate\n"
+        "// seeds reproduced it, so there are no bytes to commit (cgz-1js).\n"
+        "// This is the finding, recorded so it is not lost:\n"
+        "//\n"
+        f"//   failure:  {failure.group(0).strip() if failure else 'see the run output'}\n"
+        f"//   command:  zig build fuzz -Dfuzz-filter={target!r} --fuzz={iterations}"
+        f"{' --seed=' + seed.group(1) if seed else ''}\n"
+        "//\n"
+        "// Re-running that command searches again; it is not a replay, and the\n"
+        "// search may take a different path. Delete this block once the input\n"
+        "// is captured and promoted as a real seed.\n"
+    )
+    path.write_text(header.rstrip("\n") + "\n" + recipe + tail)
+    return path
+
+
 # Replaying a candidate costs a full `zig build test`, so the search is
 # bounded. Newest first, because the run that just crashed wrote the newest
 # files.
@@ -218,8 +266,15 @@ def run_target(zig, target, iterations):
     if crash_file.exists():
         crash_file.unlink()
     started = time.time()
+    # `test` rather than `fuzz`: the `fuzz` step also runs the harness's own
+    # preconditions - the backend assertion, this tool's self-test, and
+    # check-fuzz-seed-promotion, which itself fuzzes a fixture twice. Those are
+    # right for the gate and pure overhead here, where they would be repeated
+    # once per target. The fuzz TARGETS are on `test` as well, because their
+    # committed corpora are regression tests, so `--fuzz` reaches them either
+    # way.
     result = subprocess.run(
-        [zig, "build", "fuzz", f"-Dfuzz-filter={target}", f"--fuzz={iterations}"],
+        [zig, "build", "test", f"-Dfuzz-filter={target}", f"--fuzz={iterations}"],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -313,12 +368,39 @@ def self_test():
     if crashedFromOutput(_CLEAN_RUN_SAMPLE):
         problems.append("a clean run was reported as a crash")
 
+    # The recipe writer is the containment for cgz-1js, and it writes into a
+    # file the build compiles, so a malformed recipe would break the build
+    # rather than record a finding. Exercised here against a scratch target
+    # name so the real seed files are untouched.
+    scratch = "selftest scratch target"
+    scratch_path = seed_path(scratch)
+    try:
+        written = recordRecipe(scratch, 1234, _CRASHING_RUN_SAMPLES[1][1] + " --seed=0xdeadbeef")
+        text = written.read_text()
+        if "UNPROMOTED FINDING" not in text:
+            problems.append("the reproduction recipe was not written")
+        if "--seed=0xdeadbeef" not in text:
+            problems.append("the recipe did not carry the runner's seed")
+        if "--fuzz=1234" not in text:
+            problems.append("the recipe did not carry the iteration budget")
+        if "pub const seeds" not in text:
+            problems.append("the recipe destroyed the seed table it was appended to")
+        # Every recipe line must be a comment: a recipe is evidence, never a
+        # corpus entry, and must not change what `zig build test` runs.
+        for line in text.splitlines():
+            if line.startswith("//") or line.startswith("pub const seeds") or not line.strip():
+                continue
+            problems.append(f"recipe produced a non-comment line: {line!r}")
+    finally:
+        if scratch_path.is_file():
+            scratch_path.unlink()
+
     # And nothing in the tree may gate on that exit status. The replay in
     # `replay_reproduces` DOES read returncode, and legitimately: it runs
     # `zig build test` WITHOUT --fuzz, where a failing test does exit non-zero.
     # That distinction is the whole point, so it is checked rather than assumed.
     source = pathlib.Path(__file__).read_text()
-    fuzz_call = source.index('"build", "fuzz"')
+    fuzz_call = source.index('f"--fuzz={iterations}"')
     window = source[fuzz_call : fuzz_call + 400]
     if "returncode" in window:
         problems.append(
@@ -371,10 +453,11 @@ def main(argv):
         print(f"run-fuzz: {target}: FAILURE FOUND", file=sys.stderr)
         print(output[-3000:], file=sys.stderr)
         if not candidates:
+            recorded = recordRecipe(target, iterations, output)
             findings.append(
-                f"{target}: crashed but the run left no non-empty seed"
-                " anywhere; the failure is real and is NOT captured. Do not"
-                " clear the cache before investigating."
+                f"{target}: crashed and the run left no non-empty seed anywhere"
+                " (cgz-1js). Wrote a reproduction recipe to"
+                f" {recorded.relative_to(ROOT)} so the finding is not lost."
             )
             continue
         promoted = None
@@ -395,11 +478,12 @@ def main(argv):
                 f" {seed_path(target).relative_to(ROOT)}, proven to reproduce"
             )
         else:
+            recorded = recordRecipe(target, iterations, output)
             findings.append(
                 f"{target}: crashed, but none of the {len(candidates)} candidate"
-                " seeds reproduced, so NOTHING was committed. The failure is"
-                " real; capture it by hand from the output above rather than"
-                " committing a seed that tests nothing."
+                " seeds reproduced, so no seed was committed (cgz-1js). Wrote a"
+                f" reproduction recipe to {recorded.relative_to(ROOT)} so the"
+                " finding is not lost; it is a comment, not a corpus entry."
             )
 
     for finding in findings:
