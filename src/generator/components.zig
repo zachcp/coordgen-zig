@@ -115,6 +115,16 @@ pub fn selectProximityCenter(graph: topology.Graph, relations: []const Proximity
 
 const WeightedAngle = struct { weight: f32, angle: f32 };
 
+/// Observable disposition of every component offered to global orientation.
+/// A component is either oriented or explicitly declined because fixed or
+/// constrained input requires its pose to remain unchanged. Keeping the two
+/// counts separate prevents an input class from silently disappearing behind
+/// a successful generation (cgz-7v2.22).
+pub const OrientationOutcome = struct {
+    oriented_components: u32 = 0,
+    constrained_components: u32 = 0,
+};
+
 /// Apply upstream's global bestRotation/maybeFlip rules (sketcherMinimizer.cpp
 /// :822 and :612). Both run on every component whose fragments are neither
 /// fixed nor constrained, ring-containing ones included: upstream's only ring
@@ -129,7 +139,8 @@ pub fn orientComponents(
     graph: topology.Graph,
     rings: topology.RingMembership,
     fragmentation: ?layout.Fragmentation,
-) core.errors.Error!void {
+) core.errors.Error!OrientationOutcome {
+    var outcome: OrientationOutcome = .{};
     var analysis: ?topology.rings.Analysis = null;
     defer if (analysis) |*value| value.deinit();
     if (fragmentation != null and rings.rings.len != 0) {
@@ -143,7 +154,10 @@ pub fn orientComponents(
         for (members) |atom| {
             constrained = constrained or atoms[atom.index()].fixed or atoms[atom.index()].constrained;
         }
-        if (constrained) continue;
+        if (constrained) {
+            outcome.constrained_components += 1;
+            continue;
+        }
 
         var angles: std.ArrayList(WeightedAngle) = .empty;
         defer angles.deinit(allocator);
@@ -208,7 +222,9 @@ pub fn orientComponents(
             }
         }
         try maybeFlipComponent(allocator, atoms, bonds, graph, rings, analysis, fragmentation, component, members);
+        outcome.oriented_components += 1;
     }
+    return outcome;
 }
 
 /// One fragment's rings, in ring-index order. Upstream assigns a ring to the
@@ -925,7 +941,7 @@ fn generateMetaCoordinates(
     var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
     defer fragmentation.deinit();
     try layout.initializeCoordinates(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, fragmentation);
-    try orientComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, null);
+    _ = try orientComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, null);
 
     const coordinates = allocator.alloc(Vec2, meta_atoms.len) catch return error.OutOfMemory;
     for (meta_atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
@@ -1631,9 +1647,35 @@ test "isolated acyclic bond rotates to the upstream horizontal preference" {
     defer graph.deinit();
     var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
     defer rings.deinit();
-    try orientComponents(std.testing.allocator, &atoms, &bonds, graph, rings, null);
+    const outcome = try orientComponents(std.testing.allocator, &atoms, &bonds, graph, rings, null);
+    try std.testing.expectEqual(@as(u32, 1), outcome.oriented_components);
+    try std.testing.expectEqual(@as(u32, 0), outcome.constrained_components);
     try std.testing.expectApproxEqAbs(atoms[0].coordinates.y, atoms[1].coordinates.y, 0.05);
     try std.testing.expectApproxEqAbs(core.math.bond_length, @abs(atoms[1].coordinates.x - atoms[0].coordinates.x), 0.001);
+}
+
+test "global orientation reports constrained components instead of silently skipping them" {
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 0) };
+    atoms[0].constrained = true;
+    atoms[1].coordinates = .{ .y = 50 };
+    const bonds = [_]model.Bond{.{
+        .id = core.ids.BondId.fromIndex(0),
+        .input_index = 0,
+        .start = core.ids.AtomId.fromIndex(0),
+        .end = core.ids.AtomId.fromIndex(1),
+        .input_order = .single,
+        .effective_order = .single,
+    }};
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+
+    const before = atoms[1].coordinates;
+    const outcome = try orientComponents(std.testing.allocator, &atoms, &bonds, graph, rings, null);
+    try std.testing.expectEqual(@as(u32, 0), outcome.oriented_components);
+    try std.testing.expectEqual(@as(u32, 1), outcome.constrained_components);
+    try std.testing.expectEqual(before, atoms[1].coordinates);
 }
 
 test "first crossing proximity pair mirrors only its local component" {

@@ -53,6 +53,10 @@ pub const Outputs = struct {
     /// divergence from an orientation one, which the final coordinates alone
     /// cannot (cgz-7v2.4.2.1). No production caller requests it.
     pre_orientation: ?[]core.math.Vec2 = null,
+    /// Conformance-only stage disposition. This makes the intentional
+    /// fixed/constrained decline distinguishable from a silent input-class
+    /// skip while leaving the public result unchanged (cgz-7v2.22).
+    orientation_outcome: ?*components.OrientationOutcome = null,
 };
 
 /// Compose validated safe-API-shaped input through native preparation,
@@ -176,7 +180,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
             slice[input_index] = atom.coordinates;
         }
     }
-    try components.orientComponents(
+    const orientation_outcome = try components.orientComponents(
         allocator,
         prepared.working.atoms,
         prepared.working.bonds,
@@ -184,6 +188,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.rings,
         fragmentation,
     );
+    if (outputs.orientation_outcome) |outcome| outcome.* = orientation_outcome;
     if (proximity_relations.len == 0 and residue_atoms.len == 0) {
         try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
     } else if (proximity_relations.len == 0) {

@@ -28,6 +28,10 @@ pub const Stages = struct {
     /// The same atoms before `orientComponents` runs.
     pre_orientation: []core.math.Vec2,
     clean_pose: bool,
+    /// Counts every component global orientation handled or intentionally
+    /// declined. Ring-bearing components belong in `oriented_components`;
+    /// only fixed/constrained components belong in the other count.
+    orientation: generator.components.OrientationOutcome,
 
     pub fn deinit(self: *Stages) void {
         self.allocator.free(self.pre_orientation);
@@ -56,11 +60,13 @@ pub fn generateStages(allocator: std.mem.Allocator, input: api.Input) core.error
         return error.OutOfMemory;
     defer allocator.free(internal_to_input);
 
+    var orientation: generator.components.OrientationOutcome = .{};
     const clean_pose = try generator.generateInto(allocator, input, .{
         .coordinates = coordinates,
         .input_to_internal = input_to_internal,
         .internal_to_input = internal_to_input,
         .pre_orientation = pre_orientation,
+        .orientation_outcome = &orientation,
     });
 
     return .{
@@ -68,6 +74,7 @@ pub fn generateStages(allocator: std.mem.Allocator, input: api.Input) core.error
         .coordinates = coordinates,
         .pre_orientation = pre_orientation,
         .clean_pose = clean_pose,
+        .orientation = orientation,
     };
 }
 
@@ -95,6 +102,11 @@ test "the probe reports a pre-orientation pose that global orientation then move
     var stages = try generateStages(std.testing.allocator, input);
     defer stages.deinit();
 
+    // This component contains a six-membered ring. The count is the runtime
+    // declaration that prevents the old `has_ring` decline from returning
+    // unnoticed: the only legal decline category is fixed/constrained.
+    try std.testing.expectEqual(@as(u32, 1), stages.orientation.oriented_components);
+    try std.testing.expectEqual(@as(u32, 0), stages.orientation.constrained_components);
     try std.testing.expectEqual(atoms.len, stages.pre_orientation.len);
     for (stages.pre_orientation) |point| try std.testing.expect(point.isFinite());
     for (stages.coordinates) |point| try std.testing.expect(point.isFinite());
