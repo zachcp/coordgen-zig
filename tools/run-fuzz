@@ -17,9 +17,10 @@ part of this driver. None of them is theoretical - each was reproduced.
    to find, and wrong for exactly the ones it exists to find. A harness that
    spot-checked it would see it work.
 
-   So pass/fail here is read from the run's OUTPUT and the artifacts it leaves.
-   `returncode` is never consulted for that decision, and --self-test pins
-   that.
+   So a discovered crash is read from the run's OUTPUT, never inferred from
+   the exit status. The status is still combined with a valid clean fuzz report
+   to distinguish a completed search from a compiler or infrastructure error.
+   --self-test pins all three outcomes.
 
 2. THE FUZZING REPORT NAMES ONLY ONE TARGET, even when more ran. Measured by
    planting a failure in the second of two targets: it fired, while the report
@@ -69,15 +70,15 @@ BUDGETS = ROOT / "conformance" / "fuzz_budgets.tsv"
 # Fuzz targets live in more than one file: the C ABI's must sit beside the
 # `export fn` declarations it calls. Both are scanned, so a target cannot be
 # added anywhere without also getting a budget row.
-TARGET_SOURCES = (
-    ROOT / "tests" / "fuzz_targets.zig",
-    ROOT / "src" / "c_abi" / "exports.zig",
-)
+NATIVE_TARGET_SOURCE = ROOT / "tests" / "fuzz_targets.zig"
+C_ABI_TARGET_SOURCE = ROOT / "src" / "c_abi" / "exports.zig"
+TARGET_SOURCES = (NATIVE_TARGET_SOURCE, C_ABI_TARGET_SOURCE)
 SEED_DIR = ROOT / "tests" / "fuzz_seeds"
 
 # `test "fuzz: <name>"` is the declaration form; the budget table keys on a
 # substring of it.
 TARGET_RE = re.compile(r'^test "fuzz: (.+)" \{', re.M)
+FUZZ_OPTIMIZE = "safe"
 
 SEED_FILE_HEADER = """//! Promoted regression seeds for the `{target}` target.
 //!
@@ -120,6 +121,11 @@ def declared_targets():
     for source in TARGET_SOURCES:
         found.extend(TARGET_RE.findall(source.read_text()))
     return found
+
+
+def fuzz_step_for_target(target):
+    c_abi_targets = TARGET_RE.findall(C_ABI_TARGET_SOURCE.read_text())
+    return "fuzz-c-abi-target" if target in c_abi_targets else "fuzz-native-target"
 
 
 def read_budgets():
@@ -215,7 +221,8 @@ def recordRecipe(target, iterations, output):
         "// This is the finding, recorded so it is not lost:\n"
         "//\n"
         f"//   failure:  {failure.group(0).strip() if failure else 'see the run output'}\n"
-        f"//   command:  zig build fuzz -Dfuzz-filter={target!r} --fuzz={iterations}"
+        f"//   command:  zig build {fuzz_step_for_target(target)}"
+        f" -Doptimize={FUZZ_OPTIMIZE} -Dfuzz-filter={target!r} --fuzz={iterations}"
         f"{' --seed=' + seed.group(1) if seed else ''}\n"
         "//\n"
         "// Re-running that command searches again; it is not a replay, and the\n"
@@ -266,21 +273,31 @@ def run_target(zig, target, iterations):
     if crash_file.exists():
         crash_file.unlink()
     started = time.time()
-    # `test` rather than `fuzz`: the `fuzz` step also runs the harness's own
-    # preconditions - the backend assertion, this tool's self-test, and
-    # check-fuzz-seed-promotion, which itself fuzzes a fixture twice. Those are
-    # right for the gate and pure overhead here, where they would be repeated
-    # once per target. The fuzz TARGETS are on `test` as well, because their
-    # committed corpora are regression tests, so `--fuzz` reaches them either
-    # way.
+    # The internal step owns exactly one fuzz binary. `test` is too broad: it
+    # runs unrelated ordinary test artifacts under --fuzz, and the pinned
+    # compiler can emit an empty/corrupt coverage file for those. `fuzz` also
+    # repeats harness preconditions once per target. Neither belongs here.
     result = subprocess.run(
-        [zig, "build", "test", f"-Dfuzz-filter={target}", f"--fuzz={iterations}"],
+        [
+            zig,
+            "build",
+            fuzz_step_for_target(target),
+            f"-Doptimize={FUZZ_OPTIMIZE}",
+            f"-Dfuzz-filter={target}",
+            f"--fuzz={iterations}",
+        ],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
     )
     output = result.stdout + result.stderr
-    return crashedFromOutput(output), candidate_seeds(started - 1), output
+    outcome = classifyFuzzRun(result.returncode, output)
+    if outcome == "infrastructure":
+        fail(
+            f"{target}: fuzz command did not complete a valid run"
+            f" (exit {result.returncode})\n{output[-3000:]}"
+        )
+    return outcome == "crash", candidate_seeds(started - 1), output
 
 
 # Every way the test runner announces a failing fuzz iteration. Matched against
@@ -291,12 +308,31 @@ _CRASH_RE = re.compile(
 
 
 def crashedFromOutput(output):
-    """Property 1, factored out so it can be pinned by --self-test.
-
-    Deliberately takes no returncode argument. A signature that accepted one
-    would invite someone to start consulting it.
-    """
+    """Property 1: detect a target failure without consulting its exit status."""
     return bool(_CRASH_RE.search(output))
+
+
+def classifyFuzzRun(returncode, output):
+    """Separate discovered crashes, clean searches, and command failures.
+
+    A crash wins regardless of status because discovered crashes can exit 0.
+    A clean run requires both success status and the report emitted only after
+    the fuzz runner actually starts; everything else is infrastructure failure.
+    """
+    if crashedFromOutput(output):
+        return "crash"
+    if returncode != 0 or "======= FUZZING REPORT =======" not in output:
+        return "infrastructure"
+    return "clean"
+
+
+def classifyReplayRun(returncode, output, target):
+    """Accept only the selected target's failure as reproduction."""
+    if returncode == 0:
+        return "clean"
+    if target in output and crashedFromOutput(output):
+        return "reproduced"
+    return "infrastructure"
 
 
 def replay_reproduces(zig, target, data):
@@ -309,22 +345,35 @@ def replay_reproduces(zig, target, data):
     path = seed_path(target)
     original = path.read_text() if path.is_file() else None
     entries = existing_seeds(path) + [zig_escape(data)]
-    path.write_text(
-        SEED_FILE_HEADER.format(
-            target=target,
-            entries="".join(f'    "{entry}",\n' for entry in entries),
+    keep = False
+    try:
+        path.write_text(
+            SEED_FILE_HEADER.format(
+                target=target,
+                entries="".join(f'    "{entry}",\n' for entry in entries),
+            )
         )
-    )
-    result = subprocess.run(
-        [zig, "build", "test", f"-Dfuzz-filter={target}"],
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-    )
-    reproduced = result.returncode != 0
-    if not reproduced and original is not None:
-        path.write_text(original)
-    return reproduced
+        result = subprocess.run(
+            [zig, "build", "test", f"-Dfuzz-filter={target}"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout + result.stderr
+        outcome = classifyReplayRun(result.returncode, output, target)
+        if outcome == "infrastructure":
+            fail(
+                f"{target}: seed replay did not reach the expected target failure"
+                f" (exit {result.returncode})\n{output[-3000:]}"
+            )
+        keep = outcome == "reproduced"
+        return keep
+    finally:
+        if not keep:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(original)
 
 
 # Real output captured from a crashing fuzz run on the pin. Both shapes are
@@ -352,21 +401,37 @@ _CLEAN_RUN_SAMPLE = (
     "Coverage: 4771/19369 -> 4773/19369 (24.64%)\n"
 )
 
+_REPLAY_TARGET = "generation invariants hold on structurally valid molecules"
+_REPRODUCING_REPLAY_SAMPLE = (
+    f"error: 'fuzz: {_REPLAY_TARGET}' failed:\n"
+    "failed with error.TestUnexpectedResult\n"
+)
+
 
 def self_test():
-    """Pin the property cgz-8hm names: a crash is detected from OUTPUT.
+    """Pin crash, clean, and infrastructure classification.
 
     A crashing fuzz run exits 0 on this toolchain, so a harness that gated on
     the exit status would report green while the fuzzer was finding crashes.
-    These samples are real output from such runs; if detection ever starts
-    depending on the exit status, the samples still carry none and this fails.
+    These samples are real output from such runs. A non-zero command without
+    crash output is a build/infrastructure failure, not a clean search.
     """
     problems = []
     for label, sample in _CRASHING_RUN_SAMPLES:
-        if not crashedFromOutput(sample):
-            problems.append(f"a crashing run ({label}) was not detected from its output")
-    if crashedFromOutput(_CLEAN_RUN_SAMPLE):
-        problems.append("a clean run was reported as a crash")
+        if classifyFuzzRun(0, sample) != "crash":
+            problems.append(f"a crashing exit-0 run ({label}) was not detected from its output")
+    if classifyFuzzRun(0, _CLEAN_RUN_SAMPLE) != "clean":
+        problems.append("a completed clean run was not classified as clean")
+    if classifyFuzzRun(127, "compiler unavailable\n") != "infrastructure":
+        problems.append("a non-zero command failure was reported as a clean fuzz run")
+    if classifyFuzzRun(0, "") != "infrastructure":
+        problems.append("an exit-0 command with no fuzz report was reported as clean")
+    if classifyReplayRun(1, _REPRODUCING_REPLAY_SAMPLE, _REPLAY_TARGET) != "reproduced":
+        problems.append("the selected target's ordinary-test failure did not reproduce")
+    if classifyReplayRun(0, "", _REPLAY_TARGET) != "clean":
+        problems.append("a passing ordinary replay was not classified as clean")
+    if classifyReplayRun(1, "error: unable to build module\n", _REPLAY_TARGET) != "infrastructure":
+        problems.append("a replay compilation failure was accepted as reproduction")
 
     # The recipe writer is the containment for cgz-1js, and it writes into a
     # file the build compiles, so a malformed recipe would break the build
@@ -395,27 +460,13 @@ def self_test():
         if scratch_path.is_file():
             scratch_path.unlink()
 
-    # And nothing in the tree may gate on that exit status. The replay in
-    # `replay_reproduces` DOES read returncode, and legitimately: it runs
-    # `zig build test` WITHOUT --fuzz, where a failing test does exit non-zero.
-    # That distinction is the whole point, so it is checked rather than assumed.
-    source = pathlib.Path(__file__).read_text()
-    fuzz_call = source.index('f"--fuzz={iterations}"')
-    window = source[fuzz_call : fuzz_call + 400]
-    if "returncode" in window:
-        problems.append(
-            "the --fuzz invocation's returncode is read within 400 characters"
-            " of the call; cgz-8hm requires it not be a pass condition"
-        )
-
     for problem in problems:
         print(f"run-fuzz: {problem}", file=sys.stderr)
     if problems:
         return 2
     print(
-        "run-fuzz: self-test verified both crashing-run shapes are detected from"
-        " output, a clean run is not, and the --fuzz call does not consult its"
-        " exit status",
+        "run-fuzz: self-test verified both exit-0 crash shapes, a valid clean"
+        " report, and non-zero/missing-report infrastructure failures",
         file=sys.stderr,
     )
     return 0

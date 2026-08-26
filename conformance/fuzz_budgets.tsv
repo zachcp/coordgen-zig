@@ -20,6 +20,9 @@
 # molecule and then lays it out again to check determinism. 2000 smoke
 # iterations is therefore about three and a half minutes per target, which is a
 # PR-sized cost. The extended budget is an order of magnitude above it.
+# The driver runs ReleaseSafe: Debug writes a zero-length coverage header on
+# x86_64-linux for these multi-module targets, while ReleaseSafe preserves
+# runtime safety checks and produces a valid coverage report on both targets.
 #
 # Raising a budget needs no justification. LOWERING one is a visible diff, which
 # is the point of recording them here rather than in a workflow file.

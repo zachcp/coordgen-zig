@@ -72,6 +72,8 @@ ORACLE_STEPS = {
 NOT_A_GATE = {
     "install": "installs artifacts; exercised by package-check and abi-check",
     "uninstall": "removes artifacts; not a gate",
+    "fuzz-native-target": "internal single-target runner exercised by the fuzz gate",
+    "fuzz-c-abi-target": "internal single-target runner exercised by the fuzz gate",
 }
 
 # Slow steps skipped by --quick, so the fast path stays useful without

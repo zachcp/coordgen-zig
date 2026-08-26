@@ -1,4 +1,4 @@
-//! Promoted regression seeds for the `c abi contract` target.
+//! Promoted regression seeds for the `c abi contract for atom and bond inputs` target.
 //!
 //! Written by tools/run-fuzz, which proves a seed reproduces its failure
 //! before adding it. Each entry replays under ordinary `zig build test`.

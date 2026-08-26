@@ -191,14 +191,23 @@ def candidate_seeds(fuzz_dir):
     return candidates
 
 
-def reproduces(zig, workdir, seed_bytes):
+def classify_replay(returncode, output):
+    """Accept only the planted target's expected failure as reproduction."""
+    if returncode == 0:
+        return "clean"
+    if "promoted seed reproduces" in output and "error.PlantedCrash" in output:
+        return "reproduced"
+    return "infrastructure"
+
+
+def reproduces(zig, workdir, seed_bytes, crash_a=CRASH_A, crash_b=CRASH_B):
     """Replay one seed as a corpus entry in a NON-fuzz build.
 
     This is the reproduction check the harness must run before committing a
     seed. It is the whole point: a seed that does not fail here is a
     regression test that tests nothing.
     """
-    write_project(workdir, REPLAY.format(a=CRASH_A, b=CRASH_B))
+    write_project(workdir, REPLAY.format(a=crash_a, b=crash_b))
     (workdir / "seed.bin").write_bytes(seed_bytes)
     cache = workdir / ".zig-cache"
     if cache.exists():
@@ -210,7 +219,42 @@ def reproduces(zig, workdir, seed_bytes):
         text=True,
         timeout=900,
     )
-    return result.returncode != 0
+    output = result.stdout + result.stderr
+    outcome = classify_replay(result.returncode, output)
+    if outcome == "infrastructure":
+        fail(
+            "seed replay failed without the planted target's expected error"
+            f" (exit {result.returncode})\n{output[-2000:]}"
+        )
+    return outcome == "reproduced"
+
+
+def check_replay_classifier():
+    reproducing = (
+        "error: 'target.test.promoted seed reproduces' failed:\n"
+        "failed with error.PlantedCrash\n"
+    )
+    if classify_replay(1, reproducing) != "reproduced":
+        fail("self-test: the planted target failure was not accepted as reproduction")
+    if classify_replay(0, "") != "clean":
+        fail("self-test: a passing replay was not classified as clean")
+    if classify_replay(1, "error: unable to build module\n") != "infrastructure":
+        fail("self-test: a compilation failure was accepted as reproduction")
+
+
+def check_replay_fixtures(zig):
+    """Prove reproduction and rejection with one deterministic seed."""
+    seed = bytes(16)
+    with tempfile.TemporaryDirectory(prefix="cgz-fuzz-replay-selftest-") as raw:
+        workdir = pathlib.Path(raw)
+        if not reproduces(zig, workdir, seed, crash_a=0, crash_b=0):
+            fail("self-test: the deterministic crashing seed did not reproduce")
+        if reproduces(zig, workdir, seed):
+            fail("self-test: the deterministic clean seed was reported as reproducing")
+    print(
+        "check-fuzz-seed-promotion: self-test verified one deterministic seed"
+        " reproduces its matching failure and does not reproduce a different one"
+    )
 
 
 def measure(zig, runs, limit, verbose=True):
@@ -251,11 +295,13 @@ def main(argv):
     args = parser.parse_args(argv)
 
     zig = resolve_zig(args.zig)
-    runs = 2 if args.self_test else args.runs
-    tally = measure(zig, runs, args.limit)
+    if args.self_test:
+        check_replay_classifier()
+        check_replay_fixtures(zig)
+        return 0
+    tally = measure(zig, args.runs, args.limit)
 
     reproducing = sorted(key for key, (hit, total) in tally.items() if hit == total)
-    never = sorted(key for key, (hit, _) in tally.items() if hit == 0)
 
     for key in sorted(tally):
         hit, total = tally[key]
@@ -275,23 +321,6 @@ def main(argv):
         + "; these reproduced on every run"
     )
 
-    if args.self_test:
-        # The check has teeth only if it can tell the two apart. A run where
-        # everything reproduces would pass vacuously and prove nothing about
-        # the reproduction check itself.
-        if not never:
-            fail(
-                "self-test: every candidate reproduced, so this run cannot"
-                " show the reproduction check distinguishing anything."
-                " Widen the planted crash condition so the corpus keeps"
-                " non-reproducing near misses."
-            )
-        print(
-            "check-fuzz-seed-promotion: self-test verified the reproduction"
-            " check separates a reproducing seed from a non-reproducing one ("
-            + ", ".join(never)
-            + " did not reproduce)"
-        )
     return 0
 
 

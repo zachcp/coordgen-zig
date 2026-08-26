@@ -838,6 +838,10 @@ const FuzzInput = struct {
     bonds: [fuzz_max_bonds]BondInput = undefined,
     atom_count: u32 = 0,
     bond_count: u32 = 0,
+    /// The structurally valid lane must reach generation rather than stopping
+    /// at a C DTO validator. Generation may still return `unsupported` for a
+    /// valid stereo mode the native port does not own yet.
+    expect_generation: bool = false,
 
     fn view(self: *const FuzzInput) Input {
         return .{
@@ -863,23 +867,52 @@ const FuzzInput = struct {
 /// rebalance moved, which is the only claim being made.
 fn buildFuzzInput(smith: *std.testing.Smith) FuzzInput {
     var built: FuzzInput = .{};
-    built.atom_count = smith.valueRangeAtMost(u8, 0, fuzz_max_atoms);
+    // Per-field validity compounds into almost no valid whole inputs. Choose
+    // the lane once instead: three quarters are connected, validator-clean
+    // molecules that must reach generation; one quarter explores raw C values.
+    built.expect_generation = smith.boolWeighted(3, 1);
+    built.atom_count = if (built.expect_generation)
+        smith.valueRangeAtMost(u8, 1, fuzz_max_atoms)
+    else
+        smith.valueRangeAtMost(u8, 0, fuzz_max_atoms);
     for (built.atoms[0..built.atom_count]) |*atom| {
         atom.* = .{
             // Mostly ordinary elements; sometimes a value above 118, which is
             // representable only here and whose documented answer is
             // `invalid_atomic_number`.
-            .atomic_number = if (smith.boolWeighted(9, 1))
+            .atomic_number = if (built.expect_generation or smith.boolWeighted(9, 1))
                 smith.valueRangeAtMost(u8, 1, 30)
             else
                 smith.value(u16),
             .formal_charge = smith.valueRangeAtMost(i8, -3, 3),
-            .flags = smith.valueRangeAtMost(u8, 0, 15),
-            .stereo = smith.valueRangeAtMost(u8, 0, 8),
-            .stereo_looking_from = smith.value(u8),
-            .stereo_atom_a = smith.value(u8),
-            .stereo_atom_b = smith.value(u8),
+            .flags = if (built.expect_generation) 0 else smith.valueRangeAtMost(u8, 0, 63),
         };
+        if (built.expect_generation) {
+            atom.stereo = smith.valueRangeAtMost(u8, 0, 4);
+            if (atom.stereo == 1 or atom.stereo == 2) {
+                atom.stereo_looking_from = @intCast(smith.index(built.atom_count));
+                atom.stereo_atom_a = @intCast(smith.index(built.atom_count));
+                atom.stereo_atom_b = @intCast(smith.index(built.atom_count));
+            }
+        } else {
+            atom.stereo = smith.valueRangeAtMost(u8, 0, 8);
+            atom.stereo_looking_from = smith.value(u8);
+            atom.stereo_atom_a = smith.value(u8);
+            atom.stereo_atom_b = smith.value(u8);
+        }
+    }
+    if (built.expect_generation) {
+        // A connected chain keeps this lane inside the generator's owned
+        // domain. Atom fields and stereo still vary on every iteration.
+        for (0..built.atom_count - 1) |index| {
+            built.bonds[index] = .{
+                .start = @intCast(index),
+                .end = @intCast(index + 1),
+                .order = smith.valueRangeAtMost(u8, 1, 3),
+            };
+        }
+        built.bond_count = built.atom_count - 1;
+        return built;
     }
     var count: u32 = 0;
     while (count < fuzz_max_bonds and !smith.eosWeightedSimple(6, 1)) {
@@ -913,6 +946,9 @@ fn cAbiContract(_: void, smith: *std.testing.Smith) anyerror!void {
     const input = built.view();
     var result: Result = undefined;
     const code = coordgen_generate(&input, &result);
+    if (built.expect_generation) {
+        try std.testing.expect(code == .ok or code == .unsupported);
+    }
 
     if (code != .ok) {
         // coordgen_abi.h promises a zeroed result on failure, needing no
@@ -959,6 +995,6 @@ fn cAbiContract(_: void, smith: *std.testing.Smith) anyerror!void {
 
 const c_abi_fuzz_seeds = @import("fuzz_seeds").c_abi_contract_seeds;
 
-test "fuzz: c abi contract holds for any input a C caller can express" {
+test "fuzz: c abi contract for atom and bond inputs" {
     try std.testing.fuzz({}, cAbiContract, .{ .corpus = c_abi_fuzz_seeds });
 }

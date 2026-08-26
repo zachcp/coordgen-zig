@@ -1460,6 +1460,11 @@ pub fn build(b: *std.Build) !void {
     });
     const run_fuzz_targets = b.addRunArtifact(fuzz_targets_tests);
     fuzz_step.dependOn(&run_fuzz_targets.step);
+    // Internal driver step: unlike `test` or `fuzz`, this graph contains only
+    // the selected native fuzz binary. Running unrelated test artifacts under
+    // --fuzz can produce empty/corrupt coverage files on the pinned compiler.
+    const fuzz_native_target_step = b.step("fuzz-native-target", "Run one native fuzz target (driver internal)");
+    fuzz_native_target_step.dependOn(&run_fuzz_targets.step);
     // The C ABI surface fuzzes from its own binary, filtered the same way. A
     // second addTest rather than reusing the one on `test`, so the filter
     // never suppresses that binary's ordinary tests.
@@ -1468,7 +1473,10 @@ pub fn build(b: *std.Build) !void {
         .root_module = c_abi_exports,
         .filters = if (fuzz_filter) |filter| &.{filter} else &.{"fuzz: "},
     });
-    fuzz_step.dependOn(&b.addRunArtifact(c_abi_fuzz_tests).step);
+    const run_c_abi_fuzz_target = b.addRunArtifact(c_abi_fuzz_tests);
+    fuzz_step.dependOn(&run_c_abi_fuzz_target.step);
+    const fuzz_c_abi_target_step = b.step("fuzz-c-abi-target", "Run one C ABI fuzz target (driver internal)");
+    fuzz_c_abi_target_step.dependOn(&run_c_abi_fuzz_target.step);
     // The driver owns budgets, per-target scoping, crash detection and seed
     // promotion. `zig build fuzz` alone replays the committed corpus and
     // proves the harness is wired; searching is `tools/run-fuzz`, because a
@@ -1498,10 +1506,10 @@ pub fn build(b: *std.Build) !void {
     // cgz-r27 failure 2. The bead prescribed promoting seeds from the coverage
     // directory because `.zig-cache/f/crash` was observed 0 bytes; on this pin
     // that is false and following it would commit a seed reproducing nothing.
-    // This determines the answer by measurement instead of hardcoding either
-    // one, and fails when NO source yields a reproducing seed - which is the
-    // hazard the bead is actually about. Deliberately on `fuzz` rather than
-    // `test`: it runs the fuzzer twice and takes about 40 seconds.
+    // The self-test deterministically replays one matching and one non-matching
+    // seed, so the reproduction check has teeth without depending on which
+    // incidental near-miss artifacts a live fuzz search retained. The tool's
+    // normal mode remains the live measurement of which source is winning.
     const fuzz_seed_promotion = b.addSystemCommand(&.{
         "python3",
         "tools/check-fuzz-seed-promotion",

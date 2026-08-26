@@ -15,7 +15,7 @@ Targets, and where each lives:
 |---|---|---|
 | Native | `generation invariants` | `tests/fuzz_targets.zig` |
 | Native | `hostile input` | `tests/fuzz_targets.zig` |
-| C ABI | `c abi contract` | `src/c_abi/exports.zig` |
+| C ABI | `c abi contract for atom and bond inputs` | `src/c_abi/exports.zig` |
 
 The C ABI target sits beside the `export fn` declarations because they are not
 `pub`, so no other file can call them without re-declaring the symbols. That
@@ -114,7 +114,10 @@ would have failed silently in the way this document exists to prevent.
 One of these corrections is a correction to an earlier correction in this same
 section, and that is left visible on purpose: a single probe was generalised
 into a rule, and the real harness then contradicted it. Reproduce with
-`tools/check-fuzz-seed-promotion --self-test` and with `tools/run-fuzz`.
+`tools/check-fuzz-seed-promotion` and with `tools/run-fuzz`. The tool's
+`--self-test` mode uses deterministic matching and non-matching seeds to prove
+the replay classifier itself; it does not rely on a live search retaining a
+particular near-miss corpus.
 
 **Which file holds the reproducing seed is not fixed, and neither source can
 be trusted.** Both behaviours occur on this same pin.
@@ -203,6 +206,12 @@ respect them.
    reproduce before it is committed, and pass/fail must be read from the run's
    output and artifacts rather than from its exit code.
 
+4. **Run searches in ReleaseSafe.** On x86_64-linux, Debug fuzz binaries for
+   these multi-module targets finish with a zero-length coverage header and the
+   build reports `pcs_len was zero`. ReleaseSafe produces valid reports while
+   retaining runtime safety checks. `tools/run-fuzz` selects it explicitly so
+   host defaults cannot reintroduce the broken mode.
+
 ## Known gaps
 
 `cgz-7v2.4.4` stays open for these. Each is a thing the harness does not do,
@@ -222,8 +231,10 @@ stated here so that "the fuzz step is green" is not read as more than it is.
    for the ordinary test suite; the fuzz targets have no equivalent.
 
 3. **Three targets is not "all major input boundaries and algorithm domains",**
-   which is what `cgz-7v2.4.4` asks for. There is no target for the residue and
-   protein paths, for template loading, or for the `Options` surface.
+   which is what `cgz-7v2.4.4` asks for. The C ABI target covers atom and bond
+   DTOs only; it does not construct residues, interactions, extra bonds,
+   options, or malformed nested pointer/span combinations. There is also no
+   native target for the residue and protein paths or template loading.
 
 4. **The C ABI target does not fuzz ownership SEQUENCES.** It exercises one
    generate/free cycle per iteration. Interleaved generate/free orderings

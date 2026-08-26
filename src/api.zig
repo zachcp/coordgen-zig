@@ -412,17 +412,16 @@ test "public generation reports and cleans up every allocation failure" {
     const atoms = [_]AtomInput{ .{}, .{}, .{} };
     const bonds = [_]BondInput{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
     const input = Input{ .atoms = &atoms, .bonds = &bonds };
-    // checkAllAllocationFailures requires a deterministic allocation count and
-    // reports a first-call warm-up as nondeterminism. Discharge it here, and
-    // prove it is a warm-up rather than a leak by requiring the two following
-    // measured runs to agree exactly.
+    // Discharge first-call warm-up before the allocation-failure sweep.
     try generateAndDiscard(std.testing.allocator, input);
-    var baseline = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    try generateAndDiscard(baseline.allocator(), input);
-    var repeated = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    try generateAndDiscard(repeated.allocator(), input);
-    try std.testing.expectEqual(baseline.alloc_index, repeated.alloc_index);
-    try std.testing.expectEqual(baseline.allocated_bytes, baseline.freed_bytes);
+    // A raw alloc_index against the shared testing allocator is not stable:
+    // ArrayList growth may resize in place depending on residual heap layout.
+    // The OOM helper below removes that variable by declining in-place growth.
+    // Keep only the invariant the raw allocator can establish: success is
+    // leak-free.
+    var leak_check = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try generateAndDiscard(leak_check.allocator(), input);
+    try std.testing.expectEqual(leak_check.allocated_bytes, leak_check.freed_bytes);
 
     try core.oom.checkAllocationFailures(
         std.testing.allocator,
