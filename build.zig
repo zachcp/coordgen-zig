@@ -385,6 +385,22 @@ pub fn build(b: *std.Build) !void {
     // test binary: aggregating them behind a source-relative import in
     // src/coordgen.zig would silently stop running them.
     const layer_test_runs = blk: {
+        // Test-only: the anonymous import is referenced solely from a test
+        // block, so no conformance bytes reach the installed library, but the
+        // C ABI seam is private to its own file and its site-coverage gate has
+        // to live there.
+        c_abi_exports.addAnonymousImport("allocation_site_floors", .{
+            .root_source_file = b.path("conformance/allocation_sites.tsv"),
+        });
+        // The C ABI's fuzz target lives in exports.zig because the entry
+        // points are `export fn` and that file is the only place that can call
+        // them without re-declaring the symbols. Its promoted seeds therefore
+        // have to reach it as a named import.
+        c_abi_exports.addImport("fuzz_seeds", b.createModule(.{
+            .root_source_file = b.path("tests/fuzz_seeds/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        }));
         const layer_modules = [_]struct { name: []const u8, module: *std.Build.Module }{
             .{ .name = "core-test", .module = core },
             .{ .name = "model-test", .module = model },
@@ -439,6 +455,29 @@ pub fn build(b: *std.Build) !void {
         .root_module = native_minimal_module,
     });
     const run_native_minimal_tests = b.addRunArtifact(native_minimal_tests);
+    const native_determinism_module = b.createModule(.{
+        .root_source_file = b.path("tests/native_determinism.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api", .module = api },
+            .{ .name = "core", .module = core },
+        },
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    // The committed allocation-site floors travel with the test binary rather
+    // than being read from disk, so the suite has no working-directory
+    // assumption. Test-only: the production package stays std-only with no
+    // embedded conformance data.
+    native_determinism_module.addAnonymousImport("allocation_site_floors", .{
+        .root_source_file = b.path("conformance/allocation_sites.tsv"),
+    });
+    const native_determinism_tests = b.addTest(.{
+        .name = "native-determinism-test",
+        .root_module = native_determinism_module,
+    });
+    const run_native_determinism_tests = b.addRunArtifact(native_determinism_tests);
     const layer_tests = b.addTest(.{
         .name = "module-layer-test",
         .root_module = module_layers,
@@ -465,6 +504,7 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&run_conformance_tests.step);
     test_step.dependOn(&run_corpus_classify_tests.step);
     test_step.dependOn(&run_native_minimal_tests.step);
+    test_step.dependOn(&run_native_determinism_tests.step);
     test_step.dependOn(&run_layer_tests.step);
     test_step.dependOn(&run_consumer_tests.step);
 
@@ -689,10 +729,7 @@ pub fn build(b: *std.Build) !void {
     );
     const performance_step = b.step("performance-check", "Enforce native/oracle performance thresholds");
     const sanitizer_step = b.step("sanitizer-check", "Run oracle facade consumers with UB instrumentation");
-    const performance_pending = b.addFail(
-        "performance-check awaits the first native generation baseline and reviewed per-bucket ratios; see cgz-7v2.4.7",
-    );
-    performance_step.dependOn(&performance_pending.step);
+
     const template_generator_module = b.createModule(.{
         .root_source_file = b.path("tests/template_generate.zig"),
         .target = target,
@@ -1043,9 +1080,18 @@ pub fn build(b: *std.Build) !void {
             .imports = &.{
                 .{ .name = "conformance", .module = corpus_layers.conformance },
                 .{ .name = "c_abi", .module = corpus_layers.c_abi },
+                // Native is timed in THIS process, against the same members in
+                // the same build, target and optimize mode. It is reached
+                // through the Zig API rather than the C one because the linked
+                // oracle already provides the `coordgen_*` symbols and a
+                // second definition is the cgz-r28 duplicate-symbol defect.
+                .{ .name = "api", .module = corpus_layers.api },
             },
             .link_libc = true,
             .link_libcpp = true,
+        });
+        benchmark_module.addAnonymousImport("performance_thresholds", .{
+            .root_source_file = b.path("conformance/performance_thresholds.tsv"),
         });
         benchmark_module.addCSourceFile(.{
             .file = b.path("conformance/benchmark_clock.c"),
@@ -1066,6 +1112,14 @@ pub fn build(b: *std.Build) !void {
         // for capture by the caller and rerun the process on every invocation.
         run_benchmark.stdio = .inherit;
         performance_baseline_step.dependOn(&run_benchmark.step);
+        // The same binary, with --enforce, compares each bucket's native/oracle
+        // ratio against the committed thresholds and exits non-zero on a
+        // regression. One implementation times and judges, so the numbers the
+        // gate reads are the numbers the baseline printed.
+        const run_performance_check = b.addRunArtifact(benchmark);
+        run_performance_check.addArg("--enforce");
+        run_performance_check.stdio = .inherit;
+        performance_step.dependOn(&run_performance_check.step);
         const allocator_smoke_module = b.createModule(.{
             .target = target,
             .optimize = corpus_optimize,
@@ -1364,6 +1418,7 @@ pub fn build(b: *std.Build) !void {
         conformance_step.dependOn(&oracle_disabled.step);
         regeneration_step.dependOn(&oracle_disabled.step);
         performance_baseline_step.dependOn(&oracle_disabled.step);
+        performance_step.dependOn(&oracle_disabled.step);
         sanitizer_step.dependOn(&oracle_disabled.step);
     }
 
@@ -1376,8 +1431,61 @@ pub fn build(b: *std.Build) !void {
     examples_step.dependOn(&install_isolation.step);
 
     const fuzz_step = b.step("fuzz", "Run the platform-selected fuzz harness when available");
-    const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4");
-    fuzz_step.dependOn(&fuzz_pending.step);
+    // The fuzz targets are an ordinary test binary. In a normal build
+    // `std.testing.fuzz` replays only `options.corpus`, so every promoted seed
+    // is a deterministic regression test on `test`; under `--fuzz` the same
+    // binary searches. One shape, both modes.
+    const fuzz_targets_module = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz_targets.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "api", .module = api },
+            .{ .name = "core", .module = core },
+        },
+        .link_libc = false,
+        .link_libcpp = false,
+    });
+    // One target per invocation. The toolchain's FUZZING REPORT names only one
+    // of the fuzz tests that actually ran - measured by planting a failure in
+    // the second target, which fired while the report listed only the first -
+    // so the report cannot say which targets were covered. Running them one at
+    // a time is what makes the scope of a run knowable, and it is also what
+    // lets each target carry its own recorded budget.
+    const fuzz_filter = b.option([]const u8, "fuzz-filter", "Run only the fuzz target whose name contains this");
+    const fuzz_targets_tests = b.addTest(.{
+        .name = "fuzz-targets-test",
+        .root_module = fuzz_targets_module,
+        .filters = if (fuzz_filter) |filter| &.{filter} else &.{},
+    });
+    const run_fuzz_targets = b.addRunArtifact(fuzz_targets_tests);
+    fuzz_step.dependOn(&run_fuzz_targets.step);
+    // Internal driver step: unlike `test` or `fuzz`, this graph contains only
+    // the selected native fuzz binary. Running unrelated test artifacts under
+    // --fuzz can produce empty/corrupt coverage files on the pinned compiler.
+    const fuzz_native_target_step = b.step("fuzz-native-target", "Run one native fuzz target (driver internal)");
+    fuzz_native_target_step.dependOn(&run_fuzz_targets.step);
+    // The C ABI surface fuzzes from its own binary, filtered the same way. A
+    // second addTest rather than reusing the one on `test`, so the filter
+    // never suppresses that binary's ordinary tests.
+    const c_abi_fuzz_tests = b.addTest(.{
+        .name = "c-abi-fuzz-test",
+        .root_module = c_abi_exports,
+        .filters = if (fuzz_filter) |filter| &.{filter} else &.{"fuzz: "},
+    });
+    const run_c_abi_fuzz_target = b.addRunArtifact(c_abi_fuzz_tests);
+    fuzz_step.dependOn(&run_c_abi_fuzz_target.step);
+    const fuzz_c_abi_target_step = b.step("fuzz-c-abi-target", "Run one C ABI fuzz target (driver internal)");
+    fuzz_c_abi_target_step.dependOn(&run_c_abi_fuzz_target.step);
+    // The driver owns budgets, per-target scoping, crash detection and seed
+    // promotion. `zig build fuzz` alone replays the committed corpus and
+    // proves the harness is wired; searching is `tools/run-fuzz`, because a
+    // search needs an iteration budget and a place to put what it finds.
+    const fuzz_driver_check = b.addSystemCommand(&.{ "python3", "tools/run-fuzz", "--self-test" });
+    fuzz_step.dependOn(&fuzz_driver_check.step);
+    // Committed seeds replay on the ordinary gate, which is the whole reason
+    // to promote them.
+    test_step.dependOn(&run_fuzz_targets.step);
     // Attached now, before the harness exists, so cgz-7v2.4.4 inherits it
     // rather than having to remember it: on a compiler backend whose
     // std.testing.fuzz returns immediately, every fuzz target is a no-op that
@@ -1394,6 +1502,21 @@ pub fn build(b: *std.Build) !void {
         .root_module = fuzz_backend_module,
     });
     fuzz_step.dependOn(&b.addRunArtifact(fuzz_backend_tests).step);
+
+    // cgz-r27 failure 2. The bead prescribed promoting seeds from the coverage
+    // directory because `.zig-cache/f/crash` was observed 0 bytes; on this pin
+    // that is false and following it would commit a seed reproducing nothing.
+    // The self-test deterministically replays one matching and one non-matching
+    // seed, so the reproduction check has teeth without depending on which
+    // incidental near-miss artifacts a live fuzz search retained. The tool's
+    // normal mode remains the live measurement of which source is winning.
+    const fuzz_seed_promotion = b.addSystemCommand(&.{
+        "python3",
+        "tools/check-fuzz-seed-promotion",
+        "--self-test",
+    });
+    fuzz_seed_promotion.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    fuzz_step.dependOn(&fuzz_seed_promotion.step);
 
     // A step with no dependencies succeeds instantly and reports success, which
     // is the cgz-r20 failure mode. tools/check-gate-strength used to assert

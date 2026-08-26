@@ -52,11 +52,32 @@ _FLAGS_RE = re.compile(r'\.flags = &\.\{([^}]*)\}')
 _STRING_RE = re.compile(r'"([^"]*)"')
 
 _REQUIRED_TEXT = [
-    # The remaining placeholder gate must fail loudly rather than pass
-    # vacuously until its owning bead attaches real artifacts. Examples and
-    # template regeneration are real gates covered by the graph assertion.
-    'const fuzz_pending = b.addFail("fuzz is not implemented yet; see cgz-7v2.4.4")',
-    'const performance_pending = b.addFail(',
+    # `performance-check` used to be a placeholder required here by its addFail
+    # text. cgz-7v2.4.7 implemented it, so what is pinned instead is that the
+    # gate actually enforces: the same binary that prints the baseline is run
+    # again with --enforce, and the committed thresholds are compiled into it.
+    # Dropping either leaves a performance step that measures and then ignores
+    # what it measured.
+    'run_performance_check.addArg("--enforce")',
+    'benchmark_module.addAnonymousImport("performance_thresholds"',
+    # `fuzz` used to be a placeholder required here by its addFail text. Now
+    # that cgz-7v2.4.4 has implemented it, what has to be pinned instead are
+    # the three things that keep it from certifying nothing - each one a
+    # measured toolchain behaviour, not a precaution:
+    #
+    #   the backend assertion   a need_simple backend makes every target a
+    #                           no-op that still reports green (cgz-r27)
+    #   the budget check        a target with no recorded budget is a target
+    #                           nobody fuzzes, and nothing else would notice
+    #   the per-target filter   the FUZZING REPORT names only one target even
+    #                           when more ran, so scope comes from running
+    #                           them one at a time
+    #
+    # Deleting any of these leaves `zig build fuzz` green while covering less
+    # than it claims, which is exactly what this file exists to catch.
+    'fuzz_step.dependOn(&b.addRunArtifact(fuzz_backend_tests).step)',
+    '"tools/run-fuzz", "--self-test"',
+    'b.option([]const u8, "fuzz-filter"',
     # The real, graph-level false-green assertion. Whether each step actually
     # has dependencies is checked by build.zig itself at configure time, where
     # the constructed graph can be inspected; grepping for "<step>.dependOn("

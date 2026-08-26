@@ -204,6 +204,97 @@ iterations of a *trivial* target in 15.1 s on aarch64-macos. Coordinate
 generation is orders of magnitude heavier per iteration, so per-target limits
 cannot be extrapolated from it and must be measured when the harness exists.
 
+## Performance gate — thresholds set from the first native baseline
+
+`zig build performance-baseline -Denable-oracle=true` times **native and
+oracle in one process**, on the same members, in the same build, target and
+optimize mode. `zig build performance-check -Denable-oracle=true` runs the same
+binary with `--enforce`, so the gate reads exactly the numbers the baseline
+printed. The 100-member population is in `tests/oracle_benchmark.zig`; changing
+it requires a decision Bead.
+
+The trigger named here — set the threshold when the first representative
+native-vs-oracle baseline exists — has been met, and the thresholds are in
+[`conformance/performance_thresholds.tsv`](../../conformance/performance_thresholds.tsv)
+with their provenance.
+
+**Method**, unchanged from the frozen decision, plus one asymmetry now worth
+stating: the oracle is timed through the C entry points it provides and native
+through its Zig API, because the linked oracle already defines the `coordgen_*`
+symbols and a second definition is the `cgz-r28` duplicate-symbol defect. The
+difference is native's DTO conversion, charged to the oracle side. The ratios
+are therefore mildly generous to native.
+
+**A member native cannot lay out is skipped on BOTH sides** and counted. A
+ratio between medians taken over different member subsets is not a
+like-for-like ratio, and dropping native's hard members while keeping the
+oracle's would flatter native by exactly the amount that matters. Coverage is
+gated separately, by `min_compared_members`, so losing domain is a failure even
+though it leaves no ratio to exceed.
+
+**What the first baseline actually showed**, aarch64-macos, ReleaseFast:
+
+| bucket | median ratio | p95 ratio | members compared |
+|---|---|---|---|
+| tiny | 0.900–1.014 | 10.2–13.9 | 19 of 20 |
+| small | 2.996–3.071 | 3.457–3.483 | 17 of 20 |
+| medium | — | — | **0 of 20** |
+| large | — | — | **0 of 20** |
+| huge | — | — | **0 of 20** |
+
+Two facts in that table matter more than the thresholds:
+
+- **Native cannot lay out any member of the three largest buckets.** The
+  performance gate covers 36 of the benchmark's 100 members. That is a
+  statement about the port's domain coverage, not about its speed, and it is
+  ratcheted so it cannot quietly get smaller.
+- **Native is at parity on the tiny median and an order of magnitude slower at
+  the tiny p95**, reproducibly. That is `cgz-twy`. A median-only comparison
+  would have hidden it, which is why this document requires p95 per bucket.
+
+## OOM and leak gates
+
+- **Leak detection**: `std.testing.allocator` on **every** test. Any leak fails.
+- **OOM injection**: `std.testing.FailingAllocator` over **every reachable
+  allocation index** for bounded representative inputs to **every allocating
+  public entry point** — Zig `generate` and each allocating `coordgen_*` C ABI
+  function. Every injected failure must produce a clean error return with no
+  leak and no partial-result escape.
+- **Coverage counter**: the suite records the count of **distinct allocation
+  sites exercised per public entry point**, committed in-repo. The gate fails if
+  any entry point's count **decreases**.
+
+The counter exists because "representative inputs" is otherwise unfalsifiable:
+without it, the criterion silently weakens as the code grows and new allocation
+sites are simply never reached. A decrease is a real regression in coverage,
+even when every test still passes.
+
+## Fuzz gates
+
+Platform and mechanism are decided in `cgz-r15`; see
+[`FUZZING.md`](FUZZING.md). Budgets:
+
+- **Both CI platforms**, `ubuntu-24.04` and `macos-14`. Neither is exempt.
+- **Budgets are iteration limits** (`--fuzz=<N>`), not wall-clock: they are
+  reproducible across runners of differing speed. Bare `--fuzz` implies
+  `--webui` and hangs, so a limit is mandatory.
+- **Per-target limits are recorded in-repo**, so lowering one is a visible diff
+  rather than an invisible edit (`cgz-r21`).
+- **Ceiling: the whole fuzz step completes within 10 minutes per platform.**
+  Per-target limits are calibrated to fit that ceiling on the slower runner.
+- **Any crash, panic, leak, or error-log output fails the build.**
+- **Every minimized failure is promoted** to a committed byte seed and replayed
+  through `FuzzInputOptions.corpus` in the ordinary `zig build test`. Seed count
+  only ever grows; removing a seed requires a decision bead.
+- **The harness asserts `builtin.zig_backend` is not a `need_simple` backend**,
+  because `std.testing.fuzz` returns immediately on those and every target would
+  report green while testing nothing.
+
+The one throughput datum available is an anchor, not a budget: 1,000,007
+iterations of a *trivial* target in 15.1 s on aarch64-macos. Coordinate
+generation is orders of magnitude heavier per iteration, so per-target limits
+cannot be extrapolated from it and must be measured when the harness exists.
+
 ## Performance gate — baseline infrastructure, threshold deliberately unset
 
 `zig build performance-baseline -Denable-oracle=true` now records absolute

@@ -673,89 +673,6 @@ pub fn avoidTerminalClashes(
     return changed;
 }
 
-/// Resolve intrafragment clashes for terminal atoms which have no DOFs. This
-/// preserves upstream's fragment-order mutation and two-decimal rounding.
-pub fn avoidInternalClashes(
-    fragment_atoms: []const core.ids.AtomId,
-    bonds: []const BondScoreView,
-    atom_degrees: []const u32,
-    needs_check_for_clashes: []const bool,
-    fixed: []const bool,
-    atom_has_dofs: []const bool,
-    coordinates: []core.math.Vec2,
-) core.errors.Error!bool {
-    if (atom_degrees.len != coordinates.len or
-        needs_check_for_clashes.len != coordinates.len or
-        fixed.len != coordinates.len or
-        atom_has_dofs.len != coordinates.len)
-    {
-        return error.InvalidMapping;
-    }
-    var changed = false;
-    for (fragment_atoms) |atom| {
-        _ = try scoreCoordinate(coordinates, atom);
-        const atom_index = atom.index();
-        if (atom_degrees[atom_index] != 1 or needs_check_for_clashes[atom_index] or
-            fixed[atom_index] or atom_has_dofs[atom_index])
-        {
-            continue;
-        }
-        const neighbor = try soleNeighbor(atom, bonds, coordinates.len);
-        for (fragment_atoms) |other| {
-            _ = try scoreCoordinate(coordinates, other);
-            const other_index = other.index();
-            if (atom == other or atom_has_dofs[other_index] or areBonded(atom, other, bonds)) continue;
-            const difference = subtract(coordinates[other_index], coordinates[atom_index]);
-            const cutoff = core.math.bond_length * 0.5;
-            if (difference.x > cutoff or difference.x < -cutoff or
-                difference.y > cutoff or difference.y < -cutoff or
-                difference.x * difference.x + difference.y * difference.y > cutoff * cutoff)
-            {
-                continue;
-            }
-            const displacement = scale(subtract(coordinates[atom_index], coordinates[neighbor.index()]), 0.3);
-            coordinates[atom_index] = subtract(coordinates[atom_index], displacement);
-            if (atom_degrees[other_index] == 1) {
-                coordinates[other_index] = add(coordinates[other_index], displacement);
-                coordinates[other_index].x = roundToTwoDecimals(coordinates[other_index].x);
-                coordinates[other_index].y = roundToTwoDecimals(coordinates[other_index].y);
-            }
-            changed = true;
-        }
-    }
-    return changed;
-}
-
-fn soleNeighbor(atom: core.ids.AtomId, bonds: []const BondScoreView, atom_count: usize) core.errors.Error!core.ids.AtomId {
-    var neighbor = core.ids.AtomId.invalid;
-    for (bonds) |bond| {
-        if (bond.residue_interaction) continue;
-        try validateScoreBond(bond, atom_count);
-        const candidate = if (bond.start == atom)
-            bond.end
-        else if (bond.end == atom)
-            bond.start
-        else
-            continue;
-        if (neighbor.isValid()) return error.InvalidMapping;
-        neighbor = candidate;
-    }
-    if (!neighbor.isValid()) return error.InvalidMapping;
-    return neighbor;
-}
-
-fn areBonded(first: core.ids.AtomId, second: core.ids.AtomId, bonds: []const BondScoreView) bool {
-    for (bonds) |bond| {
-        if (bond.residue_interaction) continue;
-        if ((bond.start == first and bond.end == second) or (bond.start == second and bond.end == first)) return true;
-    }
-    return false;
-}
-
-fn roundToTwoDecimals(value: f32) f32 {
-    return @floor(value * 100 + 0.5) * 0.01;
-}
-
 fn validateScoreBond(bond: BondScoreView, atom_count: usize) core.errors.Error!void {
     if (!bond.start.isValid() or !bond.end.isValid() or bond.start.index() >= atom_count or
         bond.end.index() >= atom_count or bond.start == bond.end or
@@ -1169,41 +1086,6 @@ test "discrete clash crossing and atoms-in-rings scores preserve pinned penaltie
         },
     };
     try std.testing.expectEqual(@as(f32, 4600), try scoreProximityRelationsOnOppositeSides(&proximity));
-}
-
-test "internal clash fallback moves eligible terminal atoms in fragment order" {
-    const fragment_atoms = [_]core.ids.AtomId{
-        core.ids.AtomId.fromIndex(0),
-        core.ids.AtomId.fromIndex(1),
-        core.ids.AtomId.fromIndex(2),
-        core.ids.AtomId.fromIndex(3),
-    };
-    const bonds = [_]BondScoreView{
-        .{ .start = core.ids.AtomId.fromIndex(0), .end = core.ids.AtomId.fromIndex(1) },
-        .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(3) },
-    };
-    const degrees = [_]u32{ 1, 2, 1, 2 };
-    const needs_check = [_]bool{ false, false, true, false };
-    const fixed = [_]bool{ false, false, false, false };
-    const has_dofs = [_]bool{ false, false, false, false };
-    var coordinates = [_]core.math.Vec2{
-        .{},
-        .{ .x = -50 },
-        .{ .x = 10 },
-        .{ .x = 100 },
-    };
-    try std.testing.expect(try avoidInternalClashes(
-        &fragment_atoms,
-        &bonds,
-        &degrees,
-        &needs_check,
-        &fixed,
-        &has_dofs,
-        &coordinates,
-    ));
-    try std.testing.expectApproxEqAbs(@as(f32, -15), coordinates[0].x, 0.00001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), coordinates[0].y, 0.00001);
-    try std.testing.expectEqual(core.math.Vec2{ .x = 25 }, coordinates[2]);
 }
 
 const RebuildTestContext = struct { calls: usize = 0 };

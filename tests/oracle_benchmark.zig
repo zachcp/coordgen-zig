@@ -1,14 +1,34 @@
-//! Absolute oracle timing baseline for the versioned representative corpus.
+//! Native-vs-oracle timing on the versioned representative corpus
+//! (cgz-7v2.4.7).
 //!
-//! This intentionally does not claim native-vs-oracle parity: there is no
-//! native generation entry point yet. It establishes the executable half of
-//! the frozen method so the eventual native implementation is timed in this
-//! same process, build, target, optimize mode, and member loop.
+//! Both implementations are timed in ONE process, on the same members, in the
+//! same build, target and optimize mode, inside the same member loop - the
+//! identity rule `RunIdentity.requireSameBuild()` already enforces for
+//! coordinates, applied to timings.
+//!
+//! ## One asymmetry, stated rather than hidden
+//!
+//! The oracle is reached through the C entry points it provides; native is
+//! reached through its Zig API. That is not a preference: the linked oracle
+//! already defines the `coordgen_*` symbols, and a second definition is the
+//! cgz-r28 duplicate-symbol defect, so native's own C layer cannot be in this
+//! binary. The difference is native's DTO conversion - a bounded copy of the
+//! atom and bond arrays, with no layout work in it - which is charged to the
+//! ORACLE side here and not to native. The ratios below are therefore mildly
+//! generous to native, and a threshold set from them inherits that. Anyone
+//! tightening these numbers should close that gap first.
+//!
+//! With `--enforce`, the same binary compares each bucket's ratio against
+//! conformance/performance_thresholds.tsv and exits non-zero on a regression,
+//! so the gate reads exactly the numbers the baseline printed.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const conformance = @import("conformance");
 const c_abi = @import("c_abi");
+const api = @import("api");
+
+const thresholds_table = @embedFile("performance_thresholds");
 
 const corpus = conformance.corpus;
 const repetitions = 3;
@@ -87,8 +107,25 @@ const members = [_]Member{
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
+    var enforce = false;
+    var arguments = init.minimal.args.iterate();
+    _ = arguments.next();
+    while (arguments.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--enforce")) {
+            enforce = true;
+        } else {
+            return error.UnknownArgument;
+        }
+    }
+
     var samples: [5]std.ArrayList(u64) = @splat(.empty);
     defer for (&samples) |*bucket| bucket.deinit(gpa);
+    var native_samples: [5]std.ArrayList(u64) = @splat(.empty);
+    defer for (&native_samples) |*bucket| bucket.deinit(gpa);
+    // Members native refused, per bucket. Reported, because a bucket where
+    // native handles three of twenty members has a ratio that says very
+    // little, and the reader has to be able to see that.
+    var unsupported: [5]usize = @splat(0);
 
     for (members) |selected| {
         const molecule = try corpus.generate(gpa, selected.partition, selected.index);
@@ -96,8 +133,34 @@ pub fn main(init: std.process.Init) !void {
         const bucket = corpus.SizeBucket.of(molecule.atoms.len);
         const prepared = try PreparedInput.init(gpa, molecule);
         defer prepared.deinit(gpa);
+        const native = try NativeInput.init(gpa, molecule);
+        defer native.deinit(gpa);
 
-        // One untimed generation initializes any process-local cold state.
+        // Native still refuses domains the oracle accepts. A member it cannot
+        // lay out is SKIPPED ON BOTH SIDES and counted, rather than timed for
+        // the oracle only: a ratio between medians taken over different member
+        // subsets is not a like-for-like ratio, and dropping native's hard
+        // members while keeping the oracle's would flatter native by exactly
+        // the amount that matters.
+        const native_supported = nativeGenerateOnce(gpa, native.input()) catch |err| switch (err) {
+            error.EmptyGraph,
+            error.TooManyItems,
+            error.InvalidAtomicNumber,
+            error.InvalidBondOrder,
+            error.InvalidAtomIndex,
+            error.InvalidStereo,
+            error.InvalidCoordinate,
+            error.InvalidOption,
+            error.InvalidMapping,
+            error.Unsupported,
+            => false,
+            error.OutOfMemory => return err,
+        };
+        if (!native_supported) {
+            unsupported[@intFromEnum(bucket)] += 1;
+            continue;
+        }
+        // One untimed generation of each initializes process-local cold state.
         try generateOnce(&prepared.input);
         for (0..repetitions) |_| {
             const start = cgz_benchmark_now_ns();
@@ -106,6 +169,13 @@ pub fn main(init: std.process.Init) !void {
             const finish = cgz_benchmark_now_ns();
             if (finish <= start) return error.MonotonicClockUnavailable;
             try samples[@intFromEnum(bucket)].append(gpa, finish - start);
+        }
+        for (0..repetitions) |_| {
+            const start = cgz_benchmark_now_ns();
+            _ = try nativeGenerateOnce(gpa, native.input());
+            const finish = cgz_benchmark_now_ns();
+            if (finish <= start) return error.MonotonicClockUnavailable;
+            try native_samples[@intFromEnum(bucket)].append(gpa, finish - start);
         }
     }
 
@@ -116,23 +186,132 @@ pub fn main(init: std.process.Init) !void {
     try out.print("# target\t{t}-{t}\n", .{ builtin.target.cpu.arch, builtin.target.os.tag });
     try out.print("# toolchain\t{s}\n", .{builtin.zig_version_string});
     try out.print("# optimize\t{t}\n", .{builtin.mode});
+    try out.writeAll(
+        "# ratio rows carry compared/unsupported in the members/samples columns;" ++
+            " a member native cannot lay out is skipped on BOTH sides so the" ++
+            " ratio stays like-for-like\n",
+    );
     try out.writeAll("# implementation\tbucket\tmembers\tsamples\tmedian_ns\tp95_ns\n");
-    for (&samples, 0..) |*bucket_samples, raw_bucket| {
-        if (bucket_samples.items.len != 20 * repetitions) {
+    var violations: usize = 0;
+    for (&samples, &native_samples, 0..) |*bucket_samples, *bucket_native, raw_bucket| {
+        const compared = 20 - unsupported[raw_bucket];
+        if (bucket_samples.items.len != compared * repetitions) {
             return error.InvalidRepresentativePopulation;
+        }
+        if (bucket_samples.items.len == 0) {
+            const empty_bucket: corpus.SizeBucket = @enumFromInt(raw_bucket);
+            try out.print("oracle\t{t}\t0\t0\t-\t-\t(native supports none of 20)\n", .{empty_bucket});
+            if (enforce) {
+                // A bucket that used to be comparable and is not any more is a
+                // domain regression, and it would otherwise be invisible: with
+                // no members timed there is no ratio to exceed.
+                const limits = thresholdFor(empty_bucket) orelse {
+                    try out.print(
+                        "FAIL\t{t}\tno row in conformance/performance_thresholds.tsv\n",
+                        .{empty_bucket},
+                    );
+                    violations += 1;
+                    continue;
+                };
+                if (limits.min_compared != 0) {
+                    try out.print(
+                        "FAIL\t{t}\tnative laid out 0 members; the recorded floor is {d}\n",
+                        .{ empty_bucket, limits.min_compared },
+                    );
+                    violations += 1;
+                }
+            }
+            continue;
         }
         std.mem.sort(u64, bucket_samples.items, {}, u64LessThan);
         const median = percentile(bucket_samples.items, 50);
         const p95 = percentile(bucket_samples.items, 95);
         const bucket: corpus.SizeBucket = @enumFromInt(raw_bucket);
-        try out.print("oracle\t{t}\t20\t{d}\t{d}\t{d}\n", .{
+        try out.print("oracle\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
             bucket,
+            compared,
             bucket_samples.items.len,
             median,
             p95,
         });
+        std.mem.sort(u64, bucket_native.items, {}, u64LessThan);
+        const native_median = percentile(bucket_native.items, 50);
+        const native_p95 = percentile(bucket_native.items, 95);
+        try out.print("native\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
+            bucket,
+            bucket_native.items.len / repetitions,
+            bucket_native.items.len,
+            native_median,
+            native_p95,
+        });
+        const median_ratio = ratioOf(native_median, median);
+        const p95_ratio = ratioOf(native_p95, p95);
+        try out.print("ratio\t{t}\t{d}\t{d}\t{d:.3}\t{d:.3}\n", .{
+            bucket,
+            compared,
+            unsupported[raw_bucket],
+            median_ratio,
+            p95_ratio,
+        });
+        if (!enforce) continue;
+        const limits = thresholdFor(bucket) orelse {
+            try out.print(
+                "FAIL\t{t}\tno row in conformance/performance_thresholds.tsv\n",
+                .{bucket},
+            );
+            violations += 1;
+            continue;
+        };
+        if (compared < limits.min_compared) {
+            try out.print(
+                "FAIL\t{t}\tnative laid out {d} of 20 members; the recorded floor is {d}\n",
+                .{ bucket, compared, limits.min_compared },
+            );
+            violations += 1;
+        }
+        if (median_ratio > limits.median) {
+            try out.print("FAIL\t{t}\tmedian ratio {d:.3} exceeds {d:.3}\n", .{
+                bucket, median_ratio, limits.median,
+            });
+            violations += 1;
+        }
+        if (p95_ratio > limits.p95) {
+            try out.print("FAIL\t{t}\tp95 ratio {d:.3} exceeds {d:.3}\n", .{
+                bucket, p95_ratio, limits.p95,
+            });
+            violations += 1;
+        }
     }
     try out.flush();
+    if (enforce and violations != 0) return error.PerformanceRegression;
+}
+
+fn ratioOf(native: u64, oracle: u64) f64 {
+    if (oracle == 0) return std.math.inf(f64);
+    return @as(f64, @floatFromInt(native)) / @as(f64, @floatFromInt(oracle));
+}
+
+const Threshold = struct { median: f64, p95: f64, min_compared: usize };
+
+/// The committed per-bucket limits. Absent row means absent threshold, which
+/// `--enforce` treats as a failure rather than as permission.
+fn thresholdFor(bucket: corpus.SizeBucket) ?Threshold {
+    var lines = std.mem.splitScalar(u8, thresholds_table, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or line[0] == '#') continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const name = fields.next() orelse continue;
+        const median = fields.next() orelse continue;
+        const p95 = fields.next() orelse continue;
+        if (!std.mem.eql(u8, name, @tagName(bucket))) continue;
+        const compared = fields.next() orelse return null;
+        return .{
+            .median = std.fmt.parseFloat(f64, std.mem.trim(u8, median, " \r")) catch return null,
+            .p95 = std.fmt.parseFloat(f64, std.mem.trim(u8, p95, " \r")) catch return null,
+            .min_compared = std.fmt.parseInt(usize, std.mem.trim(u8, compared, " \r"), 10) catch return null,
+        };
+    }
+    return null;
 }
 
 const PreparedInput = struct {
@@ -166,6 +345,50 @@ const PreparedInput = struct {
         gpa.free(self.atoms);
     }
 };
+
+/// The same members, shaped for the Zig API. Built once per member and reused
+/// across repetitions, exactly as `PreparedInput` is, so neither side is
+/// charged for construction.
+const NativeInput = struct {
+    atoms: []api.AtomInput,
+    bonds: []api.BondInput,
+
+    fn init(gpa: std.mem.Allocator, molecule: corpus.Molecule) !NativeInput {
+        const atoms = try gpa.alloc(api.AtomInput, molecule.atoms.len);
+        errdefer gpa.free(atoms);
+        for (atoms, molecule.atoms) |*atom, source| {
+            atom.* = .{
+                .atomic_number = @enumFromInt(source.atomic_number),
+                .formal_charge = source.formal_charge,
+            };
+        }
+        const bonds = try gpa.alloc(api.BondInput, molecule.bonds.len);
+        errdefer gpa.free(bonds);
+        for (bonds, molecule.bonds) |*bond, source| {
+            bond.* = .{
+                .start = source.start,
+                .end = source.end,
+                .order = @enumFromInt(source.order),
+            };
+        }
+        return .{ .atoms = atoms, .bonds = bonds };
+    }
+
+    fn input(self: NativeInput) api.Input {
+        return .{ .atoms = self.atoms, .bonds = self.bonds };
+    }
+
+    fn deinit(self: NativeInput, gpa: std.mem.Allocator) void {
+        gpa.free(self.bonds);
+        gpa.free(self.atoms);
+    }
+};
+
+fn nativeGenerateOnce(gpa: std.mem.Allocator, input: api.Input) !bool {
+    var result = try api.generate(gpa, input);
+    result.deinit();
+    return true;
+}
 
 fn generateOnce(input: *const c_abi.Input) !void {
     var result: c_abi.Result = .{};

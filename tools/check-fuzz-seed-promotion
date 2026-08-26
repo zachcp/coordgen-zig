@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Determine, empirically, where a reproducing crash seed can be promoted from.
+
+cgz-r27 failure 2 records that the pinned fuzzer wrote `.zig-cache/f/crash` as
+a 0-byte file, and prescribes promoting from `.zig-cache/f/<coverage_id>/`
+instead. BOTH behaviours occur on the pinned toolchain, which is why this tool
+measures instead of assuming.
+
+In this tool's own small planted fixture, three runs from cleared caches:
+
+    .zig-cache/f/crash                 16 bytes, the crashing input, every run
+    .zig-cache/f/<coverage_id>/{0,1}   16 bytes, near misses, different every
+                                       run, never the crashing input
+
+But in the real harness (tests/fuzz_targets.zig) `crash` is written 0 bytes,
+exactly as the bead reported. Input size and -Dfuzz-filter were both ruled out
+by measurement; the cause is cgz-1js. So a result from this tool describes the
+fixture it planted, and is evidence about the toolchain rather than a rule for
+every target - which is why tools/run-fuzz replays candidates itself rather
+than trusting this answer.
+
+So this tool does not hardcode either answer. It plants a fuzz target that
+fails on a discoverable input, runs the fuzzer until it fails, and then REPLAYS
+each candidate seed to see which ones actually reproduce. What it asserts is
+the invariant that survives a toolchain bump:
+
+  * at least one candidate source yields a reproducing seed, and
+  * the reproduction check itself has teeth - a seed that does not reproduce
+    is reported as not reproducing, rather than being waved through.
+
+A THIRD silent failure, not in cgz-r27 and found by writing this: `zig build
+test --fuzz=N` exits 0 when the fuzz target crashes. The crash is printed and
+the seed is written, and the build still reports success. Measured on the pin:
+a crashing fuzz run exits 0, while the identical failure replayed in a normal
+run exits 1. It is the worst of the three, because everything else can be
+working - right backend, seed written, crash found - and CI is still green. A
+harness must therefore decide pass/fail from the run's OUTPUT and artifacts,
+never from `zig build --fuzz`'s exit status, which is what this tool does.
+
+A harness that promotes seeds should consult this tool's answer rather than
+assume a directory layout. When cgz-r24 migrates to released Zig, rerunning
+this is how the answer gets rechecked instead of re-argued.
+
+Replay works because `std.testing.fuzz`, in a binary NOT built in fuzz mode,
+runs the target over `options.corpus` and nothing else
+(lib/compiler/test_runner.zig). A promoted seed therefore becomes a regression
+test by being placed in the corpus, and it runs under ordinary `zig build
+test`.
+
+Usage:
+    tools/check-fuzz-seed-promotion [--zig PATH] [--runs N] [--limit N]
+    tools/check-fuzz-seed-promotion --self-test
+"""
+
+import argparse
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# The planted target fails only on this pair, which the fuzzer has to discover.
+# Two bytes: small enough to be found in well under the iteration limit, wide
+# enough that a corpus near-miss is overwhelmingly likely to differ.
+CRASH_A = 0x5A
+CRASH_B = 0xC3
+
+FIXTURE = """const std = @import("std");
+
+fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {{
+    const a = smith.value(u8);
+    const b = smith.value(u8);
+    if (a == 0x{a:02X} and b == 0x{b:02X}) return error.PlantedCrash;
+}}
+
+test "planted target fails on a discoverable input" {{
+    try std.testing.fuzz({{}}, testOne, .{{}});
+}}
+"""
+
+REPLAY = """const std = @import("std");
+
+fn testOne(_: void, smith: *std.testing.Smith) anyerror!void {{
+    const a = smith.value(u8);
+    const b = smith.value(u8);
+    if (a == 0x{a:02X} and b == 0x{b:02X}) return error.PlantedCrash;
+}}
+
+test "promoted seed reproduces" {{
+    try std.testing.fuzz({{}}, testOne, .{{ .corpus = &.{{@embedFile("seed.bin")}} }});
+}}
+"""
+
+BUILD = """const std = @import("std");
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const m = b.createModule(.{
+        .root_source_file = b.path("target.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const t = b.addTest(.{ .name = "target", .root_module = m });
+    b.step("test", "run").dependOn(&b.addRunArtifact(t).step);
+}
+"""
+
+
+def fail(message):
+    print(f"check-fuzz-seed-promotion: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_zig(explicit):
+    if explicit:
+        return explicit
+    from_env = os.environ.get("CGZ_ZIG")
+    if from_env:
+        return from_env
+    root = pathlib.Path(__file__).resolve().parent.parent
+    bootstrap = root / "tools" / "bootstrap-zig"
+    if bootstrap.is_file():
+        result = subprocess.run(
+            [str(bootstrap)], capture_output=True, text=True, cwd=str(root)
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+    found = shutil.which("zig")
+    if not found:
+        fail("cannot locate zig; pass --zig or set CGZ_ZIG")
+    return found
+
+
+def write_project(directory, source):
+    (directory / "target.zig").write_text(source)
+    (directory / "build.zig").write_text(BUILD)
+
+
+def run_fuzzer(zig, workdir, limit):
+    """Fuzz the planted target until it fails. Returns the fuzz cache directory."""
+    write_project(workdir, FIXTURE.format(a=CRASH_A, b=CRASH_B))
+    cache = workdir / ".zig-cache"
+    if cache.exists():
+        shutil.rmtree(cache)
+    result = subprocess.run(
+        [zig, "build", "test", f"--fuzz={limit}"],
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    fuzz_dir = cache / "f"
+    # Deliberately NOT result.returncode: a crashing fuzz run exits 0 on the
+    # pin (see the module docstring). The crash is evident from the output and
+    # from the artifact it leaves, so both are consulted and neither is the
+    # exit status.
+    output = result.stdout + result.stderr
+    crashed = "exited with code" in output or (fuzz_dir / "crash").is_file()
+    if not crashed:
+        print("--- stdout ---\n" + result.stdout[-2000:], file=sys.stderr)
+        print("--- stderr ---\n" + result.stderr[-2000:], file=sys.stderr)
+        fail(
+            f"the planted target survived {limit} iterations; it is supposed to"
+            " fail, so either the limit is too low or fuzzing did not run"
+        )
+    if result.returncode == 0:
+        print(
+            "check-fuzz-seed-promotion: note: the fuzz run found a crash and"
+            " `zig build --fuzz` still exited 0; a harness must not gate on"
+            " that exit status"
+        )
+    if not fuzz_dir.is_dir():
+        fail(f"no fuzz cache directory at {fuzz_dir}")
+    return fuzz_dir
+
+
+def candidate_seeds(fuzz_dir):
+    """Every file the fuzzer left that could plausibly be promoted."""
+    candidates = []
+    crash = fuzz_dir / "crash"
+    if crash.is_file():
+        candidates.append(("f/crash", crash))
+    for child in sorted(fuzz_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        for entry in sorted(child.iterdir()):
+            if not entry.is_file() or "lock" in entry.name:
+                continue
+            candidates.append((f"f/{child.name}/{entry.name}", entry))
+    return candidates
+
+
+def classify_replay(returncode, output):
+    """Accept only the planted target's expected failure as reproduction."""
+    if returncode == 0:
+        return "clean"
+    if "promoted seed reproduces" in output and "error.PlantedCrash" in output:
+        return "reproduced"
+    return "infrastructure"
+
+
+def reproduces(zig, workdir, seed_bytes, crash_a=CRASH_A, crash_b=CRASH_B):
+    """Replay one seed as a corpus entry in a NON-fuzz build.
+
+    This is the reproduction check the harness must run before committing a
+    seed. It is the whole point: a seed that does not fail here is a
+    regression test that tests nothing.
+    """
+    write_project(workdir, REPLAY.format(a=crash_a, b=crash_b))
+    (workdir / "seed.bin").write_bytes(seed_bytes)
+    cache = workdir / ".zig-cache"
+    if cache.exists():
+        shutil.rmtree(cache)
+    result = subprocess.run(
+        [zig, "build", "test"],
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    output = result.stdout + result.stderr
+    outcome = classify_replay(result.returncode, output)
+    if outcome == "infrastructure":
+        fail(
+            "seed replay failed without the planted target's expected error"
+            f" (exit {result.returncode})\n{output[-2000:]}"
+        )
+    return outcome == "reproduced"
+
+
+def check_replay_classifier():
+    reproducing = (
+        "error: 'target.test.promoted seed reproduces' failed:\n"
+        "failed with error.PlantedCrash\n"
+    )
+    if classify_replay(1, reproducing) != "reproduced":
+        fail("self-test: the planted target failure was not accepted as reproduction")
+    if classify_replay(0, "") != "clean":
+        fail("self-test: a passing replay was not classified as clean")
+    if classify_replay(1, "error: unable to build module\n") != "infrastructure":
+        fail("self-test: a compilation failure was accepted as reproduction")
+
+
+def check_replay_fixtures(zig):
+    """Prove reproduction and rejection with one deterministic seed."""
+    seed = bytes(16)
+    with tempfile.TemporaryDirectory(prefix="cgz-fuzz-replay-selftest-") as raw:
+        workdir = pathlib.Path(raw)
+        if not reproduces(zig, workdir, seed, crash_a=0, crash_b=0):
+            fail("self-test: the deterministic crashing seed did not reproduce")
+        if reproduces(zig, workdir, seed):
+            fail("self-test: the deterministic clean seed was reported as reproducing")
+    print(
+        "check-fuzz-seed-promotion: self-test verified one deterministic seed"
+        " reproduces its matching failure and does not reproduce a different one"
+    )
+
+
+def measure(zig, runs, limit, verbose=True):
+    """Returns {source_label: (reproducing_count, total_seen)}."""
+    tally = {}
+    for run in range(runs):
+        with tempfile.TemporaryDirectory(prefix="cgz-fuzz-promote-") as raw:
+            workdir = pathlib.Path(raw)
+            fuzz_dir = run_fuzzer(zig, workdir, limit)
+            seeds = candidate_seeds(fuzz_dir)
+            if not seeds:
+                fail("the fuzzer left no candidate seed of any kind")
+            # Read every seed before replaying: replaying rewrites the project.
+            captured = [(label, path.read_bytes()) for label, path in seeds]
+            for label, data in captured:
+                # A per-run coverage id would make every run its own label, so
+                # normalise the middle component out.
+                parts = label.split("/")
+                key = "f/crash" if len(parts) == 2 else f"f/<coverage_id>/{parts[2]}"
+                hit, total = tally.get(key, (0, 0))
+                ok = len(data) > 0 and reproduces(zig, workdir, data)
+                tally[key] = (hit + int(ok), total + 1)
+                if verbose:
+                    print(
+                        f"check-fuzz-seed-promotion: run {run + 1}: {key}"
+                        f" {len(data)} bytes,"
+                        f" {'reproduces' if ok else 'does NOT reproduce'}"
+                    )
+    return tally
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--zig")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=200000)
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args(argv)
+
+    zig = resolve_zig(args.zig)
+    if args.self_test:
+        check_replay_classifier()
+        check_replay_fixtures(zig)
+        return 0
+    tally = measure(zig, args.runs, args.limit)
+
+    reproducing = sorted(key for key, (hit, total) in tally.items() if hit == total)
+
+    for key in sorted(tally):
+        hit, total = tally[key]
+        print(f"check-fuzz-seed-promotion: {key}: reproduced {hit}/{total}")
+
+    if not reproducing:
+        fail(
+            "no candidate source yielded a seed that reproduces the planted"
+            " failure. Promotion from any of them would commit a seed that"
+            " tests nothing, which is cgz-r27 failure 2. Do not promote until"
+            " a source that reproduces is identified."
+        )
+
+    print(
+        "check-fuzz-seed-promotion: promote from "
+        + ", ".join(reproducing)
+        + "; these reproduced on every run"
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

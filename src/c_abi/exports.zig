@@ -698,6 +698,98 @@ test "coordgen_generate is repeatable and independent across concurrent contexts
     try std.testing.expectEqualSlices(core.math.Vec2, &first, &second);
 }
 
+/// The seam `coordgen_generate` delegates to, driven with an injectable
+/// allocator. The export itself pins `generation_allocator` because the
+/// installed library is std-only and the ABI promises thread safety, so it
+/// cannot take one from the caller; everything it does before delegating is
+/// field validation that allocates nothing. Sweeping the seam is therefore
+/// sweeping the entry point.
+fn generateThroughSafeApiAndDiscard(allocator: std.mem.Allocator, input: *const Input) !void {
+    var result: Result = .{};
+    switch (generateThroughSafeApi(allocator, input, &result)) {
+        .ok => {},
+        .out_of_memory => {
+            // The contract in coordgen_abi.h is that a failed generation
+            // leaves the result zeroed and needing no cleanup. Assert that
+            // rather than assuming it, since a partially published result
+            // escaping here would leak through the C boundary where no
+            // errdefer can reach it.
+            if (result.owner != null) return error.PartialResultEscaped;
+            return error.OutOfMemory;
+        },
+        else => |code| {
+            std.debug.print("unexpected error code: {t}\n", .{code});
+            return error.UnexpectedErrorCode;
+        },
+    }
+    coordgen_result_free(&result);
+}
+
+test "coordgen_generate reports and cleans up failure at every allocation index" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{}, .{} };
+    // Atom 3 carries the residue and must therefore have no structural bond:
+    // a residue representative is placed by the residue phase, not laid out.
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = 1 },
+        .{ .start = 1, .end = 2, .order = 2 },
+    };
+    const residues = [_]ResidueInput{
+        .{ .atom = 3, .chain = .{ .ptr = "A", .len = 1 }, .residue_number = 9, .closest_ligand_atom = 1 },
+    };
+    const interactions = [_]ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    // Residues and interactions are included so the sweep reaches the
+    // conversion allocations that a bare atoms-and-bonds input never makes.
+    const input: Input = .{
+        .atoms = .{ .ptr = &atoms, .len = atoms.len },
+        .bonds = .{ .ptr = &bonds, .len = bonds.len },
+        .residues = .{ .ptr = &residues, .len = residues.len },
+        .residue_interactions = .{ .ptr = &interactions, .len = interactions.len },
+    };
+
+    // Discharge the first-call warm-up, so the counting run inside
+    // checkAllocationFailures does not overcount and leave the last index
+    // unexercised.
+    try generateThroughSafeApiAndDiscard(std.testing.allocator, &input);
+    var leak_check = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    try generateThroughSafeApiAndDiscard(leak_check.allocator(), &input);
+    try std.testing.expectEqual(leak_check.allocated_bytes, leak_check.freed_bytes);
+
+    try core.oom.checkAllocationFailures(
+        std.testing.allocator,
+        generateThroughSafeApiAndDiscard,
+        .{&input},
+    );
+}
+
+/// The C ABI's own allocation-site floor. coordgen_generate pins
+/// generation_allocator, so the seam it delegates to is the injectable point;
+/// everything before that delegation is non-allocating field validation.
+const allocation_site_table = @embedFile("allocation_site_floors");
+
+test "the C entry point does not silently stop reaching allocation sites" {
+    const atoms = [_]AtomInput{ .{}, .{}, .{}, .{} };
+    const bonds = [_]BondInput{
+        .{ .start = 0, .end = 1, .order = 1 },
+        .{ .start = 1, .end = 2, .order = 2 },
+    };
+    const residues = [_]ResidueInput{
+        .{ .atom = 3, .chain = .{ .ptr = "A", .len = 1 }, .residue_number = 9, .closest_ligand_atom = 1 },
+    };
+    const interactions = [_]ResidueInteractionInput{.{ .start = 3, .end = 1 }};
+    const input: Input = .{
+        .atoms = .{ .ptr = &atoms, .len = atoms.len },
+        .bonds = .{ .ptr = &bonds, .len = bonds.len },
+        .residues = .{ .ptr = &residues, .len = residues.len },
+        .residue_interactions = .{ .ptr = &interactions, .len = interactions.len },
+    };
+    const measured = try core.oom.countAllocationSites(
+        std.testing.allocator,
+        generateThroughSafeApiAndDiscard,
+        .{&input},
+    );
+    try core.oom.expectSiteFloor(allocation_site_table, "coordgen_generate", "residue ligand", measured);
+}
+
 test "coordgen_result_free is a safe no-op on a zeroed (failure) result" {
     var result: Result = .{};
     coordgen_result_free(&result);
@@ -722,4 +814,187 @@ test "coordgen_result_free releases every owned span through the stored allocato
     // merely zeroed) is what that leak check is verifying.
     try std.testing.expect(result.owner == null);
     try std.testing.expect(result.coordinates.ptr == null);
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz target (cgz-7v2.4.4)
+//
+// This lives here rather than in tests/fuzz_targets.zig because the exports
+// are `export fn`, not `pub`, so this file is the only place that can call
+// them without linking the library and re-declaring the symbols.
+//
+// It is a SEPARATE surface from the native targets, not a thin wrapper over
+// them, and the reason is concrete: every enum on this boundary crosses as a
+// bare `u32`. An out-of-range `atomic_number` or `order` is unrepresentable in
+// the Zig API - the type system refuses it - and is trivially representable
+// here. Those values reach the validators only through this door.
+// ---------------------------------------------------------------------------
+
+const fuzz_max_atoms = 10;
+const fuzz_max_bonds = 14;
+
+const FuzzInput = struct {
+    atoms: [fuzz_max_atoms]AtomInput = undefined,
+    bonds: [fuzz_max_bonds]BondInput = undefined,
+    atom_count: u32 = 0,
+    bond_count: u32 = 0,
+    /// The structurally valid lane must reach generation rather than stopping
+    /// at a C DTO validator. Generation may still return `unsupported` for a
+    /// valid stereo mode the native port does not own yet.
+    expect_generation: bool = false,
+
+    fn view(self: *const FuzzInput) Input {
+        return .{
+            .atoms = .{ .ptr = &self.atoms, .len = self.atom_count },
+            .bonds = .{ .ptr = &self.bonds, .len = self.bond_count },
+        };
+    }
+};
+
+/// Each field is drawn mostly in range, occasionally not.
+///
+/// The first version of this drew `atomic_number` from the whole `u16` and
+/// endpoints from the whole `u8`, so nearly every input died at the first
+/// validator: 619 runs, 19 unique, 0.29% coverage - a target that tests the
+/// validator and nothing behind it. With the weights below, a comparable
+/// session reached 650 runs, 43 unique, 0.51%. Out-of-range values have to be
+/// the MINORITY for the generator itself to be reached, while still appearing
+/// often enough that every rejection path is exercised; these weights are that
+/// trade, not a preference for valid input.
+///
+/// Neither number is evidence of good coverage - both are short sessions, and
+/// coverage accumulates across runs. What they show is the direction the
+/// rebalance moved, which is the only claim being made.
+fn buildFuzzInput(smith: *std.testing.Smith) FuzzInput {
+    var built: FuzzInput = .{};
+    // Per-field validity compounds into almost no valid whole inputs. Choose
+    // the lane once instead: three quarters are connected, validator-clean
+    // molecules that must reach generation; one quarter explores raw C values.
+    built.expect_generation = smith.boolWeighted(3, 1);
+    built.atom_count = if (built.expect_generation)
+        smith.valueRangeAtMost(u8, 1, fuzz_max_atoms)
+    else
+        smith.valueRangeAtMost(u8, 0, fuzz_max_atoms);
+    for (built.atoms[0..built.atom_count]) |*atom| {
+        atom.* = .{
+            // Mostly ordinary elements; sometimes a value above 118, which is
+            // representable only here and whose documented answer is
+            // `invalid_atomic_number`.
+            .atomic_number = if (built.expect_generation or smith.boolWeighted(9, 1))
+                smith.valueRangeAtMost(u8, 1, 30)
+            else
+                smith.value(u16),
+            .formal_charge = smith.valueRangeAtMost(i8, -3, 3),
+            .flags = if (built.expect_generation) 0 else smith.valueRangeAtMost(u8, 0, 63),
+        };
+        if (built.expect_generation) {
+            atom.stereo = smith.valueRangeAtMost(u8, 0, 4);
+            if (atom.stereo == 1 or atom.stereo == 2) {
+                atom.stereo_looking_from = @intCast(smith.index(built.atom_count));
+                atom.stereo_atom_a = @intCast(smith.index(built.atom_count));
+                atom.stereo_atom_b = @intCast(smith.index(built.atom_count));
+            }
+        } else {
+            atom.stereo = smith.valueRangeAtMost(u8, 0, 8);
+            atom.stereo_looking_from = smith.value(u8);
+            atom.stereo_atom_a = smith.value(u8);
+            atom.stereo_atom_b = smith.value(u8);
+        }
+    }
+    if (built.expect_generation) {
+        // A connected chain keeps this lane inside the generator's owned
+        // domain. Atom fields and stereo still vary on every iteration.
+        for (0..built.atom_count - 1) |index| {
+            built.bonds[index] = .{
+                .start = @intCast(index),
+                .end = @intCast(index + 1),
+                .order = smith.valueRangeAtMost(u8, 1, 3),
+            };
+        }
+        built.bond_count = built.atom_count - 1;
+        return built;
+    }
+    var count: u32 = 0;
+    while (count < fuzz_max_bonds and !smith.eosWeightedSimple(6, 1)) {
+        built.bonds[count] = .{
+            .start = if (built.atom_count != 0 and smith.boolWeighted(6, 1))
+                @intCast(smith.index(built.atom_count))
+            else
+                smith.value(u8),
+            .end = if (built.atom_count != 0 and smith.boolWeighted(6, 1))
+                @intCast(smith.index(built.atom_count))
+            else
+                smith.value(u8),
+            // Above 3 is not a bond order at all.
+            .order = if (smith.boolWeighted(6, 1))
+                smith.valueRangeAtMost(u8, 0, 3)
+            else
+                smith.valueRangeAtMost(u8, 0, 6),
+            .flags = smith.valueRangeAtMost(u8, 0, 7),
+            .stereo = smith.valueRangeAtMost(u8, 0, 6),
+            .display = smith.valueRangeAtMost(u8, 0, 6),
+            .crossing_penalty_multiplier = 1,
+        };
+        count += 1;
+    }
+    built.bond_count = count;
+    return built;
+}
+
+fn cAbiContract(_: void, smith: *std.testing.Smith) anyerror!void {
+    var built = buildFuzzInput(smith);
+    const input = built.view();
+    var result: Result = undefined;
+    const code = coordgen_generate(&input, &result);
+    if (built.expect_generation) {
+        try std.testing.expect(code == .ok or code == .unsupported);
+    }
+
+    if (code != .ok) {
+        // coordgen_abi.h promises a zeroed result on failure, needing no
+        // cleanup. A partially published result escaping here would leak
+        // across the C boundary where no errdefer can reach it, and the
+        // caller - following the header - would never free it.
+        try std.testing.expect(result.owner == null);
+        try std.testing.expect(result.coordinates.ptr == null);
+        try std.testing.expect(result.input_to_internal.ptr == null);
+        try std.testing.expect(result.internal_to_input.ptr == null);
+        try std.testing.expect(result.effective_bond_orders.ptr == null);
+        try std.testing.expect(result.bond_displays.ptr == null);
+        try std.testing.expect(result.atom_stereo.ptr == null);
+        // Freeing a zeroed result is documented as a safe no-op, so a caller
+        // that frees unconditionally must not be punished for it.
+        coordgen_result_free(&result);
+        return;
+    }
+
+    try std.testing.expectEqual(built.atom_count, result.coordinates.len);
+    try std.testing.expectEqual(built.atom_count, result.input_to_internal.len);
+    try std.testing.expectEqual(built.atom_count, result.internal_to_input.len);
+    try std.testing.expectEqual(built.atom_count, result.atom_stereo.len);
+    try std.testing.expectEqual(built.bond_count, result.effective_bond_orders.len);
+    try std.testing.expectEqual(built.bond_count, result.bond_displays.len);
+    if (built.atom_count != 0) try std.testing.expect(result.owner != null);
+
+    const coordinates = if (result.coordinates.ptr) |ptr|
+        ptr[0..result.coordinates.len]
+    else
+        &[_]core.math.Vec2{};
+    for (coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+
+    // clean_pose crosses as u32 and is a boolean; anything else means the
+    // encoding drifted.
+    try std.testing.expect(result.clean_pose == 0 or result.clean_pose == 1);
+
+    coordgen_result_free(&result);
+    try std.testing.expect(result.owner == null);
+    // Idempotent by contract: the second free sees the zeroed value the first
+    // left, which is the same state a failed generation leaves.
+    coordgen_result_free(&result);
+}
+
+const c_abi_fuzz_seeds = @import("fuzz_seeds").c_abi_contract_seeds;
+
+test "fuzz: c abi contract for atom and bond inputs" {
+    try std.testing.fuzz({}, cAbiContract, .{ .corpus = c_abi_fuzz_seeds });
 }

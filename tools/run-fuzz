@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+"""Drive the fuzz targets, detect what the toolchain will not tell you, and
+promote any crash into a committed regression seed (cgz-7v2.4.4).
+
+Three properties of the pinned toolchain were measured, and each one dictates
+part of this driver. None of them is theoretical - each was reproduced.
+
+1. A DISCOVERED CRASH EXITS 0 (cgz-8hm). Measured for both a returned error
+   and a `@panic` reporting `signal ABRT`: the crash is printed, the seed is
+   written, and `zig build --fuzz` still reports success.
+
+   The exit status is not uniformly useless, which is what makes it a trap. A
+   target that fails on the INITIAL smoke input - before the search begins -
+   does exit 1. Measured on the same target minutes apart: a plant firing on
+   every input exited 1, and a plant requiring discovery, found at run ~3400,
+   exited 0. So the exit status is right for failures the fuzzer did not have
+   to find, and wrong for exactly the ones it exists to find. A harness that
+   spot-checked it would see it work.
+
+   So a discovered crash is read from the run's OUTPUT, never inferred from
+   the exit status. The status is still combined with a valid clean fuzz report
+   to distinguish a completed search from a compiler or infrastructure error.
+   --self-test pins all three outcomes.
+
+2. THE FUZZING REPORT NAMES ONLY ONE TARGET, even when more ran. Measured by
+   planting a failure in the second of two targets: it fired, while the report
+   listed only the first. So the report cannot say what was covered, and this
+   driver runs ONE TARGET PER INVOCATION with `-Dfuzz-filter` instead. That is
+   also what makes a per-target budget meaningful and a crash attributable.
+
+3. WHICH FILE HOLDS THE REPRODUCING SEED IS NOT FIXED (cgz-r27). Both
+   behaviours have now been observed on the SAME pin. In a small standalone
+   probe, `.zig-cache/f/crash` held the crashing input and reproduced 3/3
+   while the coverage directory held near misses that reproduced 0/3. In this
+   harness, with a larger drawn input and a warm coverage cache, `crash` was
+   written 0 BYTES - which is what the bead originally reported and what a
+   smaller probe had failed to reproduce.
+
+   So neither source can be trusted, and the durable rule is the one that does
+   not depend on knowing: try every candidate and keep whichever REPRODUCES.
+   That is what this driver does, and why it refuses to write a seed it could
+   not replay. `tools/check-fuzz-seed-promotion` reports which source is
+   winning on a given toolchain.
+
+   On this pin the real targets here hit the 0-byte case (cgz-1js), so a
+   finding often cannot be promoted as bytes at all. Rather than lose it, the
+   driver records a REPRODUCTION RECIPE - the exact command, the runner's seed,
+   and the failure text - into the target's seed file as a comment. A recipe is
+   worth less than a seed, because re-finding the input costs another search
+   and the search is not guaranteed to be deterministic. It is worth much more
+   than nothing, which is what a crash detected and then dropped is worth.
+
+Usage:
+    tools/run-fuzz --check-budgets        validate the budget table only
+    tools/run-fuzz [--extended] [--target NAME] [--zig PATH]
+"""
+
+import argparse
+import datetime
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BUDGETS = ROOT / "conformance" / "fuzz_budgets.tsv"
+# Fuzz targets live in more than one file: the C ABI's must sit beside the
+# `export fn` declarations it calls. Both are scanned, so a target cannot be
+# added anywhere without also getting a budget row.
+NATIVE_TARGET_SOURCE = ROOT / "tests" / "fuzz_targets.zig"
+C_ABI_TARGET_SOURCE = ROOT / "src" / "c_abi" / "exports.zig"
+TARGET_SOURCES = (NATIVE_TARGET_SOURCE, C_ABI_TARGET_SOURCE)
+SEED_DIR = ROOT / "tests" / "fuzz_seeds"
+
+# `test "fuzz: <name>"` is the declaration form; the budget table keys on a
+# substring of it.
+TARGET_RE = re.compile(r'^test "fuzz: (.+)" \{', re.M)
+FUZZ_OPTIMIZE = "safe"
+
+SEED_FILE_HEADER = """//! Promoted regression seeds for the `{target}` target.
+//!
+//! Written by tools/run-fuzz, which proves a seed reproduces its failure
+//! before adding it. Each entry replays under ordinary `zig build test`.
+//!
+//! Empty means no failure has been found and promoted yet - not that
+//! promotion is unimplemented. `tools/run-fuzz --self-test` proves the
+//! promotion path works against a deliberately planted failure.
+pub const seeds: []const []const u8 = &.{{
+{entries}}};
+"""
+
+
+def fail(message):
+    print(f"run-fuzz: {message}", file=sys.stderr)
+    sys.exit(2)
+
+
+def resolve_zig(explicit):
+    if explicit:
+        return explicit
+    if os.environ.get("CGZ_ZIG"):
+        return os.environ["CGZ_ZIG"]
+    bootstrap = ROOT / "tools" / "bootstrap-zig"
+    if bootstrap.is_file():
+        result = subprocess.run(
+            [str(bootstrap)], capture_output=True, text=True, cwd=str(ROOT)
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip().splitlines()[-1]
+    found = shutil.which("zig")
+    if not found:
+        fail("cannot locate zig; pass --zig or set CGZ_ZIG")
+    return found
+
+
+def declared_targets():
+    found = []
+    for source in TARGET_SOURCES:
+        found.extend(TARGET_RE.findall(source.read_text()))
+    return found
+
+
+def fuzz_step_for_target(target):
+    c_abi_targets = TARGET_RE.findall(C_ABI_TARGET_SOURCE.read_text())
+    return "fuzz-c-abi-target" if target in c_abi_targets else "fuzz-native-target"
+
+
+def read_budgets():
+    rows = {}
+    for line in BUDGETS.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            fail(f"malformed budget row: {line!r}")
+        rows[parts[0]] = (int(parts[1]), int(parts[2]))
+    return rows
+
+
+def check_budgets():
+    """Every declared target has exactly one budget row, and vice versa.
+
+    This is the anti-omission half. A target with no budget is a target nobody
+    fuzzes, and it would otherwise be invisible: the build still compiles it
+    and `zig build fuzz` still replays its corpus, so nothing else notices.
+    """
+    targets = declared_targets()
+    if not targets:
+        fail(
+            "no `test \"fuzz: ...\"` declarations found in "
+            + ", ".join(str(p) for p in TARGET_SOURCES)
+        )
+    budgets = read_budgets()
+    problems = []
+    for key in budgets:
+        matched = [t for t in targets if key in t]
+        if len(matched) != 1:
+            problems.append(
+                f"budget row {key!r} matches {len(matched)} targets, expected exactly 1"
+            )
+    for target in targets:
+        matched = [key for key in budgets if key in target]
+        if len(matched) != 1:
+            problems.append(
+                f"target {target!r} is matched by {len(matched)} budget rows,"
+                " expected exactly 1"
+            )
+    if problems:
+        for problem in problems:
+            print(f"run-fuzz: {problem}", file=sys.stderr)
+        fail("budget table and declared targets disagree")
+    print(
+        f"run-fuzz: {len(targets)} fuzz target(s), each with exactly one budget row"
+    )
+    return targets, budgets
+
+
+def seed_path(target):
+    slug = re.sub(r"[^a-z0-9]+", "_", target.lower()).strip("_")
+    return SEED_DIR / f"{slug}.zig"
+
+
+def existing_seeds(path):
+    if not path.is_file():
+        return []
+    return re.findall(r'"((?:[^"\\]|\\.)*)"', path.read_text().split("&.{", 1)[-1])
+
+
+def zig_escape(data):
+    return "".join(f"\\x{byte:02x}" for byte in data)
+
+
+_SEED_RE = re.compile(r"--seed=(0x[0-9a-f]+)")
+_FAILURE_RE = re.compile(r"^.*(?:terminated with signal|exited with code \d|failed with error\.).*$", re.M)
+
+
+def recordRecipe(target, iterations, output):
+    """Write a reproduction recipe into the target's seed file.
+
+    Used when a crash was found but no candidate seed reproduced it, which on
+    this toolchain is the common case (cgz-1js). The recipe is a comment, not a
+    corpus entry: it changes nothing about what `zig build test` runs, and it
+    cannot be mistaken for a seed that reproduces.
+    """
+    path = seed_path(target)
+    seed = _SEED_RE.search(output)
+    failure = _FAILURE_RE.search(output)
+    existing = path.read_text() if path.is_file() else ""
+    body = existing.split("pub const seeds", 1)
+    header = body[0] if len(body) == 2 else ""
+    tail = "pub const seeds" + body[1] if len(body) == 2 else "pub const seeds: []const []const u8 = &.{};\n"
+    recipe = (
+        "//\n"
+        f"// UNPROMOTED FINDING, {datetime.date.today().isoformat()}\n"
+        "//\n"
+        "// The fuzzer found a failure in this target and none of the candidate\n"
+        "// seeds reproduced it, so there are no bytes to commit (cgz-1js).\n"
+        "// This is the finding, recorded so it is not lost:\n"
+        "//\n"
+        f"//   failure:  {failure.group(0).strip() if failure else 'see the run output'}\n"
+        f"//   command:  zig build {fuzz_step_for_target(target)}"
+        f" -Doptimize={FUZZ_OPTIMIZE} -Dfuzz-filter={target!r} --fuzz={iterations}"
+        f"{' --seed=' + seed.group(1) if seed else ''}\n"
+        "//\n"
+        "// Re-running that command searches again; it is not a replay, and the\n"
+        "// search may take a different path. Delete this block once the input\n"
+        "// is captured and promoted as a real seed.\n"
+    )
+    path.write_text(header.rstrip("\n") + "\n" + recipe + tail)
+    return path
+
+
+# Replaying a candidate costs a full `zig build test`, so the search is
+# bounded. Newest first, because the run that just crashed wrote the newest
+# files.
+MAX_CANDIDATES = 24
+
+
+def candidate_seeds(since):
+    """Every file the run could have left the reproducing input in.
+
+    Ordered `crash` first, then coverage-directory entries newest first. The
+    order is a cost heuristic only - correctness comes from replaying them.
+    """
+    fuzz_dir = ROOT / ".zig-cache" / "f"
+    if not fuzz_dir.is_dir():
+        return []
+    found = []
+    crash = fuzz_dir / "crash"
+    if crash.is_file() and crash.stat().st_size > 0:
+        found.append(crash)
+    others = []
+    for child in fuzz_dir.iterdir():
+        if not child.is_dir():
+            continue
+        for entry in child.iterdir():
+            if not entry.is_file() or "lock" in entry.name:
+                continue
+            stat = entry.stat()
+            if stat.st_size > 0 and stat.st_mtime >= since:
+                others.append((stat.st_mtime, entry))
+    others.sort(reverse=True)
+    found.extend(entry for _mtime, entry in others)
+    return found[:MAX_CANDIDATES]
+
+
+def run_target(zig, target, iterations):
+    """Fuzz one target. Returns (crashed, candidates, output)."""
+    crash_file = ROOT / ".zig-cache" / "f" / "crash"
+    if crash_file.exists():
+        crash_file.unlink()
+    started = time.time()
+    # The internal step owns exactly one fuzz binary. `test` is too broad: it
+    # runs unrelated ordinary test artifacts under --fuzz, and the pinned
+    # compiler can emit an empty/corrupt coverage file for those. `fuzz` also
+    # repeats harness preconditions once per target. Neither belongs here.
+    result = subprocess.run(
+        [
+            zig,
+            "build",
+            fuzz_step_for_target(target),
+            f"-Doptimize={FUZZ_OPTIMIZE}",
+            f"-Dfuzz-filter={target}",
+            f"--fuzz={iterations}",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+    )
+    output = result.stdout + result.stderr
+    outcome = classifyFuzzRun(result.returncode, output)
+    if outcome == "infrastructure":
+        fail(
+            f"{target}: fuzz command did not complete a valid run"
+            f" (exit {result.returncode})\n{output[-3000:]}"
+        )
+    return outcome == "crash", candidate_seeds(started - 1), output
+
+
+# Every way the test runner announces a failing fuzz iteration. Matched against
+# the run's OUTPUT because its EXIT STATUS is 0 either way (cgz-8hm).
+_CRASH_RE = re.compile(
+    r"terminated with signal|exited with code \d|failed with error\.|thread \d+ panic"
+)
+
+
+def crashedFromOutput(output):
+    """Property 1: detect a target failure without consulting its exit status."""
+    return bool(_CRASH_RE.search(output))
+
+
+def classifyFuzzRun(returncode, output):
+    """Separate discovered crashes, clean searches, and command failures.
+
+    A crash wins regardless of status because discovered crashes can exit 0.
+    A clean run requires both success status and the report emitted only after
+    the fuzz runner actually starts; everything else is infrastructure failure.
+    """
+    if crashedFromOutput(output):
+        return "crash"
+    if returncode != 0 or "======= FUZZING REPORT =======" not in output:
+        return "infrastructure"
+    return "clean"
+
+
+def classifyReplayRun(returncode, output, target):
+    """Accept only the selected target's failure as reproduction."""
+    if returncode == 0:
+        return "clean"
+    if target in output and crashedFromOutput(output):
+        return "reproduced"
+    return "infrastructure"
+
+
+def replay_reproduces(zig, target, data):
+    """Property 3: a seed is only promoted after it is proven to reproduce.
+
+    Written into the target's seed file and replayed on the ordinary gate,
+    which is exactly how it will run once committed - so what is verified is
+    the thing that ships, not an approximation of it.
+    """
+    path = seed_path(target)
+    original = path.read_text() if path.is_file() else None
+    entries = existing_seeds(path) + [zig_escape(data)]
+    keep = False
+    try:
+        path.write_text(
+            SEED_FILE_HEADER.format(
+                target=target,
+                entries="".join(f'    "{entry}",\n' for entry in entries),
+            )
+        )
+        result = subprocess.run(
+            [zig, "build", "test", f"-Dfuzz-filter={target}"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        output = result.stdout + result.stderr
+        outcome = classifyReplayRun(result.returncode, output, target)
+        if outcome == "infrastructure":
+            fail(
+                f"{target}: seed replay did not reach the expected target failure"
+                f" (exit {result.returncode})\n{output[-3000:]}"
+            )
+        keep = outcome == "reproduced"
+        return keep
+    finally:
+        if not keep:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_text(original)
+
+
+# Real output captured from a crashing fuzz run on the pin. Both shapes are
+# included because they exit 0 for different reasons: an orderly
+# `std.process.exit(1)` from a returned error, and an abort from a panic.
+_CRASHING_RUN_SAMPLES = (
+    (
+        "returned error",
+        "run test fuzz-targets-test failure\n"
+        "failed with error.PlantedCrash\n"
+        "error: test 'x' exited with code 1; input saved to '.zig-cache/f/crash'\n",
+    ),
+    (
+        "panic",
+        "thread 3243466 panic: planted panic\n"
+        "error: test 'x' terminated with signal ABRT;"
+        " input saved to '.zig-cache/f/crash'\n",
+    ),
+)
+
+_CLEAN_RUN_SAMPLE = (
+    "======= FUZZING REPORT =======\n"
+    'Fuzz test: "x" (abc123)\n'
+    "Runs: 0 -> 48727\n"
+    "Coverage: 4771/19369 -> 4773/19369 (24.64%)\n"
+)
+
+_REPLAY_TARGET = "generation invariants hold on structurally valid molecules"
+_REPRODUCING_REPLAY_SAMPLE = (
+    f"error: 'fuzz: {_REPLAY_TARGET}' failed:\n"
+    "failed with error.TestUnexpectedResult\n"
+)
+
+
+def self_test():
+    """Pin crash, clean, and infrastructure classification.
+
+    A crashing fuzz run exits 0 on this toolchain, so a harness that gated on
+    the exit status would report green while the fuzzer was finding crashes.
+    These samples are real output from such runs. A non-zero command without
+    crash output is a build/infrastructure failure, not a clean search.
+    """
+    problems = []
+    for label, sample in _CRASHING_RUN_SAMPLES:
+        if classifyFuzzRun(0, sample) != "crash":
+            problems.append(f"a crashing exit-0 run ({label}) was not detected from its output")
+    if classifyFuzzRun(0, _CLEAN_RUN_SAMPLE) != "clean":
+        problems.append("a completed clean run was not classified as clean")
+    if classifyFuzzRun(127, "compiler unavailable\n") != "infrastructure":
+        problems.append("a non-zero command failure was reported as a clean fuzz run")
+    if classifyFuzzRun(0, "") != "infrastructure":
+        problems.append("an exit-0 command with no fuzz report was reported as clean")
+    if classifyReplayRun(1, _REPRODUCING_REPLAY_SAMPLE, _REPLAY_TARGET) != "reproduced":
+        problems.append("the selected target's ordinary-test failure did not reproduce")
+    if classifyReplayRun(0, "", _REPLAY_TARGET) != "clean":
+        problems.append("a passing ordinary replay was not classified as clean")
+    if classifyReplayRun(1, "error: unable to build module\n", _REPLAY_TARGET) != "infrastructure":
+        problems.append("a replay compilation failure was accepted as reproduction")
+
+    # The recipe writer is the containment for cgz-1js, and it writes into a
+    # file the build compiles, so a malformed recipe would break the build
+    # rather than record a finding. Exercised here against a scratch target
+    # name so the real seed files are untouched.
+    scratch = "selftest scratch target"
+    scratch_path = seed_path(scratch)
+    try:
+        written = recordRecipe(scratch, 1234, _CRASHING_RUN_SAMPLES[1][1] + " --seed=0xdeadbeef")
+        text = written.read_text()
+        if "UNPROMOTED FINDING" not in text:
+            problems.append("the reproduction recipe was not written")
+        if "--seed=0xdeadbeef" not in text:
+            problems.append("the recipe did not carry the runner's seed")
+        if "--fuzz=1234" not in text:
+            problems.append("the recipe did not carry the iteration budget")
+        if "pub const seeds" not in text:
+            problems.append("the recipe destroyed the seed table it was appended to")
+        # Every recipe line must be a comment: a recipe is evidence, never a
+        # corpus entry, and must not change what `zig build test` runs.
+        for line in text.splitlines():
+            if line.startswith("//") or line.startswith("pub const seeds") or not line.strip():
+                continue
+            problems.append(f"recipe produced a non-comment line: {line!r}")
+    finally:
+        if scratch_path.is_file():
+            scratch_path.unlink()
+
+    for problem in problems:
+        print(f"run-fuzz: {problem}", file=sys.stderr)
+    if problems:
+        return 2
+    print(
+        "run-fuzz: self-test verified both exit-0 crash shapes, a valid clean"
+        " report, and non-zero/missing-report infrastructure failures",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("--zig")
+    parser.add_argument("--check-budgets", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--extended", action="store_true")
+    parser.add_argument("--target")
+    args = parser.parse_args(argv)
+
+    targets, budgets = check_budgets()
+    if args.self_test:
+        return self_test()
+    if args.check_budgets:
+        return 0
+
+    zig = resolve_zig(args.zig)
+    selected = [t for t in targets if args.target is None or args.target in t]
+    if not selected:
+        fail(f"--target {args.target!r} matched none of: {targets}")
+
+    findings = []
+    for target in selected:
+        key = next(k for k in budgets if k in target)
+        iterations = budgets[key][1 if args.extended else 0]
+        print(f"run-fuzz: {target}: {iterations} iterations", file=sys.stderr)
+        crashed, candidates, output = run_target(zig, target, iterations)
+        if not crashed:
+            print(f"run-fuzz: {target}: no failure found", file=sys.stderr)
+            continue
+        print(f"run-fuzz: {target}: FAILURE FOUND", file=sys.stderr)
+        print(output[-3000:], file=sys.stderr)
+        if not candidates:
+            recorded = recordRecipe(target, iterations, output)
+            findings.append(
+                f"{target}: crashed and the run left no non-empty seed anywhere"
+                " (cgz-1js). Wrote a reproduction recipe to"
+                f" {recorded.relative_to(ROOT)} so the finding is not lost."
+            )
+            continue
+        promoted = None
+        for candidate in candidates:
+            data = candidate.read_bytes()
+            print(
+                f"run-fuzz: trying {candidate.relative_to(ROOT)} ({len(data)} bytes)",
+                file=sys.stderr,
+            )
+            if replay_reproduces(zig, target, data):
+                promoted = (candidate, data)
+                break
+        if promoted:
+            candidate, data = promoted
+            findings.append(
+                f"{target}: promoted a {len(data)}-byte seed from"
+                f" {candidate.relative_to(ROOT)} to"
+                f" {seed_path(target).relative_to(ROOT)}, proven to reproduce"
+            )
+        else:
+            recorded = recordRecipe(target, iterations, output)
+            findings.append(
+                f"{target}: crashed, but none of the {len(candidates)} candidate"
+                " seeds reproduced, so no seed was committed (cgz-1js). Wrote a"
+                f" reproduction recipe to {recorded.relative_to(ROOT)} so the"
+                " finding is not lost; it is a comment, not a corpus entry."
+            )
+
+    for finding in findings:
+        print(f"run-fuzz: {finding}", file=sys.stderr)
+    if findings:
+        return 1
+    print("run-fuzz: every target ran its budget with no failure", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

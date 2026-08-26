@@ -29,6 +29,10 @@ pub const Outcome = struct {
     minimization_required: bool = false,
 };
 
+/// Lay out with a DOF collection this call owns. For callers with no
+/// optimizer to share one with - the residue and component meta-molecule
+/// builders, and the layout tests - collecting here keeps the DOF set
+/// derived from exactly the molecule being laid out.
 pub fn initializeCoordinates(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
@@ -37,9 +41,17 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
-    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, .{});
+    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, membership, fragmentation);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, .{});
 }
 
+/// `dofs` is borrowed for the duration of the call and must have been
+/// collected from this same molecule: `collectAllDofs` is purely topological,
+/// so a generation can collect once before layout and share the result with
+/// the discrete pass afterwards (cgz-7v2.28). Passing another molecule's
+/// collection - an open-cycle temporary's, say - would index atoms and
+/// fragments that do not correspond.
 pub fn initializeCoordinatesWithOptions(
     allocator: std.mem.Allocator,
     atoms: []model.Atom,
@@ -47,9 +59,10 @@ pub fn initializeCoordinatesWithOptions(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
+    dofs: core.dof.Collection,
     options: Options,
 ) core.errors.Error!Outcome {
-    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, options);
+    return initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, options);
 }
 
 fn initializeCoordinatesInternal(
@@ -59,9 +72,21 @@ fn initializeCoordinatesInternal(
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
+    dofs: core.dof.Collection,
     options: Options,
 ) core.errors.Error!Outcome {
     var outcome: Outcome = .{};
+    // Upstream's `fragment->getDofsOfAtom(a).empty()`, flattened. A DOF is
+    // registered under the *affected atom's* fragment rather than its own
+    // (`CoordgenFragmentDOF::addAtom`), so for an atom of the fragment being
+    // built the fragment-local lookup and this molecule-wide map agree.
+    const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(atom_has_dofs);
+    @memset(atom_has_dofs, false);
+    for (dofs.affected_atoms) |atom| {
+        if (atom.index() >= atom_has_dofs.len) return error.InvalidMapping;
+        atom_has_dofs[atom.index()] = true;
+    }
     // Ring fusion structure is needed by the central-ring priority, and is
     // derived once for the whole molecule rather than per fragment.
     var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds);
@@ -147,12 +172,13 @@ fn initializeCoordinatesInternal(
                 tail += 1;
             }
         }
-        // Upstream's order inside buildFragment is fallbackIfNanCoordinates,
-        // then rotateMainFragment for a constrained root, then the
-        // fixed-coordinate reset (CoordgenFragmentBuilder.cpp:858-866), and
-        // only then the snapshot. All three ran once at the end of the molecule
-        // here, after assembly, which is a different function of a different
-        // pose.
+        // Upstream's order inside buildFragment is avoidInternalClashes, then
+        // fallbackIfNanCoordinates, then rotateMainFragment for a constrained
+        // root, then the fixed-coordinate reset
+        // (CoordgenFragmentBuilder.cpp:857-866), and only then the snapshot.
+        // The last three ran once at the end of the molecule here, after
+        // assembly, which is a different function of a different pose.
+        avoidInternalClashes(atoms, graph, members, atom_has_dofs);
         fallbackOnValid3dCoordinates(atoms, members);
         alignConstrainedMainFragment(atoms, fragmentation, fragment);
         restoreFixedFragmentCoordinates(atoms, fragmentation, fragment);
@@ -669,6 +695,17 @@ fn openCycleAndGenerateCoordinates(
     defer temporary_rings.deinit();
     var temporary_fragments = try fragments.Fragmentation.init(allocator, temporary_atoms, temporary_bonds, temporary_graph, temporary_rings);
     defer temporary_fragments.deinit();
+    // The temporary molecule has a bond removed and therefore its own
+    // fragmentation, so it needs its own DOF collection. Reusing the caller's
+    // here would describe a different graph.
+    var temporary_dofs = try macrocycle.collectAllDofs(
+        allocator,
+        temporary_bonds,
+        temporary_graph,
+        temporary_rings,
+        temporary_fragments,
+    );
+    defer temporary_dofs.deinit();
     _ = try initializeCoordinatesInternal(
         allocator,
         temporary_atoms,
@@ -676,6 +713,7 @@ fn openCycleAndGenerateCoordinates(
         temporary_graph,
         temporary_rings,
         temporary_fragments,
+        temporary_dofs,
         .{ .force_open_macrocycles = true },
     );
     for (atoms, temporary_atoms, placed) |*atom, temporary_atom, *is_placed| {
@@ -1054,6 +1092,67 @@ fn fragmentHasValid3dSource(atoms: []const model.Atom, members: []const core.ids
             source.z < invalid_coordinates)) return false;
     }
     return true;
+}
+
+/// `CoordgenMinimizer::avoidInternalClashes`, called per fragment from
+/// buildFragment between the non-ring placement and the NaN fallback
+/// (CoordgenFragmentBuilder.cpp:857). It separates two atoms of the same
+/// fragment that landed on top of each other and that no degree of freedom
+/// can ever move apart, so the discrete search will not fix them either.
+///
+/// Upstream's `needsCheckForClashes` guard is omitted rather than modelled as
+/// an all-false array. The flag is initialised false in
+/// sketcherMinimizerAtom's constructor and its only assignment
+/// (CoordgenFragmentBuilder.cpp:773) is itself guarded by the flag, so nothing
+/// can seed it and it is permanently false. Omitting it is exact, not a
+/// simplification.
+fn avoidInternalClashes(
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    members: []const core.ids.AtomId,
+    atom_has_dofs: []const bool,
+) void {
+    // Upstream's cutoff is written `bondLength * 0.5f * bondLength * 0.5f`,
+    // which is the square of the half-bond box it has just tested each axis
+    // against.
+    const cutoff = bond_length * 0.5;
+    for (members) |atom| {
+        const atom_index = atom.index();
+        if (graph.degree(atom) != 1 or atoms[atom_index].fixed or atom_has_dofs[atom_index]) continue;
+        const neighbor = graph.neighbors(atom)[0];
+        for (members) |other| {
+            const other_index = other.index();
+            if (atom == other or atom_has_dofs[other_index] or isBonded(graph, atom, other)) continue;
+            const difference = subtract(atoms[other_index].coordinates, atoms[atom_index].coordinates);
+            if (difference.x > cutoff or difference.x < -cutoff or
+                difference.y > cutoff or difference.y < -cutoff or
+                difference.x * difference.x + difference.y * difference.y > cutoff * cutoff)
+            {
+                continue;
+            }
+            // The displacement is along the terminal atom's own bond, so it
+            // retreats towards its neighbour and the clashing atom - only when
+            // it is terminal too - is pushed the same distance the other way.
+            // Only the pushed atom is rounded, which is upstream's asymmetry.
+            const displacement = scale(
+                subtract(atoms[atom_index].coordinates, atoms[neighbor.index()].coordinates),
+                0.3,
+            );
+            atoms[atom_index].coordinates = subtract(atoms[atom_index].coordinates, displacement);
+            if (graph.degree(other) == 1) {
+                const pushed = add(atoms[other_index].coordinates, displacement);
+                atoms[other_index].coordinates = .{
+                    .x = roundToTwoDecimalDigits(pushed.x),
+                    .y = roundToTwoDecimalDigits(pushed.y),
+                };
+            }
+        }
+    }
+}
+
+fn isBonded(graph: topology.Graph, first: core.ids.AtomId, second: core.ids.AtomId) bool {
+    for (graph.neighbors(first)) |neighbor| if (neighbor == second) return true;
+    return false;
 }
 
 fn roundToTwoDecimalDigits(value: f32) f32 {
@@ -1919,7 +2018,9 @@ test "macrocycles dispatch through native polyomino placement" {
     try std.testing.expect(hex_edges > 0);
 
     const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
-    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, .{ .force_open_macrocycles = true });
+    var opened_dofs = try macrocycle.collectAllDofs(std.testing.allocator, &bonds, graph, rings, split);
+    defer opened_dofs.deinit();
+    _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, opened_dofs, .{ .force_open_macrocycles = true });
     for (bonds) |bond| {
         if (bond.id == opened) continue;
         try std.testing.expectApproxEqAbs(
@@ -1973,7 +2074,9 @@ fn layoutWithOptionsAndDiscard(
 ) !void {
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
-    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, .{ .force_open_macrocycles = force_open_macrocycles });
+    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, rings, split);
+    defer dofs.deinit();
+    _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, dofs, .{ .force_open_macrocycles = force_open_macrocycles });
 }
 
 fn captureFramesAndDiscard(
@@ -1993,6 +2096,74 @@ fn expectBondLengths(atoms: []const model.Atom, bonds: []const model.Bond) !void
             0.01,
         );
     }
+}
+
+test "internal clash fallback moves eligible terminal atoms in fragment order" {
+    // Path 0-1-4-3-2, so 0 and 2 are the terminal atoms and 1, 4 and 3 are
+    // not. 0 and 2 are 10 apart - inside the half-bond cutoff - and unbonded,
+    // which is the clash upstream separates.
+    var atoms: [5]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    atoms[0].coordinates = .{};
+    atoms[1].coordinates = .{ .x = -50 };
+    atoms[2].coordinates = .{ .x = 10 };
+    atoms[3].coordinates = .{ .x = 100 };
+    atoms[4].coordinates = .{ .x = 500, .y = 500 };
+    const pairs = [_][2]u32{ .{ 0, 1 }, .{ 1, 4 }, .{ 4, 3 }, .{ 3, 2 } };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const members = [_]core.ids.AtomId{
+        core.ids.AtomId.fromIndex(0),
+        core.ids.AtomId.fromIndex(1),
+        core.ids.AtomId.fromIndex(2),
+        core.ids.AtomId.fromIndex(3),
+        core.ids.AtomId.fromIndex(4),
+    };
+
+    const clean = [_]bool{ false, false, false, false, false };
+    avoidInternalClashes(&atoms, graph, &members, &clean);
+    // The terminal atom retreats 0.3 along its own bond; the atom it clashed
+    // with is terminal too, so it is pushed the same distance the other way
+    // and - unlike the first - rounded to two decimals.
+    try std.testing.expectApproxEqAbs(@as(f32, -15), atoms[0].coordinates.x, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), atoms[0].coordinates.y, 0.00001);
+    try std.testing.expectEqual(core.math.Vec2{ .x = 25 }, atoms[2].coordinates);
+    // Nothing else moved: 1, 3 and 4 are not terminal, and after the
+    // separation no remaining pair is inside the cutoff.
+    try std.testing.expectEqual(core.math.Vec2{ .x = -50 }, atoms[1].coordinates);
+    try std.testing.expectEqual(core.math.Vec2{ .x = 100 }, atoms[3].coordinates);
+
+    // The DOF guard is the whole point of the stage: an atom the discrete
+    // search can move is left for the discrete search to move.
+    atoms[0].coordinates = .{};
+    atoms[2].coordinates = .{ .x = 10 };
+    const has_dofs = [_]bool{ false, false, true, false, false };
+    avoidInternalClashes(&atoms, graph, &members, &has_dofs);
+    try std.testing.expectEqual(core.math.Vec2{}, atoms[0].coordinates);
+    try std.testing.expectEqual(core.math.Vec2{ .x = 10 }, atoms[2].coordinates);
+
+    // `fixed` guards only the retreating atom. Upstream tests it on `a` and
+    // never on `a2`, so a fixed atom is still pushed when it is the partner in
+    // someone else's clash - here atom 2 retreats instead and displaces the
+    // fixed atom 0 by the same vector. Pinned because it is upstream's
+    // asymmetry, not native's.
+    atoms[0].fixed = true;
+    avoidInternalClashes(&atoms, graph, &members, &clean);
+    try std.testing.expectEqual(core.math.Vec2{ .x = 37 }, atoms[2].coordinates);
+    try std.testing.expectEqual(core.math.Vec2{ .x = -27 }, atoms[0].coordinates);
 }
 
 test "fused rings align on their shared edge and extend outward" {

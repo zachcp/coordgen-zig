@@ -1,0 +1,33 @@
+# Per-target fuzz budgets (cgz-7v2.4.4, shape fixed by cgz-r14 and
+# docs/architecture/FUZZING.md).
+#
+# Columns are tab separated:
+#   target  smoke_iterations  extended_iterations
+#
+# target              Substring matching exactly one `test "fuzz: ..."` in
+#                     tests/fuzz_targets.zig. tools/run-fuzz fails when a
+#                     declared target has no row or a row matches no target, so
+#                     adding a target without a budget is a failure rather than
+#                     a target nobody fuzzes.
+# smoke_iterations    The per-PR budget. Iterations, not wall clock, so it is
+#                     reproducible across runners of differing speed.
+# extended_iterations The scheduled-job budget.
+#
+# ## Why these numbers
+#
+# Measured on aarch64-macos, pinned toolchain, Debug: the generation target
+# sustains roughly 10 runs per second, because every iteration lays out a
+# molecule and then lays it out again to check determinism. 2000 smoke
+# iterations is therefore about three and a half minutes per target, which is a
+# PR-sized cost. The extended budget is an order of magnitude above it.
+# The driver runs ReleaseSafe: Debug writes a zero-length coverage header on
+# x86_64-linux for these multi-module targets, while ReleaseSafe preserves
+# runtime safety checks and produces a valid coverage report on both targets.
+#
+# Raising a budget needs no justification. LOWERING one is a visible diff, which
+# is the point of recording them here rather than in a workflow file.
+#
+# target	smoke_iterations	extended_iterations
+generation invariants	2000	50000
+hostile input	2000	50000
+c abi contract	1500	40000

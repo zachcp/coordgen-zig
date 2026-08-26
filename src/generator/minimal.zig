@@ -111,6 +111,19 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.rings,
     );
     defer fragmentation.deinit();
+    // One collection per generation, shared by layout and the discrete pass.
+    // `collectAllDofs` reads only bonds, graph, ring membership and
+    // fragmentation - no coordinates - so collecting it before layout is
+    // valid, and layout needs it for the stages upstream gates on
+    // `getDofsOfAtom(a).empty()` (cgz-7v2.28).
+    var dofs = try layout.macrocycle.collectAllDofs(
+        allocator,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        fragmentation,
+    );
+    defer dofs.deinit();
     const layout_outcome = try layout.initializeCoordinatesWithOptions(
         allocator,
         prepared.working.atoms,
@@ -118,6 +131,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.graph,
         prepared.rings,
         fragmentation,
+        dofs,
         .{
             .force_open_macrocycles = input.options.force_open_macrocycles,
             .templates = .{
@@ -133,6 +147,8 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.graph,
         prepared.rings,
         fragmentation,
+        dofs,
+        proximity_relations,
         input.options.precision,
         residue_atoms,
     );
@@ -344,6 +360,25 @@ const DiscreteScoreContext = struct {
     rings: []const optimize.discrete.RingScoreView,
     atom_fragments: []const core.ids.FragmentId,
     fragmentation: layout.Fragmentation,
+    /// Upstream's proximity term (below). Empty whenever the molecule has no
+    /// proximity relations, which is the common case and costs nothing.
+    proximity: Proximity = .{},
+
+    const Proximity = struct {
+        sites: []const components.ProximityScoreSite = &.{},
+        /// Refilled per scored pose; `sites` supplies everything but the
+        /// addition vector.
+        views: []optimize.discrete.ProximityScoreView = &.{},
+        /// The addition vector is defined on atoms, and the search scores bare
+        /// coordinate sets, so this holds the candidate pose in the shape
+        /// `components.singleAdditionVector` reads. It is a scratch copy: the
+        /// alternative was a second coordinate-taking implementation of the
+        /// same eight lines, which is the duplication cgz-7v2.24 exists to
+        /// find.
+        atoms: []model.Atom = &.{},
+        graph: ?topology.Graph = null,
+        rings: ?topology.RingMembership = null,
+    };
 };
 
 fn scoreDiscretePose(raw_context: ?*anyopaque, coordinates: []const core.math.Vec2, dofs: []const core.dof.Dof) core.errors.Error!f32 {
@@ -351,6 +386,32 @@ fn scoreDiscretePose(raw_context: ?*anyopaque, coordinates: []const core.math.Ve
     var energy = try optimize.discrete.scoreClashInteractions(context.interactions, coordinates);
     energy += try optimize.discrete.scoreCrossBonds(context.bonds, coordinates);
     energy += try optimize.discrete.scoreAtomsInsideRings(context.rings, context.atom_fragments, coordinates);
+    // `CoordgenMinimizer::scoreClashes` ends with this term
+    // (CoordgenMinimizer.cpp:808). Its `scoreProximityRelationsOnOppositeSides`
+    // parameter defaults true and no caller ever passes false - :1268 passes a
+    // local named `doNotComputeForces` that is initialised to true - so it is
+    // unconditional in practice. It penalises a pose in which two of a
+    // molecule's proximity attachment points face more than 90 degrees apart,
+    // and it is purely intramolecular: the addition vectors are offsets from
+    // an atom to its own neighbours, so this does not depend on where the
+    // molecules have been arranged relative to each other.
+    if (context.proximity.sites.len != 0) {
+        const proximity = context.proximity;
+        if (proximity.atoms.len != coordinates.len) return error.InvalidMapping;
+        for (proximity.atoms, coordinates) |*atom, coordinate| atom.coordinates = coordinate;
+        for (proximity.sites, proximity.views) |site, *view| view.* = .{
+            .local_molecule = site.local_molecule,
+            .local_fragment = site.local_fragment,
+            .other_molecule = site.other_molecule,
+            .addition_vector = components.singleAdditionVector(
+                proximity.atoms,
+                proximity.graph.?,
+                proximity.rings.?,
+                site.local_atom,
+            ),
+        };
+        energy += try optimize.discrete.scoreProximityRelationsOnOppositeSides(proximity.views);
+    }
     for (dofs) |dof| {
         const fragment = context.fragmentation.fragments[dof.fragment.index()];
         const chain_parent = fragment.parent.isValid() and fragment.flags.chain and
@@ -372,13 +433,12 @@ fn optimizeDiscrete(
     graph: topology.Graph,
     rings: topology.RingMembership,
     fragmentation: layout.Fragmentation,
+    dofs: core.dof.Collection,
+    proximity_relations: []const components.ProximityRelation,
     precision: f32,
     excluded_atoms: []const bool,
 ) core.errors.Error!bool {
     if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
-    var dofs = try layout.macrocycle.collectAllDofs(allocator, bonds, graph, rings, fragmentation);
-    defer dofs.deinit();
-
     const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_has_dofs);
     @memset(atom_has_dofs, false);
@@ -457,6 +517,29 @@ fn optimizeDiscrete(
         .atom_fragments = fragmentation.atom_fragment,
         .fragmentation = fragmentation,
     };
+    const proximity_sites = try components.proximityScoreSites(
+        allocator,
+        graph,
+        fragmentation.atom_fragment,
+        proximity_relations,
+    );
+    defer allocator.free(proximity_sites);
+    var proximity_views: []optimize.discrete.ProximityScoreView = &.{};
+    defer if (proximity_views.len != 0) allocator.free(proximity_views);
+    var proximity_atoms: []model.Atom = &.{};
+    defer if (proximity_atoms.len != 0) allocator.free(proximity_atoms);
+    if (proximity_sites.len != 0) {
+        proximity_views = allocator.alloc(optimize.discrete.ProximityScoreView, proximity_sites.len) catch
+            return error.OutOfMemory;
+        proximity_atoms = allocator.dupe(model.Atom, atoms) catch return error.OutOfMemory;
+        score_context.proximity = .{
+            .sites = proximity_sites,
+            .views = proximity_views,
+            .atoms = proximity_atoms,
+            .graph = graph,
+            .rings = rings,
+        };
+    }
     {
         const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
         defer allocator.free(coordinates);

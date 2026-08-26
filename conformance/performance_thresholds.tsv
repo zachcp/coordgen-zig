@@ -1,0 +1,65 @@
+# Per-bucket native/oracle timing limits and comparison coverage (cgz-7v2.4.7).
+#
+# Columns are tab separated:
+#   bucket  max_median_ratio  max_p95_ratio  min_compared_members
+#
+# A ratio is native time divided by oracle time on the same member, in the same
+# process and build. Above 1.0 means native is slower. `min_compared_members`
+# is how many of the bucket's 20 members native could lay out when this row was
+# written; a member native refuses is skipped on BOTH sides, so the ratio stays
+# like-for-like and coverage is tracked separately rather than silently folded
+# into the timing.
+#
+# ## Why per bucket
+#
+# SUCCESS_CRITERIA requires median AND p95 per size bucket so a regression
+# confined to `huge` members is visible rather than averaged away. One
+# whole-corpus number would let a 5x regression on 50 huge members hide behind
+# 1900 small ones.
+#
+# ## Where these numbers came from
+#
+# Measured on aarch64-macos, pinned toolchain, ReleaseFast, two independent
+# runs, then rounded up for headroom:
+#
+#   bucket   median ratio                    p95 ratio                             compared
+#   tiny     0.938 / 0.900 / 1.014 / 1.067   13.882 / 13.283 / 10.223 / 13.008     19 of 20
+#   small    3.013 / 3.071 / 2.996 / 3.053    3.483 /  3.477 /  3.457 /  3.468     17 of 20
+#   medium   native supports none of 20
+#   large    native supports none of 20
+#   huge     native supports none of 20
+#
+# Four runs. `small` is stable to about 2% across all of them. `tiny` is not:
+# its median spans 0.900 - 1.067 and its p95 10.2 - 13.9, because tiny members
+# complete in
+# tens of microseconds, where scheduler noise is a large fraction of the
+# measurement. Its thresholds are therefore set well above the observed range
+# rather than just above the highest sample - a gate that fires on noise is
+# one that gets relaxed on first contact, which is the cgz-r21 failure mode.
+#
+# The tiny TAIL is a real finding and not noise: native is at or near parity on
+# the tiny median while running an order of magnitude slower at p95, in every
+# run. Something in the native path is occasionally very slow on small inputs.
+# That is cgz-twy, and the threshold here does not endorse it - this gate's job
+# is to stop things getting worse, and a threshold set below today's value
+# would be red from the day it landed without making anything faster.
+#
+# ## Editing rules
+#
+# LOWERING max_*_ratio, or RAISING min_compared_members, makes the gate
+# stricter and needs no justification.
+#
+# RAISING a ratio is admitting a regression. LOWERING min_compared_members is
+# admitting native stopped handling members it used to handle. Both require a
+# decision Bead, because they are the edits that turn a red gate green without
+# fixing anything.
+#
+# A bucket with no row is NOT permission: --enforce fails on a missing row for
+# any bucket where native laid out at least one member.
+#
+# bucket	max_median_ratio	max_p95_ratio	min_compared_members
+tiny	1.50	20.00	19
+small	3.80	4.30	17
+medium	0	0	0
+large	0	0	0
+huge	0	0	0

@@ -41,7 +41,9 @@ jobs:
           ALL_PROXY: http://127.0.0.1:9
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-ordinary-empty-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-ordinary-local-cache
-        run: ${{ steps.zig.outputs.zig }} build test
+        run: |
+          ${{ steps.zig.outputs.zig }} build test
+          ${{ steps.zig.outputs.zig }} build test -Doptimize=safe
 
       - name: Fetch complete package graph
         env:
