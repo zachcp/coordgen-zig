@@ -10,12 +10,10 @@
 //! the duplicate-symbol failure cgz-r28 records. The public C entry point has
 //! its own end-to-end coverage in `tests/abi_layout.c`.
 //!
-//! The gate is the eight public observables. Alongside them the runner reports
-//! one probe seam, the pose each side holds immediately before global
-//! orientation, which localises a coordinate divergence to the layout stages or
-//! to orientation (cgz-7v2.4.2.1). The remaining seams (Morgan ranks, rings,
-//! fragments, DOFs, template mappings, components) are named in the parity
-//! manifest and still need native probe records.
+//! The gate covers every public and probe observable in the parity manifest.
+//! It additionally reports the pose each side holds immediately before global
+//! orientation, which localises a coordinate divergence to layout or global
+//! orientation without weakening either gate (cgz-7v2.4.2.1).
 //!
 //! Usage: native-oracle-diff --partition NAME [--count N] --ceiling PATH
 //!        [--tolerance BOND_LENGTHS] [--baseline PATH]
@@ -54,6 +52,26 @@ const public_observables = [_]comparison.Observable{
     .effective_bond_orders,
     .bond_displays,
     .atom_stereo,
+};
+
+const probe_observables = [_]comparison.Observable{
+    .probe_status,
+    .probe_clean_pose,
+    .morgan_ranks,
+    .rings,
+    .rings_set,
+    .fragments,
+    .fragments_set,
+    .dofs,
+    .dofs_set,
+    .dof_penalties,
+    .dof_penalties_set,
+    .template_mappings,
+    .template_mappings_set,
+    .components,
+    .components_set,
+    .component_transforms,
+    .component_transforms_set,
 };
 
 const Counter = struct {
@@ -162,6 +180,7 @@ pub fn main(init: std.process.Init) !void {
     const report = &report_file.interface;
 
     var counters: [public_observables.len]Counter = @splat(.{});
+    var probe_counters: [probe_observables.len]Counter = @splat(.{});
     var totals = Totals{};
     // Owned by the run, not the arena: the list grows through `gpa` in
     // compareCoordinateObservable, so it has to be returned there too.
@@ -180,11 +199,12 @@ pub fn main(init: std.process.Init) !void {
             ceiling,
             tolerance,
             &counters,
+            &probe_counters,
             &totals,
         );
     }
 
-    try writeSummary(report, selected, tolerance, &counters, &totals);
+    try writeSummary(report, selected, tolerance, &counters, &probe_counters, &totals);
     if (baseline_path) |path| {
         var file = try std.Io.Dir.cwd().createFile(io, path, .{});
         defer file.close(io);
@@ -202,6 +222,9 @@ pub fn main(init: std.process.Init) !void {
     const status_failed = totals.status_mismatches != 0 or totals.native_unsupported != 0;
     var parity_failed = false;
     for (counters) |counter| {
+        if (counter.mismatched != 0) parity_failed = true;
+    }
+    for (probe_counters) |counter| {
         if (counter.mismatched != 0) parity_failed = true;
     }
 
@@ -240,6 +263,7 @@ fn compareMember(
     ceiling: comparison.CeilingTable,
     tolerance: f64,
     counters: *[public_observables.len]Counter,
+    probe_counters: *[probe_observables.len]Counter,
     totals: *Totals,
 ) !void {
     totals.members += 1;
@@ -316,7 +340,31 @@ fn compareMember(
         return;
     }
 
-    try comparePreOrientation(gpa, report, native_probe_input, oracle_input, oracle_result, native_value, member, tolerance, totals);
+    var oracle_probe: conformance.probe_types.ProbeResult = undefined;
+    const oracle_probe_status = coordgen_probe_generate(&oracle_input, &oracle_probe);
+    defer if (oracle_probe_status == 0) coordgen_probe_result_free(&oracle_probe);
+    var stages = conformance.native_probe.generateStages(gpa, native_probe_input) catch |err| {
+        try report.print("{s}/probe_status: native probe failed ({t})\n", .{ member, err });
+        probe_counters[0].compared += 1;
+        probe_counters[0].mismatched += 1;
+        return;
+    };
+    defer stages.deinit();
+    try compareProbeObservables(
+        gpa,
+        report,
+        member,
+        ceiling,
+        tolerance,
+        oracle_probe_status,
+        if (oracle_probe_status == 0) &oracle_probe else null,
+        oracle_result,
+        &stages,
+        probe_counters,
+    );
+    if (oracle_probe_status == 0) {
+        try comparePreOrientation(gpa, report, oracle_result, oracle_probe, stages, native_value, member, tolerance, totals);
+    }
 
     for (public_observables, 0..) |observable, slot| {
         const row = ceiling.find(member, observable) catch |err|
@@ -390,20 +438,16 @@ fn compareMember(
 /// whether it arrived before orientation or was introduced by it is the whole
 /// point of splitting the comparison.
 fn comparePreOrientation(
-    gpa: std.mem.Allocator,
+    allocator: std.mem.Allocator,
     report: *std.Io.Writer,
-    native_input: api.Input,
-    oracle_input: c_abi.Input,
     oracle_result: c_abi.Result,
+    probe: conformance.probe_types.ProbeResult,
+    stages: conformance.native_probe.Stages,
     native_value: api.Result,
     member: []const u8,
     tolerance: f64,
     totals: *Totals,
 ) !void {
-    var probe: conformance.probe_types.ProbeResult = undefined;
-    if (coordgen_probe_generate(&oracle_input, &probe) != 0) return;
-    defer coordgen_probe_result_free(&probe);
-
     const components = probe.componentSlice();
     // One component is the case the reconstruction is defined for: with several,
     // each carries its own transform and the atom-to-component mapping would
@@ -418,12 +462,6 @@ fn comparePreOrientation(
         );
         return;
     }
-
-    var stages = conformance.native_probe.generateStages(gpa, native_input) catch |err| {
-        try report.print("{s}/pre_orientation: native probe failed ({t})\n", .{ member, err });
-        return;
-    };
-    defer stages.deinit();
 
     // One generation feeding two readings is only sound if it agrees with the
     // public entry point. Checked, not assumed: a disagreement is a
@@ -442,12 +480,12 @@ fn comparePreOrientation(
 
     const len: usize = @intCast(oracle_result.coordinates.len);
     if (len != stages.pre_orientation.len) return error.NativeProbeLengthMismatch;
-    const oracle_final = try gpa.alloc(comparison.Point, len);
-    defer gpa.free(oracle_final);
-    const oracle_before = try gpa.alloc(comparison.Point, len);
-    defer gpa.free(oracle_before);
-    const native_before = try gpa.alloc(comparison.Point, len);
-    defer gpa.free(native_before);
+    const oracle_final = try allocator.alloc(comparison.Point, len);
+    defer allocator.free(oracle_final);
+    const oracle_before = try allocator.alloc(comparison.Point, len);
+    defer allocator.free(oracle_before);
+    const native_before = try allocator.alloc(comparison.Point, len);
+    defer allocator.free(native_before);
     const raw = oracle_result.coordinates.ptr.?;
     for (oracle_final, native_before, stages.pre_orientation, 0..) |*reference, *candidate, point, i| {
         reference.* = .{ .x = raw[i].x, .y = raw[i].y };
@@ -490,6 +528,331 @@ fn comparePreOrientation(
             orientation,
         },
     );
+}
+
+const ProbeView = struct {
+    morgan_ranks: []const u32,
+    ring_atoms: []const u32,
+    fragment_atoms: []const u32,
+    fragment_rings: []const u32,
+    component_atoms: []const u32,
+    dof_affected_atoms: []const u32,
+    template_mapping: []const conformance.probe_types.TemplateMappingProbe,
+    rings: []const conformance.probe_types.RingProbe,
+    fragments: []const conformance.probe_types.FragmentProbe,
+    dofs: []const conformance.probe_types.DofProbe,
+    components: []const conformance.probe_types.ComponentProbe,
+    clean_pose: bool,
+};
+
+fn oracleProbeView(probe: conformance.probe_types.ProbeResult) ProbeView {
+    return .{
+        .morgan_ranks = spanValues(probe.morgan_ranks),
+        .ring_atoms = spanValues(probe.ring_atoms),
+        .fragment_atoms = spanValues(probe.fragment_atoms),
+        .fragment_rings = spanValues(probe.fragment_rings),
+        .component_atoms = spanValues(probe.component_atoms),
+        .dof_affected_atoms = spanValues(probe.dof_affected_atoms),
+        .template_mapping = probe.templateMappingSlice(),
+        .rings = probe.ringSlice(),
+        .fragments = probe.fragmentSlice(),
+        .dofs = probe.dofSlice(),
+        .components = probe.componentSlice(),
+        .clean_pose = probe.clean_pose != 0,
+    };
+}
+
+fn nativeProbeView(probe: conformance.native_probe.Probe) ProbeView {
+    return .{
+        .morgan_ranks = probe.morgan_ranks,
+        .ring_atoms = probe.ring_atoms,
+        .fragment_atoms = probe.fragment_atoms,
+        .fragment_rings = probe.fragment_rings,
+        .component_atoms = probe.component_atoms,
+        .dof_affected_atoms = probe.dof_affected_atoms,
+        .template_mapping = probe.template_mapping,
+        .rings = probe.rings,
+        .fragments = probe.fragments,
+        .dofs = probe.dofs,
+        .components = probe.components,
+        .clean_pose = probe.clean_pose,
+    };
+}
+
+fn compareProbeObservables(
+    gpa: std.mem.Allocator,
+    report: *std.Io.Writer,
+    member: []const u8,
+    ceiling: comparison.CeilingTable,
+    tolerance: f64,
+    oracle_status: u32,
+    oracle_probe: ?*const conformance.probe_types.ProbeResult,
+    oracle_result: c_abi.Result,
+    stages: *const conformance.native_probe.Stages,
+    counters: *[probe_observables.len]Counter,
+) !void {
+    const native = nativeProbeView(stages.probe);
+    for (probe_observables, 0..) |observable, slot| {
+        const row = ceiling.find(member, observable) catch |err|
+            return fatal("ceiling lookup failed for {s}: {t}", .{ member, err });
+        const plan = comparison.differentialComparison(observable, row == null, row, tolerance) catch |err| {
+            try report.print("{s}/{t}: {t}\n", .{ member, observable, err });
+            counters[slot].mismatched += 1;
+            continue;
+        };
+        if (row != null) counters[slot].ceiling_applied += 1;
+        counters[slot].compared += 1;
+
+        var matched = oracle_status == 0;
+        if (observable == .probe_status) {
+            matched = oracle_status == 0;
+        } else if (oracle_probe) |probe_result| {
+            const oracle = oracleProbeView(probe_result.*);
+            matched = switch (observable) {
+                .probe_clean_pose => oracle.clean_pose == native.clean_pose,
+                .morgan_ranks => std.mem.eql(u32, oracle.morgan_ranks, native.morgan_ranks),
+                .dof_penalties, .dof_penalties_set => penaltiesEqual(
+                    oracle,
+                    native,
+                    observable == .dof_penalties_set,
+                    plan.tolerance_bond_lengths,
+                ),
+                .component_transforms, .component_transforms_set => try transformEffectsEqual(
+                    gpa,
+                    report,
+                    member,
+                    oracle,
+                    native,
+                    oracle_result,
+                    stages,
+                    observable == .component_transforms_set,
+                    plan.tolerance_bond_lengths,
+                ),
+                .rings,
+                .rings_set,
+                .fragments,
+                .fragments_set,
+                .dofs,
+                .dofs_set,
+                .template_mappings,
+                .template_mappings_set,
+                .components,
+                .components_set,
+                => try structuralProbeEqual(gpa, report, member, oracle, native, observable),
+                else => unreachable,
+            };
+        }
+        if (!matched) {
+            counters[slot].mismatched += 1;
+            try report.print("{s}/{t}: mismatch\n", .{ member, observable });
+        }
+    }
+}
+
+fn structuralProbeEqual(
+    allocator: std.mem.Allocator,
+    report: *std.Io.Writer,
+    member: []const u8,
+    oracle: ProbeView,
+    native: ProbeView,
+    observable: comparison.Observable,
+) !bool {
+    var oracle_records = try probeRecords(allocator, oracle, observable);
+    defer freeRecords(allocator, &oracle_records);
+    var native_records = try probeRecords(allocator, native, observable);
+    defer freeRecords(allocator, &native_records);
+    if (oracle_records.items.len != native_records.items.len) {
+        try report.print("{s}/{t}: record count oracle={d} native={d}\n", .{
+            member, observable, oracle_records.items.len, native_records.items.len,
+        });
+        return false;
+    }
+    const set_comparison = switch (observable) {
+        .rings_set, .fragments_set, .dofs_set, .template_mappings_set, .components_set => true,
+        else => false,
+    };
+    if (set_comparison) {
+        std.mem.sort([]const u8, oracle_records.items, {}, lessThanBytes);
+        std.mem.sort([]const u8, native_records.items, {}, lessThanBytes);
+    }
+    for (oracle_records.items, native_records.items, 0..) |left, right, index| {
+        if (!std.mem.eql(u8, left, right)) {
+            try report.print("{s}/{t}[{d}]: oracle={s} native={s}\n", .{
+                member, observable, index, left, right,
+            });
+            return false;
+        }
+    }
+    return true;
+}
+
+fn probeRecords(
+    allocator: std.mem.Allocator,
+    view: ProbeView,
+    observable: comparison.Observable,
+) !std.ArrayList([]const u8) {
+    var records: std.ArrayList([]const u8) = .empty;
+    errdefer freeRecords(allocator, &records);
+    switch (observable) {
+        .rings, .rings_set => for (view.rings) |ring| {
+            try records.append(allocator, try std.fmt.allocPrint(allocator, "[{f}]", .{
+                U32List{ .values = checkedSlice(view.ring_atoms, ring.atom_start, ring.atom_count) orelse return error.InvalidProbeRange },
+            }));
+        },
+        .fragments, .fragments_set => for (view.fragments) |fragment| {
+            try records.append(allocator, try std.fmt.allocPrint(
+                allocator,
+                "[parent={d} component={d} flags={d} template={d} atoms={f} rings={f}]",
+                .{
+                    fragment.parent,
+                    fragment.component,
+                    fragment.flags,
+                    fragment.template_match,
+                    U32List{ .values = checkedSlice(view.fragment_atoms, fragment.atom_start, fragment.atom_count) orelse return error.InvalidProbeRange },
+                    U32List{ .values = checkedSlice(view.fragment_rings, fragment.ring_start, fragment.ring_count) orelse return error.InvalidProbeRange },
+                },
+            ));
+        },
+        .dofs, .dofs_set => for (view.dofs) |dof| {
+            try records.append(allocator, try std.fmt.allocPrint(
+                allocator,
+                "[kind={d} fragment={d} state={d}/{d}/{d} tier={d} affected={f} atoms={d},{d} ring={d} multiplier={d}]",
+                .{
+                    @backingInt(dof.kind),
+                    dof.fragment,
+                    dof.current_state,
+                    dof.optimal_state,
+                    dof.state_count,
+                    dof.tier,
+                    U32List{ .values = checkedSlice(view.dof_affected_atoms, dof.affected_start, dof.affected_count) orelse return error.InvalidProbeRange },
+                    dof.atom_a,
+                    dof.atom_b,
+                    dof.ring,
+                    dof.variant_penalty_multiplier,
+                },
+            ));
+        },
+        .template_mappings, .template_mappings_set => for (view.template_mapping) |mapping| {
+            try records.append(allocator, try std.fmt.allocPrint(allocator, "[{d}->{d}]", .{
+                mapping.input_atom,
+                mapping.template_atom,
+            }));
+        },
+        .components, .components_set => for (view.components) |component| {
+            try records.append(allocator, try std.fmt.allocPrint(allocator, "[atoms={f} status={d}]", .{
+                U32List{ .values = checkedSlice(view.component_atoms, component.atom_start, component.atom_count) orelse return error.InvalidProbeRange },
+                @backingInt(component.transform_status),
+            }));
+        },
+        else => unreachable,
+    }
+    return records;
+}
+
+fn penaltiesEqual(oracle: ProbeView, native: ProbeView, as_set: bool, tolerance: f64) bool {
+    if (oracle.dofs.len != native.dofs.len) return false;
+    for (oracle.dofs) |left| {
+        var right: ?conformance.probe_types.DofProbe = null;
+        if (as_set) {
+            for (native.dofs) |candidate| if (candidate.id == left.id) {
+                right = candidate;
+                break;
+            };
+        } else if (left.id < native.dofs.len) {
+            right = native.dofs[left.id];
+        }
+        const value = right orelse return false;
+        if (@abs(@as(f64, left.current_penalty) - @as(f64, value.current_penalty)) > @max(0.001, tolerance)) return false;
+    }
+    return true;
+}
+
+fn transformEffectsEqual(
+    allocator: std.mem.Allocator,
+    report: *std.Io.Writer,
+    member: []const u8,
+    oracle: ProbeView,
+    native: ProbeView,
+    oracle_result: c_abi.Result,
+    stages: *const conformance.native_probe.Stages,
+    as_set: bool,
+    tolerance: f64,
+) !bool {
+    if (oracle.components.len != native.components.len) return false;
+    for (oracle.components, 0..) |left, index| {
+        var right: ?conformance.probe_types.ComponentProbe = null;
+        if (as_set) {
+            const left_atoms = checkedSlice(oracle.component_atoms, left.atom_start, left.atom_count) orelse return false;
+            for (native.components) |candidate| {
+                const right_atoms = checkedSlice(native.component_atoms, candidate.atom_start, candidate.atom_count) orelse return false;
+                if (std.mem.eql(u32, left_atoms, right_atoms)) {
+                    right = candidate;
+                    break;
+                }
+            }
+        } else {
+            right = native.components[index];
+        }
+        const value = right orelse return false;
+        if (left.transform_status != value.transform_status) return false;
+        if (left.transform_status == .unobserved) continue;
+        const oracle_atoms = checkedSlice(oracle.component_atoms, left.atom_start, left.atom_count) orelse return false;
+        const native_atoms = checkedSlice(native.component_atoms, value.atom_start, value.atom_count) orelse return false;
+        if (!std.mem.eql(u32, oracle_atoms, native_atoms)) return false;
+        const oracle_points = try allocator.alloc(comparison.Point, oracle_atoms.len);
+        defer allocator.free(oracle_points);
+        const native_points = try allocator.alloc(comparison.Point, native_atoms.len);
+        defer allocator.free(native_points);
+        const oracle_coordinates = oracle_result.coordinates.ptr orelse return false;
+        for (oracle_atoms, native_atoms, oracle_points, native_points) |oracle_atom, native_atom, *oracle_point, *native_point| {
+            if (oracle_atom >= oracle_result.coordinates.len or native_atom >= stages.pre_orientation.len) return false;
+            oracle_point.* = .{ .x = oracle_coordinates[oracle_atom].x, .y = oracle_coordinates[oracle_atom].y };
+            const source = stages.pre_orientation[native_atom];
+            native_point.* = .{
+                .x = value.transform[0] * source.x + value.transform[1] * source.y + value.transform[4],
+                .y = value.transform[2] * source.x + value.transform[3] * source.y + value.transform[5],
+            };
+        }
+        const result = comparison.compareCoordinates(oracle_points, native_points, tolerance, .{}) catch return false;
+        if (!result.matches) {
+            try report.print("{s}/component_transforms[{d}]: effect deviation {d:.6}\n", .{
+                member, index, result.max_deviation_bond_lengths,
+            });
+            return false;
+        }
+    }
+    return true;
+}
+
+fn checkedSlice(values: []const u32, start: u32, count: u32) ?[]const u32 {
+    const end = std.math.add(u32, start, count) catch return null;
+    if (end > values.len) return null;
+    return values[start..end];
+}
+
+fn spanValues(span: c_abi.U32Span) []const u32 {
+    const values = span.ptr orelse return &.{};
+    return values[0..span.len];
+}
+
+const U32List = struct {
+    values: []const u32,
+
+    pub fn format(self: U32List, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (self.values, 0..) |value, position| {
+            if (position != 0) try writer.writeByte(',');
+            try writer.print("{d}", .{value});
+        }
+    }
+};
+
+fn lessThanBytes(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.order(u8, left, right) == .lt;
+}
+
+fn freeRecords(allocator: std.mem.Allocator, records: *std.ArrayList([]const u8)) void {
+    for (records.items) |record| allocator.free(record);
+    records.deinit(allocator);
 }
 
 fn compareCoordinateObservable(
@@ -566,6 +929,7 @@ fn writeSummary(
     partition: corpus.Partition,
     tolerance: f64,
     counters: *const [public_observables.len]Counter,
+    probe_counters: *const [probe_observables.len]Counter,
     totals: *const Totals,
 ) !void {
     try report.print(
@@ -590,6 +954,14 @@ fn writeSummary(
             try report.print(", {d} at the enumerated ceiling", .{counter.ceiling_applied});
         }
         try report.print("\n", .{});
+    }
+    for (probe_observables, probe_counters) |observable, counter| {
+        try report.print(
+            "  {t}: {d}/{d} matched",
+            .{ observable, counter.compared - counter.mismatched, counter.compared },
+        );
+        if (counter.ceiling_applied != 0) try report.print(", {d} at the enumerated ceiling", .{counter.ceiling_applied});
+        try report.writeByte('\n');
     }
     if (totals.pre_orientation_compared != 0) {
         try report.print(

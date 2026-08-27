@@ -1364,6 +1364,25 @@ pub fn build(b: *std.Build) !void {
         );
         native_diff_step.dependOn(&run_native_diff.step);
 
+        // Full breadth is explicit rather than attached to ordinary tests or
+        // the fast drug-like gate. The 2,000-member population is the pinned
+        // adversarial corpus behind the stability manifest.
+        const run_native_diff_adversarial = b.addRunArtifact(native_diff);
+        run_native_diff_adversarial.expectExitCode(0);
+        run_native_diff_adversarial.addArgs(&.{
+            "--partition",
+            "adversarial",
+            "--count",
+            "2000",
+        });
+        run_native_diff_adversarial.addArg("--ceiling");
+        run_native_diff_adversarial.addFileArg(b.path("conformance/parity_ceiling.tsv"));
+        const native_diff_adversarial_step = b.step(
+            "native-diff-adversarial",
+            "Compare native against the pinned oracle over all 2,000 adversarial members",
+        );
+        native_diff_adversarial_step.dependOn(&run_native_diff_adversarial.step);
+
         // Publishing the baseline is a second run of the same binary over the
         // same partition, in the mode that reports a mismatch instead of
         // failing on it (cgz-7v2.4.2). It is deliberately not the gate's run:

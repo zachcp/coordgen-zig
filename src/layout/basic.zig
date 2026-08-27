@@ -19,6 +19,31 @@ const pi: f32 = std.math.pi;
 pub const Options = struct {
     force_open_macrocycles: bool = false,
     templates: templates.Options = .{},
+    /// Optional generation-lifetime observer used by the non-installed native
+    /// conformance probe. It sees only accepted matches, at the point where
+    /// their transient mapping still exists.
+    template_observer: ?TemplateObserver = null,
+};
+
+pub const TemplateObserver = struct {
+    context: *anyopaque,
+    recordFn: *const fn (
+        context: *anyopaque,
+        fragment: core.ids.FragmentId,
+        template_index: u32,
+        atoms: []const core.ids.AtomId,
+        mapping: []const u8,
+    ) core.errors.Error!void,
+
+    pub fn record(
+        self: TemplateObserver,
+        fragment: core.ids.FragmentId,
+        template_index: u32,
+        atoms: []const core.ids.AtomId,
+        mapping: []const u8,
+    ) core.errors.Error!void {
+        return self.recordFn(self.context, fragment, template_index, atoms, mapping);
+    }
 };
 
 /// What the ring path decided that later phases need to know.
@@ -629,6 +654,14 @@ fn matchFragmentTemplate(
     )) orelse return false;
     defer match.deinit();
     try match.apply(atoms);
+    if (options.template_observer) |observer| {
+        try observer.record(
+            fragment.id,
+            match.match.template_index,
+            match.atoms,
+            match.match.mapping,
+        );
+    }
     for (match.atoms) |atom_id| placed[atom_id.index()] = true;
     return true;
 }
@@ -1535,8 +1568,8 @@ fn neighbourAnglesAtCenter(
             !atoms[neighbours[0].index()].cross_layout or
             !atoms[neighbours[1].index()].cross_layout) division = 3;
         const incident = graph.incidentBonds(center);
-        const total = @intFromEnum(bonds[incident[0].index()].effective_order) +
-            @intFromEnum(bonds[incident[1].index()].effective_order);
+        const total = @backingInt(bonds[incident[0].index()].effective_order) +
+            @backingInt(bonds[incident[1].index()].effective_order);
         if (total >= 4) division = 2;
     } else if (neighbours.len == 4 and !atoms[center.index()].cross_layout) {
         // Upstream's 60-90-120-90 around a tetracoordinated centre.
@@ -2207,8 +2240,8 @@ test "the third ring of a linear acene mirrors away from its parent ring, not fr
     var atoms: [14]model.Atom = undefined;
     for (&atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
     const pairs = [_][2]u32{
-        .{ 0, 1 },  .{ 1, 2 },   .{ 2, 3 },   .{ 3, 4 },  .{ 4, 5 },   .{ 5, 0 },
-        .{ 3, 6 },  .{ 6, 7 },   .{ 7, 8 },   .{ 8, 9 },  .{ 9, 4 },   .{ 8, 10 },
+        .{ 0, 1 },   .{ 1, 2 },   .{ 2, 3 },   .{ 3, 4 },  .{ 4, 5 }, .{ 5, 0 },
+        .{ 3, 6 },   .{ 6, 7 },   .{ 7, 8 },   .{ 8, 9 },  .{ 9, 4 }, .{ 8, 10 },
         .{ 10, 11 }, .{ 11, 12 }, .{ 12, 13 }, .{ 13, 7 },
     };
     var bonds: [pairs.len]model.Bond = undefined;
@@ -2415,7 +2448,6 @@ test "constrained alignment and fixed reset are deterministic" {
     atoms[2].template_coordinates = .{ .x = -12, .y = 34 };
     try layoutFixture(&atoms, &bonds);
     try std.testing.expectEqual(core.math.Vec2{ .x = -12, .y = 34 }, atoms[2].coordinates);
-
 }
 
 test "the 3D fallback applies upstream's scaled, mirrored projection" {
@@ -2500,9 +2532,15 @@ test "planarity scoring separates a flat fused system from a bond shared by thre
     for (&bridged_atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
     const bridged_pairs = [_][2]u32{
         .{ 0, 1 },
-        .{ 0, 2 }, .{ 2, 3 }, .{ 3, 1 },
-        .{ 0, 4 }, .{ 4, 5 }, .{ 5, 1 },
-        .{ 0, 6 }, .{ 6, 7 }, .{ 7, 1 },
+        .{ 0, 2 },
+        .{ 2, 3 },
+        .{ 3, 1 },
+        .{ 0, 4 },
+        .{ 4, 5 },
+        .{ 5, 1 },
+        .{ 0, 6 },
+        .{ 6, 7 },
+        .{ 7, 1 },
     };
     var bridged_bonds: [bridged_pairs.len]model.Bond = undefined;
     for (&bridged_bonds, bridged_pairs, 0..) |*bond, pair, index| bond.* = .{

@@ -57,6 +57,26 @@ pub const Outputs = struct {
     /// fixed/constrained decline distinguishable from a silent input-class
     /// skip while leaving the public result unchanged (cgz-7v2.22).
     orientation_outcome: ?*components.OrientationOutcome = null,
+    /// One generation-lifetime callback for the non-installed native probe.
+    /// All values are borrowed and valid only for the callback invocation.
+    probe_sink: ?ProbeSink = null,
+};
+
+pub const ProbeSnapshot = struct {
+    prepared: *const topology.PreparedGraph,
+    fragmentation: layout.Fragmentation,
+    dofs: core.dof.Collection,
+    clean_pose: bool,
+};
+
+pub const ProbeSink = struct {
+    context: *anyopaque,
+    template_observer: layout.TemplateObserver,
+    captureFn: *const fn (*anyopaque, ProbeSnapshot) core.errors.Error!void,
+
+    pub fn capture(self: ProbeSink, snapshot: ProbeSnapshot) core.errors.Error!void {
+        return self.captureFn(self.context, snapshot);
+    }
 };
 
 /// Compose validated safe-API-shaped input through native preparation,
@@ -142,6 +162,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
                 .load_templates = input.options.load_templates,
                 .template_directory = input.options.template_directory,
             },
+            .template_observer = if (outputs.probe_sink) |sink| sink.template_observer else null,
         },
     );
     const clean_pose = try optimizeDiscrete(
@@ -210,6 +231,12 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
     )) {
         return error.Unsupported;
     }
+    if (outputs.probe_sink) |sink| try sink.capture(.{
+        .prepared = &prepared,
+        .fragmentation = fragmentation,
+        .dofs = dofs,
+        .clean_pose = clean_pose,
+    });
     if (prepared.working.residues.len != 0) {
         if (prepared.working.residues.len == prepared.working.atoms.len) {
             try residues.placeProteinOnly(
