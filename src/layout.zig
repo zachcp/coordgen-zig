@@ -4,6 +4,7 @@ pub const templates = @import("layout/templates.zig");
 pub const macrocycle = @import("layout/macrocycle.zig");
 
 pub const Fragmentation = fragments.Fragmentation;
+pub const TemplateObserver = basic.TemplateObserver;
 pub const initializeCoordinates = basic.initializeCoordinates;
 pub const initializeCoordinatesWithOptions = basic.initializeCoordinatesWithOptions;
 pub const captureFragmentFrames = basic.captureFragmentFrames;
