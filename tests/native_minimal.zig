@@ -180,11 +180,15 @@ test "minimal native generation explicitly rejects domains owned by later phases
     changed_bonds[0].display = .solid_forward;
     try expectUnsupported(.{ .atoms = &atoms, .bonds = &changed_bonds });
 
-    try expectUnsupported(.{
+    // Proximity relations now run through the same subset-first component
+    // arrangement as zero-order metal bonds; they are no longer a deferred
+    // generation domain.
+    var proximity_result = try generate(std.testing.allocator, .{
         .atoms = &atoms,
         .bonds = &path,
         .residue_interactions = &.{.{ .start = 0, .end = 2 }},
     });
+    proximity_result.deinit();
     try expectUnsupported(.{
         .atoms = &atoms,
         .bonds = &path,
@@ -515,4 +519,3 @@ test "minimal native validation rejects malformed input before generation" {
         .bonds = &.{.{ .start = 0, .end = 2 }},
     }));
 }
-

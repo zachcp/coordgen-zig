@@ -127,12 +127,14 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var partition: ?corpus.Partition = null;
+    var start_index: u32 = 0;
     var requested_count: u32 = 0;
     var ceiling_path: ?[]const u8 = null;
     var baseline_path: ?[]const u8 = null;
     var check_baseline_path: ?[]const u8 = null;
     var tolerance = default_tolerance_bond_lengths;
     var on_mismatch: OnMismatch = .fail;
+    var status_only = false;
 
     const args = try init.minimal.args.toSlice(arena);
     var index: usize = 1;
@@ -142,6 +144,9 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, args[index], "--partition")) {
             partition = std.meta.stringToEnum(corpus.Partition, value) orelse
                 return fatal("unknown partition '{s}'", .{value});
+        } else if (std.mem.eql(u8, args[index], "--start")) {
+            start_index = std.fmt.parseInt(u32, value, 10) catch
+                return fatal("--start '{s}' is not a number", .{value});
         } else if (std.mem.eql(u8, args[index], "--count")) {
             requested_count = std.fmt.parseInt(u32, value, 10) catch
                 return fatal("--count '{s}' is not a number", .{value});
@@ -154,6 +159,11 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[index], "--on-mismatch")) {
             on_mismatch = std.meta.stringToEnum(OnMismatch, value) orelse
                 return fatal("--on-mismatch takes 'fail' or 'record', not '{s}'", .{value});
+        } else if (std.mem.eql(u8, args[index], "--status-only")) {
+            status_only = std.mem.eql(u8, value, "true") or if (std.mem.eql(u8, value, "false"))
+                false
+            else
+                return fatal("--status-only takes 'true' or 'false', not '{s}'", .{value});
         } else if (std.mem.eql(u8, args[index], "--tolerance")) {
             tolerance = std.fmt.parseFloat(f64, value) catch
                 return fatal("--tolerance '{s}' is not a number", .{value});
@@ -167,7 +177,17 @@ pub fn main(init: std.process.Init) !void {
     // argument silently downgrade the run to "no pair is ever excused", which
     // reads as a pass. Same reasoning as corpus-classify's --ceiling.
     const ceiling_file = ceiling_path orelse return fatal("--ceiling is required", .{});
-    const count = selected.memberCount(requested_count);
+    const count = switch (selected) {
+        .adversarial => requested_count,
+        .drug_like => blk: {
+            const partition_count = selected.memberCount(0);
+            if (start_index >= partition_count) {
+                return fatal("--start {d} is outside corpus partition '{t}' ({d} members)", .{ start_index, selected, partition_count });
+            }
+            const remaining = partition_count - start_index;
+            break :blk if (requested_count == 0) remaining else @min(requested_count, remaining);
+        },
+    };
     if (count == 0) return fatal("corpus partition '{t}' would be empty", .{selected});
 
     const ceiling_text = try std.Io.Dir.cwd().readFileAlloc(io, ceiling_file, arena, .limited(1 << 20));
@@ -186,8 +206,8 @@ pub fn main(init: std.process.Init) !void {
     // compareCoordinateObservable, so it has to be returned there too.
     defer totals.member_deviations.deinit(gpa);
 
-    for (0..count) |raw_index| {
-        const member_index: u32 = @intCast(raw_index);
+    for (0..count) |raw_offset| {
+        const member_index = start_index + @as(u32, @intCast(raw_offset));
         const molecule = try corpus.generate(gpa, selected, member_index);
         defer molecule.deinit(gpa);
         const member = try std.fmt.allocPrint(arena, "{t}/{d}", .{ selected, member_index });
@@ -201,6 +221,7 @@ pub fn main(init: std.process.Init) !void {
             &counters,
             &probe_counters,
             &totals,
+            status_only,
         );
     }
 
@@ -265,6 +286,7 @@ fn compareMember(
     counters: *[public_observables.len]Counter,
     probe_counters: *[probe_observables.len]Counter,
     totals: *Totals,
+    status_only: bool,
 ) !void {
     totals.members += 1;
 
@@ -339,6 +361,7 @@ fn compareMember(
         );
         return;
     }
+    if (status_only) return;
 
     var oracle_probe: conformance.probe_types.ProbeResult = undefined;
     const oracle_probe_status = coordgen_probe_generate(&oracle_input, &oracle_probe);

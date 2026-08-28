@@ -142,6 +142,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
     // `getDofsOfAtom(a).empty()` (cgz-7v2.28).
     var dofs = try layout.macrocycle.collectAllDofs(
         allocator,
+        prepared.working.atoms,
         prepared.working.bonds,
         prepared.graph,
         prepared.rings,
@@ -214,22 +215,15 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         try components.arrangeComponents(allocator, prepared.working.atoms, prepared.graph);
     } else if (proximity_relations.len == 0) {
         try components.arrangeComponentsExcluding(allocator, prepared.working.atoms, prepared.graph, residue_atoms);
-    } else if (prepared.working.residues.len != 0) {
-        if (!try components.arrangeProximityComponentsExcluding(
+    } else {
+        try components.arrangeComponentsWithProximityExcluding(
             allocator,
             prepared.working.atoms,
             prepared.working.bonds,
+            prepared.graph,
             proximity_relations,
             residue_atoms,
-        )) return error.Unsupported;
-    } else if (!try components.arrangeProximityComponents(
-        allocator,
-        prepared.working.atoms,
-        prepared.graph,
-        prepared.rings,
-        proximity_relations,
-    )) {
-        return error.Unsupported;
+        );
     }
     if (outputs.probe_sink) |sink| try sink.capture(.{
         .prepared = &prepared,
@@ -391,6 +385,7 @@ const DiscreteScoreContext = struct {
     bonds: []const optimize.discrete.BondScoreView,
     rings: []const optimize.discrete.RingScoreView,
     atom_fragments: []const core.ids.FragmentId,
+    fragment_components: []const core.ids.MoleculeId,
     fragmentation: layout.Fragmentation,
     /// Upstream's proximity term (below). Empty whenever the molecule has no
     /// proximity relations, which is the common case and costs nothing.
@@ -417,7 +412,7 @@ fn scoreDiscretePose(raw_context: ?*anyopaque, coordinates: []const core.math.Ve
     const context: *DiscreteScoreContext = @ptrCast(@alignCast(raw_context.?));
     var energy = try optimize.discrete.scoreClashInteractions(context.interactions, coordinates);
     energy += try optimize.discrete.scoreCrossBonds(context.bonds, coordinates);
-    energy += try optimize.discrete.scoreAtomsInsideRings(context.rings, context.atom_fragments, coordinates);
+    energy += try optimize.discrete.scoreAtomsInsideRings(context.rings, context.atom_fragments, context.fragment_components, coordinates);
     // `CoordgenMinimizer::scoreClashes` ends with this term
     // (CoordgenMinimizer.cpp:808). Its `scoreProximityRelationsOnOppositeSides`
     // parameter defaults true and no caller ever passes false - :1268 passes a
@@ -507,10 +502,11 @@ fn optimizeDiscrete(
     defer if (filtered_interactions.len != 0) allocator.free(filtered_interactions);
     var scoring_interactions = interactions.items;
     var filtered_count: usize = 0;
-    if (excluded_atoms.len != 0) {
+    if (excluded_atoms.len != 0 or graph.component_count > 1) {
         filtered_interactions = allocator.alloc(core.interaction.Interaction, interactions.items.len) catch return error.OutOfMemory;
         for (interactions.items) |interaction| {
             if (interactionTouchesExcluded(interaction, excluded_atoms)) continue;
+            if (try interactionCrossesComponents(interaction, graph)) continue;
             filtered_interactions[filtered_count] = interaction;
             filtered_count += 1;
         }
@@ -529,6 +525,7 @@ fn optimizeDiscrete(
         view.* = .{
             .start = bond.start,
             .end = bond.end,
+            .component = graph.component(bond.start) orelse return error.InvalidMapping,
             .crossing_penalty_multiplier = bond.crossing_penalty_multiplier,
             .terminal = graph.degree(bond.start) == 1 or graph.degree(bond.end) == 1,
             .macrocycle = macrocycle,
@@ -540,15 +537,11 @@ fn optimizeDiscrete(
     for (rings.rings, ring_views) |ring, *view| view.* = .{
         .atoms = rings.atoms(ring.id),
         .fragment = fragmentation.atom_fragment[rings.atoms(ring.id)[0].index()],
+        .component = graph.component(rings.atoms(ring.id)[0]) orelse return error.InvalidMapping,
     };
-
-    var score_context = DiscreteScoreContext{
-        .interactions = scoring_interactions,
-        .bonds = bond_views,
-        .rings = ring_views,
-        .atom_fragments = fragmentation.atom_fragment,
-        .fragmentation = fragmentation,
-    };
+    const fragment_components = allocator.alloc(core.ids.MoleculeId, fragmentation.fragments.len) catch return error.OutOfMemory;
+    defer allocator.free(fragment_components);
+    for (fragmentation.fragments, fragment_components) |fragment, *component| component.* = fragment.component;
     const proximity_sites = try components.proximityScoreSites(
         allocator,
         graph,
@@ -556,30 +549,105 @@ fn optimizeDiscrete(
         proximity_relations,
     );
     defer allocator.free(proximity_sites);
+    var all_clean = true;
+    for (0..graph.component_count) |raw_component| {
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+        const clean = try optimizeDiscreteComponent(
+            allocator,
+            atoms,
+            graph,
+            rings,
+            fragmentation,
+            dofs,
+            scoring_interactions,
+            bond_views,
+            ring_views,
+            fragment_components,
+            proximity_sites,
+            component,
+            precision,
+        );
+        all_clean = all_clean and clean;
+    }
+    return all_clean;
+}
+
+fn optimizeDiscreteComponent(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    fragmentation: layout.Fragmentation,
+    dofs: core.dof.Collection,
+    all_interactions: []const core.interaction.Interaction,
+    all_bonds: []const optimize.discrete.BondScoreView,
+    all_rings: []const optimize.discrete.RingScoreView,
+    fragment_components: []const core.ids.MoleculeId,
+    all_proximity_sites: []const components.ProximityScoreSite,
+    component: core.ids.MoleculeId,
+    precision: f32,
+) core.errors.Error!bool {
+    var component_dofs: std.ArrayList(core.dof.Dof) = .empty;
+    defer component_dofs.deinit(allocator);
+    var dof_indices: std.ArrayList(usize) = .empty;
+    defer dof_indices.deinit(allocator);
+    for (dofs.items, 0..) |dof, index| {
+        if (fragmentation.fragments[dof.fragment.index()].component != component) continue;
+        component_dofs.append(allocator, dof) catch return error.OutOfMemory;
+        dof_indices.append(allocator, index) catch return error.OutOfMemory;
+    }
+
+    var interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer interactions.deinit(allocator);
+    for (all_interactions) |interaction| {
+        if (try interactionComponent(interaction, graph) == component) {
+            interactions.append(allocator, interaction) catch return error.OutOfMemory;
+        }
+    }
+    var bonds: std.ArrayList(optimize.discrete.BondScoreView) = .empty;
+    defer bonds.deinit(allocator);
+    for (all_bonds) |bond| if (bond.component == component) {
+        bonds.append(allocator, bond) catch return error.OutOfMemory;
+    };
+    var proximity_sites: std.ArrayList(components.ProximityScoreSite) = .empty;
+    defer proximity_sites.deinit(allocator);
+    for (all_proximity_sites) |site| if (site.local_molecule == component) {
+        proximity_sites.append(allocator, site) catch return error.OutOfMemory;
+    };
+
+    var score_context = DiscreteScoreContext{
+        .interactions = interactions.items,
+        .bonds = bonds.items,
+        // Upstream's atom-inside-ring term is global even while the mutable
+        // clash/DOF search is molecule-local. Each ring still compares only
+        // with atoms from its own molecule in scoreAtomsInsideRings.
+        .rings = all_rings,
+        .atom_fragments = fragmentation.atom_fragment,
+        .fragment_components = fragment_components,
+        .fragmentation = fragmentation,
+    };
     var proximity_views: []optimize.discrete.ProximityScoreView = &.{};
     defer if (proximity_views.len != 0) allocator.free(proximity_views);
     var proximity_atoms: []model.Atom = &.{};
     defer if (proximity_atoms.len != 0) allocator.free(proximity_atoms);
-    if (proximity_sites.len != 0) {
-        proximity_views = allocator.alloc(optimize.discrete.ProximityScoreView, proximity_sites.len) catch
-            return error.OutOfMemory;
+    if (proximity_sites.items.len != 0) {
+        proximity_views = allocator.alloc(optimize.discrete.ProximityScoreView, proximity_sites.items.len) catch return error.OutOfMemory;
         proximity_atoms = allocator.dupe(model.Atom, atoms) catch return error.OutOfMemory;
         score_context.proximity = .{
-            .sites = proximity_sites,
+            .sites = proximity_sites.items,
             .views = proximity_views,
             .atoms = proximity_atoms,
             .graph = graph,
             .rings = rings,
         };
     }
-    {
-        const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
-        defer allocator.free(coordinates);
-        for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
-        const initial = try scoreDiscretePose(&score_context, coordinates, dofs.items);
-        if (initial < optimize.discrete.clash_energy_threshold) return true;
-    }
-    if (dofs.items.len == 0) return false;
+
+    const coordinates = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(coordinates);
+    for (atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+    const initial = try scoreDiscretePose(&score_context, coordinates, component_dofs.items);
+    if (initial < optimize.discrete.clash_energy_threshold) return true;
+    if (component_dofs.items.len == 0) return false;
 
     var frame_data = try layout.captureFragmentFrames(allocator, atoms, fragmentation);
     defer frame_data.deinit();
@@ -590,7 +658,7 @@ fn optimizeDiscrete(
     const global = allocator.alloc(core.math.Vec2, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(global);
     var evaluator = optimize.discrete.FramePoseEvaluator{
-        .dofs = dofs.items,
+        .dofs = component_dofs.items,
         .affected_atoms = dofs.affected_atoms,
         .pose = .{
             .frames = frame_data.frames,
@@ -606,9 +674,10 @@ fn optimizeDiscrete(
         .score_context = &score_context,
         .scorePoseFn = scoreDiscretePose,
     };
-    var cache = try optimize.discrete.SolutionCache.init(allocator, dofs.items.len, precision, evaluator.evaluator());
+    var cache = try optimize.discrete.SolutionCache.init(allocator, component_dofs.items.len, precision, evaluator.evaluator());
     defer cache.deinit();
-    const search = try optimize.discrete.tieredSearch(allocator, dofs.items, &cache, precision, 0);
+    const search = try optimize.discrete.tieredSearch(allocator, component_dofs.items, &cache, precision, 0);
+    for (component_dofs.items, dof_indices.items) |source, index| dofs.items[index].state = source.state;
     for (atoms, global) |*atom, coordinate| atom.coordinates = coordinate;
     return search.clean_pose;
 }
@@ -623,6 +692,27 @@ fn interactionTouchesExcluded(interaction: core.interaction.Interaction, exclude
         .ez_constraint => |value| excluded_atoms[value.side_a.index()] or excluded_atoms[value.double_a.index()] or
             excluded_atoms[value.double_b.index()] or excluded_atoms[value.side_b.index()],
     };
+}
+
+fn interactionCrossesComponents(interaction: core.interaction.Interaction, graph: topology.Graph) core.errors.Error!bool {
+    const pair = switch (interaction.payload) {
+        .clash => |value| .{ value.segment_start, value.point },
+        else => return false,
+    };
+    const first = graph.component(pair[0]) orelse return error.InvalidMapping;
+    const second = graph.component(pair[1]) orelse return error.InvalidMapping;
+    return first != second;
+}
+
+fn interactionComponent(interaction: core.interaction.Interaction, graph: topology.Graph) core.errors.Error!core.ids.MoleculeId {
+    const atom = switch (interaction.payload) {
+        .stretch => |value| value.atom_a,
+        .bend => |value| value.center,
+        .clash => |value| value.segment_start,
+        .constraint => |value| value.atom,
+        .ez_constraint => |value| value.double_a,
+    };
+    return graph.component(atom) orelse error.InvalidMapping;
 }
 
 fn rejectOutOfScope(input: anytype) core.errors.Error!void {

@@ -119,12 +119,31 @@ const macrocycle_atoms = [_]api.AtomInput{
 };
 const macrocycle_bonds = ringBonds(13);
 
-/// Two chains with no bond and no relation between them: the plain component
-/// arrangement path.
-const component_atoms = [_]api.AtomInput{ carbon, carbon, carbon, carbon };
+/// A branched cyclic component plus a separate chain: this reaches both the
+/// molecule-local discrete search and the plain component-arrangement path.
+/// Keeping both in one family prevents a correction to disconnected-component
+/// scoring from silently dropping the search allocation coverage.
+const component_atoms = [_]api.AtomInput{
+    carbon, carbon, carbon, carbon, carbon, carbon, carbon, carbon,
+    carbon, carbon, carbon, carbon, carbon, carbon, carbon, carbon,
+};
 const component_bonds = [_]api.BondInput{
-    .{ .start = 0, .end = 1 },
+    .{ .start = 0, .end = 1, .order = .triple },
+    .{ .start = 0, .end = 2, .order = .double },
     .{ .start = 2, .end = 3 },
+    .{ .start = 2, .end = 4 },
+    .{ .start = 0, .end = 5 },
+    .{ .start = 5, .end = 6, .order = .double },
+    .{ .start = 5, .end = 7, .order = .double },
+    .{ .start = 4, .end = 8, .order = .double },
+    .{ .start = 2, .end = 9 },
+    .{ .start = 4, .end = 10 },
+    .{ .start = 0, .end = 11 },
+    .{ .start = 8, .end = 12, .order = .double },
+    .{ .start = 0, .end = 13 },
+    .{ .start = 12, .end = 10 },
+    .{ .start = 0, .end = 6 },
+    .{ .start = 14, .end = 15 },
 };
 
 /// Two molecules joined by two zero-order bonds to the same partner atom. Two
@@ -146,26 +165,29 @@ const proximity_bonds = [_]api.BondInput{
 const counterion_atoms = [_]api.AtomInput{
     .{ .atomic_number = .nitrogen, .formal_charge = 1 },
     carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
+    carbon,
     .{ .atomic_number = .chlorine, .formal_charge = -1 },
 };
-const counterion_bonds = [_]api.BondInput{.{ .start = 0, .end = 1 }};
+// Reuse the search-reaching connected half of the component fixture; atom 14
+// remains the disconnected counterion placed beside charged atom 0.
+const counterion_bonds = component_bonds[0..15].*;
 
 /// A nonterminal bond to a metal, which preparation rewrites to zero order
 /// (cgz-r11). Placed on a ring so the rewrite changes the graph's shape rather
 /// than only an observable.
-const metal_atoms = [_]api.AtomInput{
-    carbon,
-    carbon,
-    .{ .atomic_number = .iron },
-    carbon,
-    .{ .atomic_number = .oxygen },
-};
-const metal_bonds = [_]api.BondInput{
-    .{ .start = 0, .end = 1 },
-    .{ .start = 1, .end = 2 },
-    .{ .start = 2, .end = 3 },
-    .{ .start = 3, .end = 4 },
-};
+const metal_atoms = component_atoms ++ [_]api.AtomInput{.{ .atomic_number = .iron }};
+const metal_bonds = component_bonds ++ [_]api.BondInput{.{ .start = 0, .end = 16 }};
 
 const hetero_atoms = [_]api.AtomInput{
     .{ .atomic_number = .carbon },
@@ -199,12 +221,11 @@ const residue_interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end 
 ///   components        0.071243  congruent
 ///   proximity        83.474560  divergent
 ///   counterion        0.000000  identical
-///   metal zero-order  1.460194  congruent
+///   metal zero-order  0.208847  congruent
 ///   heteroatoms       0.000000  identical
 ///
 /// Recorded so a reclassification can be compared against a number rather than
-/// argued about. `metal zero-order` is the one with the least headroom, at
-/// 1.46 against a 5.0 bound.
+/// argued about.
 const families = [_]Family{
     .{ .name = "chain", .atoms = &chain_atoms, .bonds = &chain_bonds, .order = .identical },
     .{ .name = "ring", .atoms = &ring_atoms, .bonds = &ring_bonds, .order = .congruent },
@@ -380,8 +401,8 @@ fn reverseInput(
 }
 
 test "a reversed caller order is itself deterministic, and invariance is pinned per family" {
-    const max_atoms = 16;
-    const max_bonds = 16;
+    const max_atoms = 17;
+    const max_bonds = 17;
     for (families) |family| {
         // The reversal remap here does not carry residue references, so the
         // residue family keeps its own dedicated order test in

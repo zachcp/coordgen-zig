@@ -169,6 +169,33 @@ pub const FramePoseEvaluator = struct {
             try applyToFrame(dof.*, try affectedAtoms(self.affected_atoms, dof.*), self.pose);
         }
         try self.pose.rebuild();
+        // Fragment construction can propagate a scale-atoms DOF onto the
+        // parent-side atom of its attachment bond. Upstream stores that atom
+        // pointer outside the fragment's local-coordinate map, so the DOF
+        // mutates its already-built global coordinate. Apply those external
+        // entries after rebuilding; child-side attachments are present in
+        // the owner's frame and were handled above.
+        for (self.pose.rebuild_order) |fragment_id| {
+            for (self.dofs) |dof| {
+                if (dof.fragment != fragment_id or dof.state.current == 0) continue;
+                const payload = switch (dof.payload) {
+                    .scale_atoms => |payload| payload,
+                    else => continue,
+                };
+                const pivot = (try self.pose.coordinate(dof.fragment, payload.pivot)).*;
+                for (try affectedAtoms(self.affected_atoms, dof)) |atom| {
+                    _ = self.pose.coordinate(dof.fragment, atom) catch |err| switch (err) {
+                        error.InvalidMapping => {
+                            if (!atom.isValid() or atom.index() >= self.pose.global_coordinates.len) return error.InvalidAtomIndex;
+                            const coordinate = &self.pose.global_coordinates[atom.index()];
+                            coordinate.* = add(pivot, scale(subtract(coordinate.*, pivot), 0.4));
+                            continue;
+                        },
+                        else => return err,
+                    };
+                }
+            }
+        }
         return self.scorePoseFn(self.score_context, self.pose.global_coordinates, self.dofs);
     }
 };
@@ -520,6 +547,7 @@ fn lexicographicLess(left: []const u32, right: []const u32) bool {
 pub const BondScoreView = struct {
     start: core.ids.AtomId,
     end: core.ids.AtomId,
+    component: core.ids.MoleculeId = .invalid,
     crossing_penalty_multiplier: f32 = 1,
     terminal: bool = false,
     macrocycle: bool = false,
@@ -530,6 +558,7 @@ pub const BondScoreView = struct {
 pub const RingScoreView = struct {
     atoms: []const core.ids.AtomId,
     fragment: core.ids.FragmentId,
+    component: core.ids.MoleculeId = .invalid,
 };
 
 pub const ProximityScoreView = struct {
@@ -568,6 +597,7 @@ pub fn scoreCrossBonds(bonds: []const BondScoreView, coordinates: []const core.m
         for (bonds[first_index + 1 ..]) |second| {
             if (second.residue_interaction) continue;
             try validateScoreBond(second, coordinates.len);
+            if (first.component.isValid() and second.component.isValid() and first.component != second.component) continue;
             if (!bondsClash(first, second, coordinates)) continue;
             var penalty_value = standard_crossing_bond_penalty * first.crossing_penalty_multiplier * second.crossing_penalty_multiplier;
             if (first.terminal or second.terminal) penalty_value *= terminal_bond_crossing_multiplier;
@@ -582,6 +612,7 @@ pub fn scoreCrossBonds(bonds: []const BondScoreView, coordinates: []const core.m
 pub fn scoreAtomsInsideRings(
     rings: []const RingScoreView,
     atom_fragments: []const core.ids.FragmentId,
+    fragment_components: []const core.ids.MoleculeId,
     coordinates: []const core.math.Vec2,
 ) core.errors.Error!f32 {
     if (atom_fragments.len != coordinates.len) return error.InvalidMapping;
@@ -593,6 +624,10 @@ pub fn scoreAtomsInsideRings(
         center = scale(center, 1 / @as(f32, @floatFromInt(ring.atoms.len)));
         for (coordinates, atom_fragments) |coordinate_value, fragment| {
             if (fragment == ring.fragment) continue;
+            if (fragment_components.len != 0) {
+                if (!fragment.isValid() or fragment.index() >= fragment_components.len) return error.InvalidMapping;
+                if (ring.component.isValid() and fragment_components[fragment.index()] != ring.component) continue;
+            }
             const difference = subtract(center, coordinate_value);
             if (difference.x > core.math.bond_length or difference.y > core.math.bond_length or
                 difference.x < -core.math.bond_length or difference.y < -core.math.bond_length)
@@ -799,7 +834,13 @@ pub fn applyToFrame(dof: core.dof.Dof, affected: []const core.ids.AtomId, pose: 
         .scale_atoms => |payload| {
             const pivot = (try pose.coordinate(dof.fragment, payload.pivot)).*;
             for (affected) |atom| {
-                const coordinate_value = try pose.coordinate(dof.fragment, atom);
+                const coordinate_value = pose.coordinate(dof.fragment, atom) catch |err| switch (err) {
+                    // The parent-side attachment atom is not part of this
+                    // fragment's local-coordinate map. FramePoseEvaluator
+                    // applies that upstream pointer side effect after rebuild.
+                    error.InvalidMapping => continue,
+                    else => return err,
+                };
                 coordinate_value.* = add(pivot, scale(subtract(coordinate_value.*, pivot), 0.4));
             }
         },
@@ -1063,7 +1104,7 @@ test "discrete clash crossing and atoms-in-rings scores preserve pinned penaltie
     try std.testing.expectEqual(@as(f32, 150), try scoreAtomsInsideRings(&.{.{
         .atoms = &ring_atoms,
         .fragment = core.ids.FragmentId.fromIndex(0),
-    }}, &fragments, &ring_coordinates));
+    }}, &fragments, &.{}, &ring_coordinates));
 
     const proximity = [_]ProximityScoreView{
         .{
