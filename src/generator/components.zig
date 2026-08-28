@@ -731,9 +731,9 @@ pub fn arrangeProximityComponents(
     for (relations, 0..) |relation, index| {
         const first = graph.component(relation.start) orelse return error.InvalidMapping;
         const second = graph.component(relation.end) orelse return error.InvalidMapping;
-        if (first == second) continue;
         related[first.index()] = true;
         related[second.index()] = true;
+        if (first == second) continue;
         var duplicate = false;
         for (relations[0..index]) |previous| {
             const previous_first = graph.component(previous.start) orelse return error.InvalidMapping;
@@ -786,7 +786,8 @@ pub fn arrangeProximityComponents(
             queue.append(allocator, neighbor) catch return error.OutOfMemory;
         }
     }
-    for (related, placed) |is_related, is_placed| if (is_related and !is_placed) return false;
+    // Upstream leaves proximity molecules outside the central relation graph
+    // unplaced here; its following ordinary-component pass owns them.
     return true;
 }
 
@@ -855,6 +856,54 @@ pub fn arrangeProximityComponentsExcluding(
     if (!try arrangeProximityComponents(allocator, active_atoms, graph, rings, active_relations)) return false;
     for (active_atoms, new_to_old) |atom, old_index| atoms[old_index].coordinates = atom.coordinates;
     return true;
+}
+
+/// Arrange the proximity-connected subset first, then place ordinary
+/// components around it. Upstream builds its proximity meta-molecule from
+/// only molecules incident to proximity relations; unrelated components stay
+/// unplaced until the ordinary multiple-molecule pass.
+pub fn arrangeComponentsWithProximityExcluding(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    relations: []const ProximityRelation,
+    excluded_atoms: []const bool,
+) core.errors.Error!void {
+    if (relations.len == 0 or (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len)) return error.InvalidMapping;
+
+    const related_components = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(related_components);
+    @memset(related_components, false);
+    for (relations) |relation| {
+        if (relation.start.index() >= atoms.len or relation.end.index() >= atoms.len) return error.InvalidMapping;
+        if (excluded_atoms.len != 0 and (excluded_atoms[relation.start.index()] or excluded_atoms[relation.end.index()])) {
+            return error.InvalidMapping;
+        }
+        const start = graph.component(relation.start) orelse return error.InvalidMapping;
+        const end = graph.component(relation.end) orelse return error.InvalidMapping;
+        related_components[start.index()] = true;
+        related_components[end.index()] = true;
+    }
+
+    const proximity_excluded = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(proximity_excluded);
+    for (proximity_excluded, 0..) |*excluded, atom_index| {
+        const component = graph.component(core.ids.AtomId.fromIndex(@intCast(atom_index))) orelse return error.InvalidMapping;
+        excluded.* = (excluded_atoms.len != 0 and excluded_atoms[atom_index]) or !related_components[component.index()];
+    }
+    if (!try arrangeProximityComponentsExcluding(allocator, atoms, bonds, relations, proximity_excluded)) {
+        return error.InvalidMapping;
+    }
+
+    try arrangeComponentsExcludingWithPlaced(
+        allocator,
+        atoms,
+        graph,
+        excluded_atoms,
+        related_components,
+        .{},
+    );
 }
 
 /// General meta-graph placement. Upstream recursively lays out one carbon-like
@@ -935,13 +984,13 @@ fn generateMetaCoordinates(
 
     var meta_graph = try topology.Graph.init(allocator, meta_atoms, meta_bonds);
     defer meta_graph.deinit();
-    if (meta_graph.component_count != 1) return null;
     var meta_rings = try topology.RingMembership.init(allocator, meta_graph, meta_bonds);
     defer meta_rings.deinit();
     var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
     defer fragmentation.deinit();
     try layout.initializeCoordinates(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, fragmentation);
     _ = try orientComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, null);
+    try arrangeComponents(allocator, meta_atoms, meta_graph);
 
     const coordinates = allocator.alloc(Vec2, meta_atoms.len) catch return error.OutOfMemory;
     for (meta_atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
@@ -970,7 +1019,9 @@ fn rotateGeneralComponent(
         neighbors[neighbor_count] = other;
         neighbor_count += 1;
     }
-    if (neighbor_count == 0) return false;
+    // A molecule can carry only intra-component proximity relations. Upstream
+    // still marks it placed and otherwise leaves its pose unchanged.
+    if (neighbor_count == 0) return true;
     if (neighbor_count == 1) {
         const site = try proximitySiteToward(atoms, graph, rings, relations, component, neighbors[0]);
         if (site.count == 0) return false;
@@ -1239,7 +1290,19 @@ pub fn arrangeComponentsExcluding(
     graph: topology.Graph,
     excluded_atoms: []const bool,
 ) core.errors.Error!void {
+    return arrangeComponentsExcludingWithPlaced(allocator, atoms, graph, excluded_atoms, &.{}, null);
+}
+
+fn arrangeComponentsExcludingWithPlaced(
+    allocator: std.mem.Allocator,
+    atoms: []model.Atom,
+    graph: topology.Graph,
+    excluded_atoms: []const bool,
+    initially_placed: []const bool,
+    initial_center: ?Vec2,
+) core.errors.Error!void {
     if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
+    if (initially_placed.len != 0 and initially_placed.len != graph.component_count) return error.InvalidMapping;
     var excluded_components: []bool = &.{};
     defer if (excluded_components.len != 0) allocator.free(excluded_components);
     var active_count: usize = graph.component_count;
@@ -1255,30 +1318,39 @@ pub fn arrangeComponentsExcluding(
             active_count += @intFromBool(!excluded.*);
         }
     }
-    if (active_count < 2) return;
+    if (active_count == 0) return;
     const placed = allocator.alloc(bool, graph.component_count) catch return error.OutOfMemory;
     defer allocator.free(placed);
-    @memset(placed, false);
+    var placed_count: usize = 0;
+    for (placed, 0..) |*value, index| {
+        value.* = initially_placed.len != 0 and initially_placed[index] and
+            (excluded_components.len == 0 or !excluded_components[index]);
+        placed_count += @intFromBool(value.*);
+    }
+    if (placed_count == active_count) return;
     const charged_atom_used = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(charged_atom_used);
     @memset(charged_atom_used, false);
 
-    var central_index: u32 = if (excluded_components.len == 0)
-        0
-    else
-        @intCast(std.mem.indexOfScalar(bool, excluded_components, false).?);
-    var central_size = graph.componentMembers(core.ids.MoleculeId.fromIndex(central_index)).len;
-    for (0..graph.component_count) |raw_index| {
-        if (excluded_components.len != 0 and excluded_components[raw_index]) continue;
-        const index: u32 = @intCast(raw_index);
-        const size = graph.componentMembers(core.ids.MoleculeId.fromIndex(index)).len;
-        if (size > central_size) {
-            central_index = index;
-            central_size = size;
+    var center = initial_center orelse Vec2{};
+    if (placed_count == 0) {
+        var central_index: u32 = if (excluded_components.len == 0)
+            0
+        else
+            @intCast(std.mem.indexOfScalar(bool, excluded_components, false).?);
+        var central_size = graph.componentMembers(core.ids.MoleculeId.fromIndex(central_index)).len;
+        for (0..graph.component_count) |raw_index| {
+            if (excluded_components.len != 0 and excluded_components[raw_index]) continue;
+            const index: u32 = @intCast(raw_index);
+            const size = graph.componentMembers(core.ids.MoleculeId.fromIndex(index)).len;
+            if (size > central_size) {
+                central_index = index;
+                central_size = size;
+            }
         }
+        placed[central_index] = true;
+        center = componentCenter(atoms, graph.componentMembers(core.ids.MoleculeId.fromIndex(central_index)));
     }
-    placed[central_index] = true;
-    const center = componentCenter(atoms, graph.componentMembers(core.ids.MoleculeId.fromIndex(central_index)));
 
     for (0..graph.component_count) |raw_index| {
         const index: u32 = @intCast(raw_index);
@@ -1747,6 +1819,47 @@ test "proximity child aligns interaction site with parent free valence" {
     try std.testing.expectEqual(Vec2{ .x = 200 }, atoms[2].coordinates);
     try std.testing.expectEqual(Vec2{ .x = 250 }, atoms[3].coordinates);
     try std.testing.expect(placed[1]);
+}
+
+test "proximity arrangement leaves unrelated components for ordinary placement" {
+    var atoms = [_]model.Atom{
+        testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 50), testAtom(4, 0),
+    };
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(1),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = core.ids.AtomId.fromIndex(2),
+            .end = core.ids.AtomId.fromIndex(3),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    const relations = [_]ProximityRelation{.{
+        .start = core.ids.AtomId.fromIndex(1),
+        .end = core.ids.AtomId.fromIndex(2),
+    }};
+
+    try arrangeComponentsWithProximityExcluding(
+        std.testing.allocator,
+        &atoms,
+        &bonds,
+        graph,
+        &relations,
+        &.{},
+    );
+
+    try std.testing.expect(atoms[4].coordinates.x != 0 or atoms[4].coordinates.y != 0);
 }
 
 fn arrangeAndDiscard(allocator: std.mem.Allocator, atoms: []model.Atom, graph: topology.Graph) !void {

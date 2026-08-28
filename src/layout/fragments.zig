@@ -108,9 +108,27 @@ pub const Fragmentation = struct {
         }
         const fragment_atoms = allocator.alloc(core.ids.AtomId, offset) catch return error.OutOfMemory;
         errdefer allocator.free(fragment_atoms);
+        const emitted_atoms = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+        defer allocator.free(emitted_atoms);
+        @memset(emitted_atoms, false);
+        // Upstream appends atoms to a fragment as it encounters bond ends.
+        // This order determines the root and traversal direction used by
+        // layout and DOF construction, so canonical atom order is not
+        // interchangeable for fragments whose input bonds start at the
+        // opposite end.
+        for (graph.structuralBonds()) |bond_id| {
+            const bond = bonds[bond_id.index()];
+            for ([_]core.ids.AtomId{ bond.start, bond.end }) |atom_id| {
+                const fragment = atom_fragment[atom_id.index()];
+                if (!fragment.isValid() or emitted_atoms[atom_id.index()]) continue;
+                fragment_atoms[counts[fragment.index()]] = atom_id;
+                counts[fragment.index()] += 1;
+                emitted_atoms[atom_id.index()] = true;
+            }
+        }
         for (atoms) |atom| {
             const fragment = atom_fragment[atom.id.index()];
-            if (!fragment.isValid()) continue;
+            if (!fragment.isValid() or emitted_atoms[atom.id.index()]) continue;
             fragment_atoms[counts[fragment.index()]] = atom.id;
             counts[fragment.index()] += 1;
         }
@@ -437,6 +455,31 @@ test "ordinary rings remain one rigid fragment" {
     try std.testing.expectEqual(@as(usize, 1), result.fragments.len);
     try std.testing.expectEqual(@as(u32, 1), result.fragments[0].ring_count);
     try std.testing.expect(!result.fragments[0].flags.chain);
+}
+
+test "rigid fragment members retain structural-bond first appearance order" {
+    const atoms = [_]model.Atom{ testAtom(0), testAtom(1), testAtom(2) };
+    var bonds = [_]model.Bond{
+        testBond(0, 2, 1),
+        testBond(1, 1, 0),
+    };
+    for (&bonds) |*bond| {
+        bond.input_order = .double;
+        bond.effective_order = .double;
+    }
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var result = try Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.fragments.len);
+    try std.testing.expectEqualSlices(core.ids.AtomId, &.{
+        core.ids.AtomId.fromIndex(2),
+        core.ids.AtomId.fromIndex(1),
+        core.ids.AtomId.fromIndex(0),
+    }, result.members(core.ids.FragmentId.fromIndex(0)));
 }
 
 test "prepared path fragments retain pinned canonical atom and creation order" {

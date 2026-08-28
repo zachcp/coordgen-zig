@@ -4,6 +4,7 @@ const geometry = @import("geometry");
 const model = @import("model");
 const topology = @import("topology");
 const fragments = @import("fragments.zig");
+const neighbour_order = @import("neighbour_order.zig");
 
 pub const max_macrocycles: usize = 40;
 pub const path_failed: i32 = -1000;
@@ -333,7 +334,10 @@ pub const Polyomino = struct {
     }
 
     pub fn buildWithVertices(self: *Polyomino, total_vertices: usize) core.errors.Error!void {
-        if (total_vertices < 10) return error.InvalidOption;
+        // Two adjacent hexagons start with ten contour vertices; replacing
+        // one shared-corner vertex with a pentagon yields the valid nine-atom
+        // macrocycle shape used at upstream's minimum macrocycle size.
+        if (total_vertices < 9) return error.InvalidOption;
         self.clear();
         try self.addHex(.{ .x = 0, .y = 0 });
         try self.addHex(.{ .x = 1, .y = 0 });
@@ -871,6 +875,7 @@ pub fn collectDofs(
 /// macrocycle DOFs in upstream fragment-local order.
 pub fn collectAllDofs(
     allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
@@ -915,7 +920,7 @@ pub fn collectAllDofs(
                 .payload = entry.payload,
             }) catch return error.OutOfMemory;
         }
-        try appendSpecializedDofs(allocator, &items, &affected, fragment, bonds, graph, membership, fragmentation);
+        try appendSpecializedDofs(allocator, &items, &affected, fragment, atoms, bonds, graph, membership, fragmentation);
     }
     const owned_items = items.toOwnedSlice(allocator) catch return error.OutOfMemory;
     errdefer allocator.free(owned_items);
@@ -934,6 +939,7 @@ fn appendSpecializedDofs(
     output: *std.ArrayList(core.dof.Dof),
     output_affected: *std.ArrayList(core.ids.AtomId),
     fragment: fragments.Fragment,
+    atoms: []const model.Atom,
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
@@ -955,6 +961,8 @@ fn appendSpecializedDofs(
     @memset(visited, false);
     const queue = allocator.alloc(core.ids.AtomId, fragment.atom_count) catch return error.OutOfMemory;
     defer allocator.free(queue);
+    const ordered_neighbors = allocator.alloc(core.ids.AtomId, fragmentation.atom_fragment.len) catch return error.OutOfMemory;
+    defer allocator.free(ordered_neighbors);
     var head: usize = 0;
     var tail: usize = 0;
     const members = fragmentation.members(fragment.id);
@@ -978,11 +986,32 @@ fn appendSpecializedDofs(
 
     while (head < tail) : (head += 1) {
         const atom = queue[head];
-        for (graph.neighbors(atom)) |neighbor| {
-            if (fragmentation.atom_fragment[neighbor.index()] != fragment.id or visited[neighbor.index()]) continue;
-            visited[neighbor.index()] = true;
-            queue[tail] = neighbor;
-            tail += 1;
+        const neighbors = graph.neighbors(atom);
+        if (membership.atomRings(atom).len == 0) {
+            try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, atom, ordered_neighbors[0..neighbors.len]);
+            var start: usize = 0;
+            for (ordered_neighbors[0..neighbors.len], 0..) |neighbor, index| {
+                if (visited[neighbor.index()]) {
+                    start = index;
+                    break;
+                }
+            }
+            std.mem.rotate(core.ids.AtomId, ordered_neighbors[0..neighbors.len], start);
+        } else {
+            @memcpy(ordered_neighbors[0..neighbors.len], neighbors);
+        }
+        for (ordered_neighbors[0..neighbors.len]) |neighbor| {
+            if (visited[neighbor.index()]) continue;
+            if (fragmentation.atom_fragment[neighbor.index()] == fragment.id) {
+                visited[neighbor.index()] = true;
+                queue[tail] = neighbor;
+                tail += 1;
+            }
+            // Upstream adds every newly placed neighbour to the current
+            // atom's existing DOFs before deciding whether that neighbour is
+            // part of this fragment's traversal. A child-fragment attachment
+            // therefore belongs to the affected set even though it is not
+            // queued here.
             for (0..pending.items.len) |pending_index| {
                 if (!atom_dofs[pending_index * fragmentation.atom_fragment.len + atom.index()]) continue;
                 pending.items[pending_index].affected.append(allocator, neighbor) catch return error.OutOfMemory;
@@ -1316,6 +1345,15 @@ test "round polyomino path is deterministic and allocation failures clean up" {
     try std.testing.expectEqual(@as(usize, 17), contour.len);
 }
 
+test "round polyomino supports the nine-atom macrocycle boundary" {
+    var polyomino = Polyomino.init(std.testing.allocator);
+    defer polyomino.deinit();
+    try polyomino.buildWithVertices(9);
+    const contour = try polyomino.path(std.testing.allocator);
+    defer std.testing.allocator.free(contour);
+    try std.testing.expectEqual(@as(usize, 9), contour.len);
+}
+
 fn buildAndTraverse(allocator: std.mem.Allocator) !void {
     var polyomino = Polyomino.init(allocator);
     defer polyomino.deinit();
@@ -1477,7 +1515,7 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
             collectDofsAndDiscard,
             .{ &bonds, graph, membership, fragmentation },
         );
-        var all_dofs = try collectAllDofs(allocator, &bonds, graph, membership, fragmentation);
+        var all_dofs = try collectAllDofs(allocator, &atoms, &bonds, graph, membership, fragmentation);
         defer all_dofs.deinit();
         try std.testing.expect(all_dofs.items.len > fragmentation.fragments.len * 3 + 1);
         var found_scale = false;
@@ -1499,7 +1537,7 @@ fn collectAndGenerateFixture(allocator: std.mem.Allocator, test_dofs: bool) !voi
         try core.oom.checkAllocationFailures(
             std.testing.allocator,
             collectAllDofsAndDiscard,
-            .{ &bonds, graph, membership, fragmentation },
+            .{ &atoms, &bonds, graph, membership, fragmentation },
         );
     }
     var data = try collectPathData(allocator, core.ids.RingId.fromIndex(0), &atoms, &bonds, graph, membership);
@@ -1550,12 +1588,13 @@ fn collectDofsAndDiscard(
 
 fn collectAllDofsAndDiscard(
     allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) !void {
-    var dofs = try collectAllDofs(allocator, bonds, graph, membership, fragmentation);
+    var dofs = try collectAllDofs(allocator, atoms, bonds, graph, membership, fragmentation);
     defer dofs.deinit();
 }
 
@@ -1582,6 +1621,7 @@ test "five-atom path DOFs match the stable upstream probe" {
     defer fragmentation.deinit();
     var dofs = try collectAllDofs(
         std.testing.allocator,
+        prepared.working.atoms,
         prepared.working.bonds,
         prepared.graph,
         prepared.rings,

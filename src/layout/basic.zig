@@ -4,6 +4,7 @@ const model = @import("model");
 const topology = @import("topology");
 const fragments = @import("fragments.zig");
 const macrocycle = @import("macrocycle.zig");
+const neighbour_order = @import("neighbour_order.zig");
 const templates = @import("templates.zig");
 
 pub const bond_length: f32 = 50;
@@ -66,7 +67,7 @@ pub fn initializeCoordinates(
     membership: topology.RingMembership,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
-    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, membership, fragmentation);
+    var dofs = try macrocycle.collectAllDofs(allocator, atoms, bonds, graph, membership, fragmentation);
     defer dofs.deinit();
     _ = try initializeCoordinatesInternal(allocator, atoms, bonds, graph, membership, fragmentation, dofs, .{});
 }
@@ -733,6 +734,7 @@ fn openCycleAndGenerateCoordinates(
     // here would describe a different graph.
     var temporary_dofs = try macrocycle.collectAllDofs(
         allocator,
+        temporary_atoms,
         temporary_bonds,
         temporary_graph,
         temporary_rings,
@@ -1393,7 +1395,7 @@ fn placeAcyclicNeighbours(
     if (neighbours.len == 0 or neighbours.len > max_neighbours) return false;
 
     var ordered: [max_neighbours]core.ids.AtomId = undefined;
-    try orderNeighbours(allocator, atoms, bonds, graph, membership, center, ordered[0..neighbours.len]);
+    try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, center, ordered[0..neighbours.len]);
 
     // Upstream's visited set is fragment-local: it starts as this fragment's
     // ring atoms, or its single start atom, and only ever gains atoms of this
@@ -1430,125 +1432,6 @@ fn placeAcyclicNeighbours(
     // Handled, whether or not anything moved: the caller must not also run the
     // fixed spread over the same centre.
     return true;
-}
-
-/// Upstream takes the neighbours in input order everywhere except at degree
-/// four, where `sketcherMinimizerAtom::orderAtomPriorities` ranks them.
-fn orderNeighbours(
-    allocator: std.mem.Allocator,
-    atoms: []const model.Atom,
-    bonds: []const model.Bond,
-    graph: topology.Graph,
-    membership: topology.RingMembership,
-    center: core.ids.AtomId,
-    out: []core.ids.AtomId,
-) core.errors.Error!void {
-    const neighbours = graph.neighbors(center);
-    @memcpy(out, neighbours);
-    if (neighbours.len != 4) return;
-
-    var weights: [4]f32 = undefined;
-    for (neighbours, 0..) |neighbor, index| {
-        weights[index] = try neighbourPriorityWeight(allocator, atoms, bonds, graph, membership, center, neighbor);
-    }
-
-    // Upstream lifts the lowest weight out, then the lowest of what remains,
-    // and rebuilds the list with those two at the ends: long chains keep
-    // positions 2 and 3, side substituents take 1 and 4. Phosphorus and sulfur
-    // at degree four are the exception and take both lifted atoms up front.
-    var rest: [4]core.ids.AtomId = undefined;
-    var rest_weights: [4]f32 = undefined;
-    var rest_count: usize = 0;
-    for (neighbours, 0..) |neighbor, index| {
-        rest[rest_count] = neighbor;
-        rest_weights[rest_count] = weights[index];
-        rest_count += 1;
-    }
-    const first = takeLowestWeight(rest[0..rest_count], rest_weights[0..rest_count]);
-    rest_count -= 1;
-    const second = takeLowestWeight(rest[0..rest_count], rest_weights[0..rest_count]);
-    rest_count -= 1;
-
-    const center_element = atoms[center.index()].atomic_number;
-    if (center_element != .sulfur and center_element != .phosphorus) {
-        out[0] = first;
-        out[1] = rest[0];
-        out[2] = rest[1];
-        out[3] = second;
-    } else {
-        out[0] = first;
-        out[1] = rest[0];
-        out[2] = second;
-        out[3] = rest[1];
-    }
-}
-
-/// Remove and return the first atom holding the lowest weight, keeping the
-/// order of the rest, which is upstream's `erase` on both parallel vectors.
-fn takeLowestWeight(atoms: []core.ids.AtomId, weights: []f32) core.ids.AtomId {
-    var lowest: usize = 0;
-    for (weights, 0..) |weight, index| {
-        if (weight < weights[lowest]) lowest = index;
-    }
-    const taken = atoms[lowest];
-    var index = lowest;
-    while (index + 1 < atoms.len) : (index += 1) {
-        atoms[index] = atoms[index + 1];
-        weights[index] = weights[index + 1];
-    }
-    return taken;
-}
-
-/// The weight `sketcherMinimizerAtom::orderAtomPriorities` scores a neighbour
-/// by: the size of the branch behind it, adjusted by bond order, ring
-/// membership, element, and neighbouring stereochemistry.
-///
-/// One term of upstream's is absent: the -2000 for a neighbour that is
-/// `isSharedAndInner` while the centre is not. That flag is set only on the
-/// fusion atoms of a ring system whose every neighbour lies in both fused
-/// rings (CoordgenFragmentBuilder.cpp:975-995), and this port does not model
-/// it at all - inventing a value for it here would be a guess, not a
-/// transcription (cgz-7v2.31).
-fn neighbourPriorityWeight(
-    allocator: std.mem.Allocator,
-    atoms: []const model.Atom,
-    bonds: []const model.Bond,
-    graph: topology.Graph,
-    membership: topology.RingMembership,
-    center: core.ids.AtomId,
-    neighbor: core.ids.AtomId,
-) core.errors.Error!f32 {
-    const branch = try graph.reachableExcluding(allocator, neighbor, center);
-    defer allocator.free(branch);
-    var weight: f32 = @floatFromInt(branch.len);
-
-    const bond_id = bondBetween(graph, center, neighbor);
-    if (bond_id) |id| {
-        const order = bonds[id.index()].effective_order;
-        // So that =O gets lower priority than -OH in a phosphate.
-        if (order == .double) weight -= 0.25;
-        // Forcing the wedge away from the double bond in a sulphoxide.
-        if (atoms[center.index()].atomic_number == .sulfur and order == .double) weight += 2000;
-        // Upstream's test is sameRing on the bond's two atoms, not on the
-        // bond, so a bridging bond between two atoms of one ring counts.
-        if (sharesRing(membership, center, neighbor)) weight += 500;
-    }
-    if (atoms[neighbor.index()].atomic_number == .carbon) weight += 0.5;
-    if (atoms[neighbor.index()].atomic_number == .hydrogen) weight -= 0.5;
-    if (atoms[neighbor.index()].stereo != .unspecified) weight += 10000;
-    if (atoms[center.index()].cross_layout and graph.degree(neighbor) > 1) weight += 200;
-    for (graph.incidentBonds(neighbor)) |incident| if (bonds[incident.index()].effective_order == .double) {
-        weight += 100;
-        break;
-    };
-    return weight;
-}
-
-fn bondBetween(graph: topology.Graph, atom: core.ids.AtomId, other: core.ids.AtomId) ?core.ids.BondId {
-    for (graph.neighbors(atom), graph.incidentBonds(atom)) |neighbor, bond| {
-        if (neighbor == other) return bond;
-    }
-    return null;
 }
 
 /// `CoordgenFragmentBuilder::neighborsAnglesAtCenter`. `m_evenAngles` is
@@ -2051,7 +1934,7 @@ test "macrocycles dispatch through native polyomino placement" {
     try std.testing.expect(hex_edges > 0);
 
     const opened = macrocycle.findBondToOpen(core.ids.RingId.fromIndex(0), &bonds, graph, rings) orelse return error.InvalidMapping;
-    var opened_dofs = try macrocycle.collectAllDofs(std.testing.allocator, &bonds, graph, rings, split);
+    var opened_dofs = try macrocycle.collectAllDofs(std.testing.allocator, &atoms, &bonds, graph, rings, split);
     defer opened_dofs.deinit();
     _ = try initializeCoordinatesWithOptions(std.testing.allocator, &atoms, &bonds, graph, rings, split, opened_dofs, .{ .force_open_macrocycles = true });
     for (bonds) |bond| {
@@ -2107,7 +1990,7 @@ fn layoutWithOptionsAndDiscard(
 ) !void {
     const atoms = try allocator.dupe(model.Atom, source_atoms);
     defer allocator.free(atoms);
-    var dofs = try macrocycle.collectAllDofs(allocator, bonds, graph, rings, split);
+    var dofs = try macrocycle.collectAllDofs(allocator, atoms, bonds, graph, rings, split);
     defer dofs.deinit();
     _ = try initializeCoordinatesWithOptions(allocator, atoms, bonds, graph, rings, split, dofs, .{ .force_open_macrocycles = force_open_macrocycles });
 }
