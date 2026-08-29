@@ -232,7 +232,9 @@ oracle's would flatter native by exactly the amount that matters. Coverage is
 gated separately, by `min_compared_members`, so losing domain is a failure even
 though it leaves no ratio to exceed.
 
-**What the first baseline actually showed**, aarch64-macos, ReleaseFast:
+**What the first baseline showed**, aarch64-macos, ReleaseFast. Native could
+lay out nothing above thirty atoms, so the gate covered 36 of the benchmark's
+100 members and three buckets had no ratio to measure:
 
 | bucket | median ratio | p95 ratio | members compared |
 |---|---|---|---|
@@ -242,15 +244,33 @@ though it leaves no ratio to exceed.
 | large | — | — | **0 of 20** |
 | huge | — | — | **0 of 20** |
 
-Two facts in that table matter more than the thresholds:
+**What it shows now**, same host and build, at `dd4bb2f`, over twelve runs
+(`cgz-7v2.4.9`). Every bucket is measurable and the gate covers 100 of 100:
 
-- **Native cannot lay out any member of the three largest buckets.** The
-  performance gate covers 36 of the benchmark's 100 members. That is a
-  statement about the port's domain coverage, not about its speed, and it is
-  ratcheted so it cannot quietly get smaller.
-- **Native is at parity on the tiny median and an order of magnitude slower at
-  the tiny p95**, reproducibly. That is `cgz-twy`. A median-only comparison
-  would have hidden it, which is why this document requires p95 per bucket.
+| bucket | median ratio | p95 ratio | members compared |
+|---|---|---|---|
+| tiny | 0.793–1.034 | 2.524–3.505 | 20 of 20 |
+| small | 1.683–1.798 | 3.561–3.739 | 20 of 20 |
+| medium | 3.805–4.889 | 3.528–3.660 | 20 of 20 |
+| large | 5.059–5.179 | 3.980–4.415 | 20 of 20 |
+| huge | 5.310–5.688 | 4.069–4.896 | 20 of 20 |
+
+Three facts in the second table matter more than the thresholds:
+
+- **Domain coverage is complete.** Every member of every bucket now lays out,
+  where three buckets were entirely unsupported. `min_compared_members` is
+  ratcheted to 20 everywhere so it cannot quietly get smaller.
+- **The tiny tail moved.** `cgz-twy` was filed on a tiny p95 of 10.2–13.9
+  against a median at parity; it now measures 2.5–3.5. The bead stays open —
+  tiny is the noisiest bucket, its comparison set changed from 19 members to
+  20, and no cause has been identified. A median-only comparison would have
+  hidden the original finding, which is why this document requires p95 per
+  bucket.
+- **The median now degrades with size** — 4x on medium, 5.1x on large, 5.5x on
+  huge — while the p95 ratio stays flat near 3.5–4.4 across every bucket. A
+  constant overhead would hold the ratio steady; one that grows with input
+  size while the tail does not points at a term that scales worse in native
+  than in the oracle. That is `cgz-7v2.4.12`.
 
 ## OOM and leak gates
 
