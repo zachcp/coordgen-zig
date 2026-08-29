@@ -81,6 +81,14 @@ jobs:
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true native-baseline-check
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true template-regeneration-check
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-baseline
+          # performance-baseline MEASURES; performance-check ENFORCES. Running
+          # only the first is how the committed thresholds went stale without
+          # anyone noticing: PRs #27-#30 merged green while the gate was red on
+          # main, because CI printed the ratios and nothing compared them
+          # (cgz-7v2.4.10). Both legs of the matrix run it - the thresholds in
+          # conformance/performance_thresholds.tsv are set from samples taken on
+          # both, not from one host (cgz-7v2.4.14).
+          ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-check
           ${{ steps.zig.outputs.zig }} build sanitizer-check -Denable-oracle=true -Dsanitize-oracle=true -Doptimize=safe
 
       # The architecture axis of the stability classification runs the other

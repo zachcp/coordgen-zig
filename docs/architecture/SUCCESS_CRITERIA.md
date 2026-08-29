@@ -315,7 +315,19 @@ iterations of a *trivial* target in 15.1 s on aarch64-macos. Coordinate
 generation is orders of magnitude heavier per iteration, so per-target limits
 cannot be extrapolated from it and must be measured when the harness exists.
 
-## Performance gate — baseline infrastructure, threshold deliberately unset
+## Performance gate — the frozen decision, and how it was discharged
+
+> **Superseded in part.** This section records the decision as it was frozen,
+> when no native implementation existed to time. The trigger it names has since
+> fired: thresholds for all five buckets are set and enforced, and the live
+> numbers are in the section above and in
+> [`conformance/performance_thresholds.tsv`](../../conformance/performance_thresholds.tsv).
+> The **method**, the **trigger**, and the **rationale for holding** are kept
+> verbatim below because they are what the thresholds were later derived
+> against — and because the failure mode the rationale names, a threshold "so
+> tight it gets relaxed on first contact", is exactly what `cgz-7v2.4.9` walked
+> into and had to reverse. Read the present-tense claims about there being no
+> native timings, and about `performance-check` being an `addFail`, as history.
 
 `zig build performance-baseline -Denable-oracle=true` now records absolute
 oracle median and p95 generation time for 20 versioned members in each atom-count
