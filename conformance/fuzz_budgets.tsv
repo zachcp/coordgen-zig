@@ -2,7 +2,7 @@
 # docs/architecture/FUZZING.md).
 #
 # Columns are tab separated:
-#   target  smoke_iterations  extended_iterations
+#   target  smoke_iterations  extended_iterations  min_covered_points
 #
 # target              Substring matching exactly one `test "fuzz: ..."` in
 #                     tests/fuzz_targets.zig. tools/run-fuzz fails when a
@@ -12,6 +12,10 @@
 # smoke_iterations    The per-PR budget. Iterations, not wall clock, so it is
 #                     reproducible across runners of differing speed.
 # extended_iterations The scheduled-job budget.
+# min_covered_points  Absolute instrumented points the smoke run must reach.
+#                     The denominator changes as code grows, so an absolute
+#                     numerator is the stable ratchet. A target that becomes
+#                     validator-only loses covered points and fails.
 #
 # ## Why these numbers
 #
@@ -24,10 +28,23 @@
 # x86_64-linux for these multi-module targets, while ReleaseSafe preserves
 # runtime safety checks and produces a valid coverage report on both targets.
 #
-# Raising a budget needs no justification. LOWERING one is a visible diff, which
-# is the point of recording them here rather than in a workflow file.
+# Fresh-cache x86_64-linux measurements on the pinned toolchain, 2026-08-30:
+# generation reached 4700 points after its promoted cgz-7v2.34 regression was
+# fixed; the other completed smoke runs reached hostile 1336, native domains
+# 4286, C atom/bond 1804, C extended 2667, and C ownership 1302. Floors retain
+# at least 10% headroom (more on the lower-coverage targets) while still failing
+# if a target collapses to its shallow validator path. Raising a floor follows
+# observed growth; lowering one requires a new fresh-cache measurement and
+# review.
 #
-# target	smoke_iterations	extended_iterations
-generation invariants	2000	50000
-hostile input	2000	50000
-c abi contract	1500	40000
+# Raising a budget or coverage floor needs no justification. LOWERING either
+# needs measured evidence and review, which is the point of recording them here
+# rather than in a workflow file.
+#
+# target	smoke_iterations	extended_iterations	min_covered_points
+generation invariants	2000	50000	3500
+hostile input	2000	50000	1100
+residue template options and macrocycle domains	500	10000	3800
+c abi contract	1500	40000	1500
+c abi extended input contract	1000	20000	2300
+c abi ownership sequences	500	10000	1100

@@ -15,7 +15,10 @@ Targets, and where each lives:
 |---|---|---|
 | Native | `generation invariants` | `tests/fuzz_targets.zig` |
 | Native | `hostile input` | `tests/fuzz_targets.zig` |
+| Native | `residue template options and macrocycle domains` | `tests/fuzz_targets.zig` |
 | C ABI | `c abi contract for atom and bond inputs` | `src/c_abi/exports.zig` |
+| C ABI | `c abi extended input contract` | `src/c_abi/exports.zig` |
+| C ABI | `c abi ownership sequences` | `src/c_abi/exports.zig` |
 
 The C ABI target sits beside the `export fn` declarations because they are not
 `pub`, so no other file can call them without re-declaring the symbols. That
@@ -153,6 +156,19 @@ rather than committing one that tests nothing.
 `tools/check-fuzz-seed-promotion` reports which source is winning on a given
 toolchain.
 
+### Resolution, 2026-08-30 (cgz-1js)
+
+The paragraph above records the state when the harness first landed. The root
+cause is now identified and the automatic path is complete. The pinned
+toolchain's `saveCrash()` streams through a 512-byte writer and closes without
+flushing, so `crash` contains only whole buffer fills: a measured 652-byte input
+became 512 bytes, and every input below 512 becomes zero bytes. The per-instance
+`.zig-cache/f/in*` mmap files carry an explicit length and the complete payload.
+`tools/run-fuzz` reads those first, then proves the extracted bytes reproduce
+under the ordinary seed-replay gate before retaining them. PR #33 demonstrated
+the path end to end with a 520-byte planted failure whose truncated `crash`
+could not reproduce.
+
 **A DISCOVERED crash exits 0, and that is narrower and worse than it sounds.**
 Measured for both failure shapes — a returned error and a `@panic` reporting
 `signal ABRT`, the exact case the line above described. In each, the crash is
@@ -212,31 +228,30 @@ respect them.
    retaining runtime safety checks. `tools/run-fuzz` selects it explicitly so
    host defaults cannot reintroduce the broken mode.
 
-## Known gaps
+## Completion status, 2026-08-30
 
-`cgz-7v2.4.4` stays open for these. Each is a thing the harness does not do,
-stated here so that "the fuzz step is green" is not read as more than it is.
+The four gaps previously recorded here are now executable checks rather than
+planning claims:
 
-1. **Automatic seed promotion does not complete on this toolchain.** The
-   reproducing input for a failing target is not reliably persisted anywhere
-   the driver can find it (`cgz-1js`). `tools/run-fuzz` detects the failure and
-   prints it, tries every candidate, and refuses to commit one that does not
-   reproduce - so nothing degrades silently, but a finding must currently be
-   captured by hand from the stack trace.
+1. Automatic promotion reads complete mmap inputs and requires ordinary-test
+   reproduction before retaining a seed. A fresh generation smoke run used
+   that path to promote a 521-byte real finding as `cgz-7v2.34`. The seed
+   exposed a neighbor-workspace bound that assumed incidence degree could not
+   exceed atom count; the fix sizes it for parallel-bond incidence, and the
+   promoted seed now passes in the ordinary test gate.
+2. `conformance/fuzz_budgets.tsv` records an absolute covered-point floor per
+   target. `tools/run-fuzz` rejects a clean iteration budget whose final report
+   falls below that floor; the denominator may grow without weakening the
+   ratchet. Floors come from fresh-cache runs on the pinned toolchain.
+3. The native domain target reaches residue/ligand placement, protein-only
+   chains, 13-member macrocycles, every option, and the explicit unsupported
+   runtime-template-directory contract. The extended C target reaches residues,
+   interactions and nested spans, extra bonds, options, template views, and
+   malformed null/length combinations.
+4. The C ownership target retains four simultaneous result slots and fuzzes
+   interleaved generation, free, and repeated-safe-free operations while
+   checking that operations on one slot do not invalidate another.
 
-2. **Coverage is not a gate.** The budgets are iteration counts. Nothing
-   asserts that a run reached any particular part of the tree, so a target
-   that stops exercising a module would still pass its budget. The
-   allocation-site ratchet in `conformance/allocation_sites.tsv` does that job
-   for the ordinary test suite; the fuzz targets have no equivalent.
-
-3. **Three targets is not "all major input boundaries and algorithm domains",**
-   which is what `cgz-7v2.4.4` asks for. The C ABI target covers atom and bond
-   DTOs only; it does not construct residues, interactions, extra bonds,
-   options, or malformed nested pointer/span combinations. There is also no
-   native target for the residue and protein paths or template loading.
-
-4. **The C ABI target does not fuzz ownership SEQUENCES.** It exercises one
-   generate/free cycle per iteration. Interleaved generate/free orderings
-   across several results, which is where a lifetime defect would live, are not
-   reached.
+`cgz-7v2.4.18` owns the remaining integration step: run the measured smoke
+budgets in CI on both supported platforms. Until that lands, the harness is
+complete locally but is not yet an automated per-PR gate.

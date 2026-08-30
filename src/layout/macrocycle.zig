@@ -961,7 +961,10 @@ fn appendSpecializedDofs(
     @memset(visited, false);
     const queue = allocator.alloc(core.ids.AtomId, fragment.atom_count) catch return error.OutOfMemory;
     defer allocator.free(queue);
-    const ordered_neighbors = allocator.alloc(core.ids.AtomId, fragmentation.atom_fragment.len) catch return error.OutOfMemory;
+    // Parallel bonds can make a graph's incidence degree exceed its atom
+    // count, so size this workspace from the incidence storage rather than
+    // the number of atoms (cgz-7v2.34).
+    const ordered_neighbors = allocator.alloc(core.ids.AtomId, graph.adjacent_atoms.len) catch return error.OutOfMemory;
     defer allocator.free(ordered_neighbors);
     var head: usize = 0;
     var tail: usize = 0;

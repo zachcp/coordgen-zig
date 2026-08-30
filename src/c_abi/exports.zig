@@ -993,8 +993,196 @@ fn cAbiContract(_: void, smith: *std.testing.Smith) anyerror!void {
     coordgen_result_free(&result);
 }
 
+const c_abi_domain_max_indices = 4;
+
+const CAbiDomainInput = struct {
+    atoms: [4]AtomInput = undefined,
+    bonds: [2]BondInput = undefined,
+    residues: [1]ResidueInput = undefined,
+    interactions: [1]ResidueInteractionInput = undefined,
+    other_start_atoms: [c_abi_domain_max_indices]u32 = undefined,
+    other_end_atoms: [c_abi_domain_max_indices]u32 = undefined,
+    extra_bonds: [1]BondInput = undefined,
+    input: Input = .{},
+    expect_generation: bool = false,
+    other_start_present: bool = true,
+    other_end_present: bool = true,
+
+    fn view(self: *CAbiDomainInput) Input {
+        self.interactions[0].other_start_atoms.ptr =
+            if (self.other_start_present) &self.other_start_atoms else null;
+        self.interactions[0].other_end_atoms.ptr =
+            if (self.other_end_present) &self.other_end_atoms else null;
+        var input = self.input;
+        if (input.atoms.ptr != null) input.atoms.ptr = &self.atoms;
+        if (input.bonds.ptr != null) input.bonds.ptr = &self.bonds;
+        if (input.residues.ptr != null) input.residues.ptr = &self.residues;
+        if (input.residue_interactions.ptr != null) input.residue_interactions.ptr = &self.interactions;
+        if (input.extra_bonds.ptr != null) input.extra_bonds.ptr = &self.extra_bonds;
+        return input;
+    }
+};
+
+/// The original C target deliberately preserves its atom/bond Smith decode
+/// order so promoted seeds stay meaningful. This separate target reaches the
+/// rest of the public DTO: residues, nested index spans, extra bonds, options,
+/// template-directory views, and malformed null/length combinations.
+fn buildCAbiDomainInput(smith: *std.testing.Smith) CAbiDomainInput {
+    var built: CAbiDomainInput = .{};
+    for (&built.atoms) |*atom| atom.* = .{};
+    built.bonds = .{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+    };
+    built.residues[0] = .{
+        .atom = 3,
+        .residue_number = smith.valueRangeAtMost(i8, -4, 4),
+        .closest_ligand_atom = 1,
+        .chain = .{ .ptr = "A", .len = 1 },
+    };
+    built.other_start_atoms[0] = 0;
+    built.other_end_atoms[0] = 2;
+    built.interactions[0] = .{
+        .start = 3,
+        .end = 1,
+        .other_start_atoms = .{ .ptr = &built.other_start_atoms, .len = 1 },
+        .other_end_atoms = .{ .ptr = &built.other_end_atoms, .len = 1 },
+        .crossing_penalty_multiplier = smith.valueRangeAtMost(u8, 0, 4),
+    };
+    built.extra_bonds[0] = .{ .start = 0, .end = 2 };
+
+    built.expect_generation = smith.boolWeighted(3, 1);
+    built.input = .{
+        .atoms = .{ .ptr = &built.atoms, .len = built.atoms.len },
+        .bonds = .{ .ptr = &built.bonds, .len = built.bonds.len },
+        .residues = .{ .ptr = &built.residues, .len = built.residues.len },
+        .residue_interactions = .{ .ptr = &built.interactions, .len = built.interactions.len },
+        .extra_bonds = if (smith.boolWeighted(7, 1))
+            .{ .ptr = &built.extra_bonds, .len = built.extra_bonds.len }
+        else
+            .{},
+        .options = .{
+            .precision = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+                0 => api.Precision.quick,
+                1 => api.Precision.standard,
+                else => api.Precision.best,
+            },
+            .score_residue_interactions = @intFromBool(smith.boolWeighted(1, 1)),
+            .treat_nonterminal_bonds_to_metal_as_zero_order = @intFromBool(smith.boolWeighted(1, 1)),
+            .even_angles = @intFromBool(smith.boolWeighted(15, 1)),
+            .skip_minimization = @intFromBool(smith.boolWeighted(1, 1)),
+            .force_open_macrocycles = @intFromBool(smith.boolWeighted(1, 1)),
+            .constrain_all_atoms = @intFromBool(smith.boolWeighted(15, 1)),
+            .debug_coordinates = @intFromBool(smith.boolWeighted(15, 1)),
+            .load_templates = @intFromBool(smith.boolWeighted(1, 1)),
+            .template_directory = if (smith.boolWeighted(31, 1))
+                .{ .ptr = "fixtures", .len = 8 }
+            else
+                .{},
+        },
+    };
+
+    if (!built.expect_generation) {
+        switch (smith.valueRangeAtMost(u8, 0, 5)) {
+            0 => built.input.options.score_residue_interactions = smith.valueRangeAtMost(u8, 2, 5),
+            1 => built.input.options.precision = -1,
+            2 => built.input.residues = .{ .ptr = null, .len = 1 },
+            3 => {
+                built.other_start_present = false;
+                built.interactions[0].other_start_atoms.len = 1;
+            },
+            4 => built.residues[0].chain = .{ .ptr = null, .len = 1 },
+            else => built.interactions[0].end = smith.value(u8),
+        }
+    }
+    return built;
+}
+
+fn expectZeroedResult(result: Result) !void {
+    try std.testing.expect(result.owner == null);
+    try std.testing.expect(result.coordinates.ptr == null);
+    try std.testing.expect(result.input_to_internal.ptr == null);
+    try std.testing.expect(result.internal_to_input.ptr == null);
+    try std.testing.expect(result.effective_bond_orders.ptr == null);
+    try std.testing.expect(result.bond_displays.ptr == null);
+    try std.testing.expect(result.atom_stereo.ptr == null);
+}
+
+fn checkLiveCAbiResult(result: Result, atom_count: u32, bond_count: u32) !void {
+    try std.testing.expect(result.owner != null);
+    try std.testing.expectEqual(atom_count, result.coordinates.len);
+    try std.testing.expectEqual(atom_count, result.input_to_internal.len);
+    try std.testing.expectEqual(atom_count, result.internal_to_input.len);
+    try std.testing.expectEqual(atom_count, result.atom_stereo.len);
+    try std.testing.expectEqual(bond_count, result.effective_bond_orders.len);
+    try std.testing.expectEqual(bond_count, result.bond_displays.len);
+    const coordinates = result.coordinates.ptr.?[0..result.coordinates.len];
+    for (coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+    try std.testing.expect(result.clean_pose == 0 or result.clean_pose == 1);
+}
+
+fn cAbiExtendedInputContract(_: void, smith: *std.testing.Smith) anyerror!void {
+    var built = buildCAbiDomainInput(smith);
+    const input = built.view();
+    var result: Result = undefined;
+    const code = coordgen_generate(&input, &result);
+    if (built.expect_generation) try std.testing.expect(code == .ok or code == .unsupported);
+    if (code == .ok) {
+        try checkLiveCAbiResult(result, input.atoms.len, input.bonds.len);
+    } else {
+        try expectZeroedResult(result);
+    }
+    coordgen_result_free(&result);
+    try expectZeroedResult(result);
+}
+
+fn cAbiOwnershipSequences(_: void, smith: *std.testing.Smith) anyerror!void {
+    var built = buildFuzzInput(smith);
+    const input = built.view();
+    var results = [_]Result{ .{}, .{}, .{}, .{} };
+    defer for (&results) |*result| coordgen_result_free(result);
+
+    const operation_count = smith.valueRangeAtMost(u8, 1, 16);
+    for (0..operation_count) |_| {
+        const slot = smith.index(results.len);
+        if (smith.boolWeighted(3, 2)) {
+            // Reusing a live output without freeing it is outside the caller
+            // contract. Pick another operation rather than manufacturing a
+            // leak in the harness itself.
+            if (results[slot].owner != null) continue;
+            const code = coordgen_generate(&input, &results[slot]);
+            if (built.expect_generation) try std.testing.expect(code == .ok or code == .unsupported);
+            if (code == .ok) {
+                try checkLiveCAbiResult(results[slot], built.atom_count, built.bond_count);
+            } else {
+                try expectZeroedResult(results[slot]);
+            }
+        } else {
+            // Includes repeated frees of zeroed and already-freed slots.
+            coordgen_result_free(&results[slot]);
+            try expectZeroedResult(results[slot]);
+        }
+
+        // Generating or freeing one result must not invalidate any other live
+        // result retained by the caller.
+        for (results) |result| {
+            if (result.owner != null) try checkLiveCAbiResult(result, built.atom_count, built.bond_count);
+        }
+    }
+}
+
 const c_abi_fuzz_seeds = @import("fuzz_seeds").c_abi_contract_seeds;
+const c_abi_extended_fuzz_seeds = @import("fuzz_seeds").c_abi_extended_input_seeds;
+const c_abi_ownership_fuzz_seeds = @import("fuzz_seeds").c_abi_ownership_sequence_seeds;
 
 test "fuzz: c abi contract for atom and bond inputs" {
     try std.testing.fuzz({}, cAbiContract, .{ .corpus = c_abi_fuzz_seeds });
+}
+
+test "fuzz: c abi extended input contract" {
+    try std.testing.fuzz({}, cAbiExtendedInputContract, .{ .corpus = c_abi_extended_fuzz_seeds });
+}
+
+test "fuzz: c abi ownership sequences" {
+    try std.testing.fuzz({}, cAbiOwnershipSequences, .{ .corpus = c_abi_ownership_fuzz_seeds });
 }

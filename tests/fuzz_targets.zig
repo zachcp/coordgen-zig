@@ -116,7 +116,7 @@ fn buildHostile(smith: *std.testing.Smith) Molecule {
         atom.* = .{
             // Every element the enum names, 0 (virtual) through 118, not just
             // the organic handful the valid target draws from.
-            .atomic_number = @enumFromInt(smith.valueRangeAtMost(u8, 0, 118)),
+            .atomic_number = @fromBackingInt(@intCast(smith.valueRangeAtMost(u8, 0, 118))),
             .formal_charge = smith.value(i16),
             .hidden = smith.boolWeighted(9, 1),
             .fixed = smith.boolWeighted(9, 1),
@@ -229,10 +229,139 @@ fn hostileInputIsRejected(_: void, smith: *std.testing.Smith) anyerror!void {
     try checkResult(&molecule, result);
 }
 
+const domain_max_atoms = 16;
+const domain_max_bonds = 16;
+
+const DomainInput = struct {
+    atoms: [domain_max_atoms]api.AtomInput = undefined,
+    bonds: [domain_max_bonds]api.BondInput = undefined,
+    residues: [4]api.ResidueInput = undefined,
+    interactions: [2]api.ResidueInteractionInput = undefined,
+    atom_count: usize = 0,
+    bond_count: usize = 0,
+    residue_count: usize = 0,
+    interaction_count: usize = 0,
+    options: api.Options = .{},
+
+    fn input(self: *const DomainInput) api.Input {
+        return .{
+            .atoms = self.atoms[0..self.atom_count],
+            .bonds = self.bonds[0..self.bond_count],
+            .residues = self.residues[0..self.residue_count],
+            .residue_interactions = self.interactions[0..self.interaction_count],
+            .options = self.options,
+        };
+    }
+};
+
+/// Reach domains the small graph targets cannot: residue/protein placement,
+/// the 13-member macrocycle dispatch, and every public option. Unsupported
+/// runtime template directories are intentional inputs too: until a native
+/// loader exists, explicit rejection is the public contract to preserve.
+fn buildDomainInput(smith: *std.testing.Smith) DomainInput {
+    var built: DomainInput = .{};
+    switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => {
+            built.atom_count = 4;
+            for (built.atoms[0..built.atom_count]) |*atom| atom.* = .{};
+            built.bonds[0] = .{ .start = 0, .end = 1 };
+            built.bonds[1] = .{ .start = 1, .end = 2 };
+            built.bond_count = 2;
+            built.residues[0] = .{
+                .atom = 3,
+                .chain = "A",
+                .residue_number = smith.valueRangeAtMost(i8, -4, 4),
+                .closest_ligand_atom = 1,
+            };
+            built.residue_count = 1;
+            built.interactions[0] = .{
+                .start = 3,
+                .end = 1,
+                .crossing_penalty_multiplier = smith.valueRangeAtMost(u8, 0, 4),
+            };
+            built.interaction_count = 1;
+        },
+        1 => {
+            built.atom_count = 4;
+            for (built.atoms[0..built.atom_count]) |*atom| atom.* = .{};
+            built.residues[0] = .{ .atom = 0, .chain = "A", .residue_number = 1 };
+            built.residues[1] = .{ .atom = 1, .chain = "A", .residue_number = 2 };
+            built.residues[2] = .{ .atom = 2, .chain = "B", .residue_number = 1 };
+            built.residues[3] = .{ .atom = 3, .chain = "B", .residue_number = 2 };
+            built.residue_count = 4;
+            built.interactions[0] = .{ .start = 0, .end = 2 };
+            built.interactions[1] = .{ .start = 1, .end = 3 };
+            built.interaction_count = 2;
+        },
+        else => {
+            built.atom_count = 13;
+            built.bond_count = 13;
+            for (built.atoms[0..built.atom_count], built.bonds[0..built.bond_count], 0..) |*atom, *bond, index| {
+                atom.* = .{};
+                bond.* = .{
+                    .start = @intCast(index),
+                    .end = @intCast((index + 1) % built.atom_count),
+                };
+            }
+        },
+    }
+
+    built.options = .{
+        .precision = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+            0 => api.Precision.quick,
+            1 => api.Precision.standard,
+            else => api.Precision.best,
+        },
+        .score_residue_interactions = smith.boolWeighted(1, 1),
+        .treat_nonterminal_bonds_to_metal_as_zero_order = smith.boolWeighted(1, 1),
+        .even_angles = smith.boolWeighted(15, 1),
+        .skip_minimization = smith.boolWeighted(1, 1),
+        .force_open_macrocycles = smith.boolWeighted(1, 1),
+        .constrain_all_atoms = smith.boolWeighted(15, 1),
+        .debug_coordinates = smith.boolWeighted(15, 1),
+        .load_templates = smith.boolWeighted(1, 1),
+        .template_directory = if (smith.boolWeighted(31, 1)) "fixtures" else null,
+    };
+    return built;
+}
+
+fn domainResult(input: api.Input) !?api.Result {
+    return api.generate(std.testing.allocator, input) catch |err| switch (err) {
+        error.EmptyGraph,
+        error.TooManyItems,
+        error.InvalidAtomicNumber,
+        error.InvalidBondOrder,
+        error.InvalidAtomIndex,
+        error.InvalidStereo,
+        error.InvalidCoordinate,
+        error.InvalidOption,
+        error.InvalidMapping,
+        error.Unsupported,
+        error.OutOfMemory,
+        => return null,
+    };
+}
+
+fn residueTemplateOptionsAndMacrocycle(_: void, smith: *std.testing.Smith) anyerror!void {
+    var built = buildDomainInput(smith);
+    const input = built.input();
+    var first = (try domainResult(input)) orelse return;
+    defer first.deinit();
+    try std.testing.expectEqual(input.atoms.len, first.coordinates.len);
+    for (first.coordinates) |coordinate| try std.testing.expect(coordinate.isFinite());
+
+    var second = (try domainResult(input)) orelse return error.NondeterministicDomainAcceptance;
+    defer second.deinit();
+    try std.testing.expectEqual(first.clean_pose, second.clean_pose);
+    try std.testing.expectEqualSlices(api.Vec2, first.coordinates, second.coordinates);
+    try std.testing.expectEqualSlices(u32, first.input_to_internal, second.input_to_internal);
+}
+
 /// Seeds promoted by tools/run-fuzz. Each was proven to reproduce its failure
 /// before being written here, and each runs on ordinary `zig build test`.
 const generation_seeds = @import("fuzz_seeds/generation_invariants_hold_on_structurally_valid_molecules.zig").seeds;
 const hostile_seeds = @import("fuzz_seeds/hostile_input_is_rejected_or_answered_well_formed.zig").seeds;
+const domain_seeds = @import("fuzz_seeds/residue_template_options_and_macrocycle_domains.zig").seeds;
 
 test "fuzz: generation invariants hold on structurally valid molecules" {
     try std.testing.fuzz({}, generationInvariants, .{ .corpus = generation_seeds });
@@ -240,4 +369,8 @@ test "fuzz: generation invariants hold on structurally valid molecules" {
 
 test "fuzz: hostile input is rejected or answered well-formed" {
     try std.testing.fuzz({}, hostileInputIsRejected, .{ .corpus = hostile_seeds });
+}
+
+test "fuzz: residue template options and macrocycle domains" {
+    try std.testing.fuzz({}, residueTemplateOptionsAndMacrocycle, .{ .corpus = domain_seeds });
 }

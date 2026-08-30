@@ -145,9 +145,9 @@ def read_budgets():
         if not line.strip() or line.startswith("#"):
             continue
         parts = line.split("\t")
-        if len(parts) < 3:
+        if len(parts) != 4:
             fail(f"malformed budget row: {line!r}")
-        rows[parts[0]] = (int(parts[1]), int(parts[2]))
+        rows[parts[0]] = (int(parts[1]), int(parts[2]), int(parts[3]))
     return rows
 
 
@@ -219,6 +219,35 @@ def zig_escape(data):
 
 _SEED_RE = re.compile(r"--seed=(0x[0-9a-f]+)")
 _FAILURE_RE = re.compile(r"^.*(?:terminated with signal|exited with code \d|failed with error\.).*$", re.M)
+_COVERAGE_RE = re.compile(r"Coverage:\s+\d+/\d+\s+->\s+(\d+)/(\d+)")
+
+
+def coverageFromOutput(output):
+    """Return the final covered and total instrumented points.
+
+    The denominator grows when code is added, so the ratchet gates the absolute
+    covered-point numerator. A target that stops reaching a module loses
+    covered points even if its percentage happens to improve.
+    """
+    matches = _COVERAGE_RE.findall(output)
+    if not matches:
+        return None
+    covered, total = matches[-1]
+    return int(covered), int(total)
+
+
+def coverageFloorProblem(target, output, floor):
+    coverage = coverageFromOutput(output)
+    if coverage is None:
+        return f"{target}: completed without a parseable coverage row"
+    covered, total = coverage
+    if covered < floor:
+        return (
+            f"{target}: covered {covered}/{total} instrumented points,"
+            f" below committed floor {floor}; a target that stops reaching"
+            " a module must not pass on iteration count alone"
+        )
+    return None
 
 
 def recordRecipe(target, iterations, output):
@@ -529,6 +558,14 @@ def self_test():
         problems.append("a non-zero command failure was reported as a clean fuzz run")
     if classifyFuzzRun(0, "") != "infrastructure":
         problems.append("an exit-0 command with no fuzz report was reported as clean")
+    if coverageFromOutput(_CLEAN_RUN_SAMPLE) != (4773, 19369):
+        problems.append("the final fuzz coverage was not parsed from a valid report")
+    if coverageFromOutput("no report") is not None:
+        problems.append("output without a coverage row produced a coverage measurement")
+    if coverageFloorProblem("x", _CLEAN_RUN_SAMPLE, 4773) is not None:
+        problems.append("coverage equal to its committed floor failed the ratchet")
+    if coverageFloorProblem("x", _CLEAN_RUN_SAMPLE, 4774) is None:
+        problems.append("coverage one point below its committed floor passed the ratchet")
     if classifyReplayRun(1, _REPRODUCING_REPLAY_SAMPLE, _REPLAY_TARGET) != "reproduced":
         problems.append("the selected target's ordinary-test failure did not reproduce")
     if classifyReplayRun(1, _RETURNED_ERROR_REPLAY_SAMPLE, _REPLAY_TARGET) != "reproduced":
@@ -644,10 +681,22 @@ def main(argv):
     for target in selected:
         key = next(k for k in budgets if k in target)
         iterations = budgets[key][1 if args.extended else 0]
+        coverage_floor = budgets[key][2]
         print(f"run-fuzz: {target}: {iterations} iterations", file=sys.stderr)
         crashed, candidates, output = run_target(zig, target, iterations, extract_dir)
         if not crashed:
+            coverage = coverageFromOutput(output)
+            problem = coverageFloorProblem(target, output, coverage_floor)
+            if problem:
+                fail(problem)
+            assert coverage is not None
+            covered, total = coverage
             print(f"run-fuzz: {target}: no failure found", file=sys.stderr)
+            print(
+                f"run-fuzz: {target}: coverage {covered}/{total}"
+                f" (floor {coverage_floor})",
+                file=sys.stderr,
+            )
             continue
         print(f"run-fuzz: {target}: FAILURE FOUND", file=sys.stderr)
         print(output[-3000:], file=sys.stderr)
