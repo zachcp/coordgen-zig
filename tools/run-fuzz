@@ -28,27 +28,36 @@ part of this driver. None of them is theoretical - each was reproduced.
    driver runs ONE TARGET PER INVOCATION with `-Dfuzz-filter` instead. That is
    also what makes a per-target budget meaningful and a crash attributable.
 
-3. WHICH FILE HOLDS THE REPRODUCING SEED IS NOT FIXED (cgz-r27). Both
-   behaviours have now been observed on the SAME pin. In a small standalone
-   probe, `.zig-cache/f/crash` held the crashing input and reproduced 3/3
-   while the coverage directory held near misses that reproduced 0/3. In this
-   harness, with a larger drawn input and a warm coverage cache, `crash` was
-   written 0 BYTES - which is what the bead originally reported and what a
-   smaller probe had failed to reproduce.
+3. `.zig-cache/f/crash` IS TRUNCATED BY THE TOOLCHAIN (cgz-1js). Root-caused,
+   not merely observed. saveCrash() in the pin's
+   lib/compiler/Maker/Step/Run.zig streams the input into a writer holding a
+   512-byte buffer and closes the file WITHOUT FLUSHING, so what lands is
+   truncated to a whole number of buffer-fills. Measured against a planted
+   failure on 0.17.0-dev.1516+8a4b5424d, aarch64-macos: the input was 652
+   bytes, `crash` held exactly 512, and those 512 bytes compared equal to the
+   first 512 of the input.
 
-   So neither source can be trusted, and the durable rule is the one that does
-   not depend on knowing: try every candidate and keep whichever REPRODUCES.
-   That is what this driver does, and why it refuses to write a seed it could
+   That arithmetic explains the original report. Any input under 512 bytes
+   truncates to ZERO, which is the 0-byte crash file cgz-1js was filed on, and
+   it also explains why a small standalone probe once appeared to work while
+   the real harness did not - the outcome depends only on how the input's
+   length falls against the buffer, never on the cache being warm.
+
+   So this driver does not rely on `crash` at all. The per-instance mmap input
+   files the fuzzer maintains, `.zig-cache/f/in*`, carry the true length in
+   their header and the bytes in full; reading them directly sidesteps the
+   truncation. They are tried FIRST, `crash` and the coverage directory remain
+   as fallbacks, and correctness still comes from replaying a candidate rather
+   than from trusting any source: this driver refuses to write a seed it could
    not replay. `tools/check-fuzz-seed-promotion` reports which source is
    winning on a given toolchain.
 
-   On this pin the real targets here hit the 0-byte case (cgz-1js), so a
-   finding often cannot be promoted as bytes at all. Rather than lose it, the
-   driver records a REPRODUCTION RECIPE - the exact command, the runner's seed,
-   and the failure text - into the target's seed file as a comment. A recipe is
-   worth less than a seed, because re-finding the input costs another search
-   and the search is not guaranteed to be deterministic. It is worth much more
-   than nothing, which is what a crash detected and then dropped is worth.
+   The REPRODUCTION RECIPE path - command, runner seed, and failure text
+   written into the seed file as a comment - is kept for the case where no
+   candidate reproduces at all. It is worth less than a seed, because
+   re-finding the input costs another search that is not guaranteed to be
+   deterministic. It is worth much more than nothing, which is what a crash
+   detected and then dropped is worth.
 
 Usage:
     tools/run-fuzz --check-budgets        validate the budget table only
@@ -61,8 +70,10 @@ import os
 import pathlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -178,6 +189,19 @@ def check_budgets():
     return targets, budgets
 
 
+def displayPath(path):
+    """Repo-relative when it is inside the repo, absolute otherwise.
+
+    Extracted mmap payloads live in a temp directory outside the tree, so an
+    unconditional relative_to(ROOT) raises for exactly the candidates that are
+    now tried first.
+    """
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
 def seed_path(target):
     slug = re.sub(r"[^a-z0-9]+", "_", target.lower()).strip("_")
     return SEED_DIR / f"{slug}.zig"
@@ -239,16 +263,69 @@ def recordRecipe(target, iterations, output):
 MAX_CANDIDATES = 24
 
 
-def candidate_seeds(since):
+# MmapInputHeader, from the pinned toolchain's lib/std/Build/abi.zig:
+#   pc_digest u64 (align 4), instance_id u32, test_i u32, len u32
+# 20 bytes, little-endian, no padding. The payload follows the header, and only
+# the first `len` bytes of it are the input the fuzzer was running.
+MMAP_INPUT_HEADER = struct.Struct("<QIII")
+
+
+def mmapInputSeeds(fuzz_dir, out_dir):
+    """The crashing input, read the way the toolchain RECORDS it rather than
+    the way it SAVES it. This is the fix for cgz-1js.
+
+    `.zig-cache/f/crash` is written by saveCrash() in the toolchain's
+    lib/compiler/Maker/Step/Run.zig, which streams `len` bytes into a writer
+    holding a 512-byte buffer and then closes the file WITHOUT FLUSHING. So the
+    saved file is truncated to a whole number of buffer-fills: an input of 652
+    bytes lands as exactly 512, and any input under 512 bytes lands as ZERO.
+    That is the 0-byte crash file cgz-1js reported, and it is a defect in the
+    pinned toolchain, not in this repository.
+
+    Measured on 0.17.0-dev.1516+8a4b5424d, aarch64-macos, against a planted
+    failure: f/in0 carried len=652, f/crash held 512 bytes, and those 512 bytes
+    compared equal to the first 512 of the input. Nothing about the mechanism
+    is specific to that input size.
+
+    The mmap input files the fuzzer maintains per instance are unaffected -
+    they carry the true length in their header and the bytes in full. Reading
+    them directly sidesteps the truncation entirely, so a finding no longer
+    depends on how large the input happened to be.
+
+    Extracted payloads are written into `out_dir`, outside the cache, so this
+    never adds files the toolchain or a later scan would find.
+    """
+    seeds = []
+    for entry in sorted(fuzz_dir.glob("in*")):
+        if not entry.is_file():
+            continue
+        raw = entry.read_bytes()
+        if len(raw) < MMAP_INPUT_HEADER.size:
+            continue
+        _pc_digest, _instance_id, _test_i, length = MMAP_INPUT_HEADER.unpack_from(raw, 0)
+        payload = raw[MMAP_INPUT_HEADER.size : MMAP_INPUT_HEADER.size + length]
+        # A short read means the header outran the file, which is a shape this
+        # code does not understand; skip rather than promote a partial input.
+        if length == 0 or len(payload) != length:
+            continue
+        dest = out_dir / f"{entry.name}.input"
+        dest.write_bytes(payload)
+        seeds.append(dest)
+    return seeds
+
+
+def candidate_seeds(since, out_dir):
     """Every file the run could have left the reproducing input in.
 
-    Ordered `crash` first, then coverage-directory entries newest first. The
-    order is a cost heuristic only - correctness comes from replaying them.
+    Ordered mmap inputs first - they carry an explicit length and are not
+    subject to the truncation described in `mmapInputSeeds` - then `crash`,
+    then coverage-directory entries newest first. The order is a cost heuristic
+    only; correctness comes from replaying them.
     """
     fuzz_dir = ROOT / ".zig-cache" / "f"
     if not fuzz_dir.is_dir():
         return []
-    found = []
+    found = mmapInputSeeds(fuzz_dir, out_dir)
     crash = fuzz_dir / "crash"
     if crash.is_file() and crash.stat().st_size > 0:
         found.append(crash)
@@ -267,7 +344,7 @@ def candidate_seeds(since):
     return found[:MAX_CANDIDATES]
 
 
-def run_target(zig, target, iterations):
+def run_target(zig, target, iterations, out_dir):
     """Fuzz one target. Returns (crashed, candidates, output)."""
     crash_file = ROOT / ".zig-cache" / "f" / "crash"
     if crash_file.exists():
@@ -297,7 +374,7 @@ def run_target(zig, target, iterations):
             f"{target}: fuzz command did not complete a valid run"
             f" (exit {result.returncode})\n{output[-3000:]}"
         )
-    return outcome == "crash", candidate_seeds(started - 1), output
+    return outcome == "crash", candidate_seeds(started - 1, out_dir), output
 
 
 # Every way the test runner announces a failing fuzz iteration. Matched against
@@ -326,11 +403,25 @@ def classifyFuzzRun(returncode, output):
     return "clean"
 
 
+def replayNamedTargetFailure(output, target):
+    """The ordinary-gate failure shape, tied to the target's own name.
+
+    `zig build test` reports a returned error as `error: '<name>' failed:`
+    followed by a stack trace, with none of the tokens a crashing FUZZ run
+    emits. Matching on the target name keeps this from accepting an unrelated
+    build failure as reproduction.
+    """
+    pattern = r"error: '[^']*" + re.escape(target) + r"[^']*' failed:"
+    return re.search(pattern, output) is not None
+
+
 def classifyReplayRun(returncode, output, target):
     """Accept only the selected target's failure as reproduction."""
     if returncode == 0:
         return "clean"
-    if target in output and crashedFromOutput(output):
+    if target in output and (
+        crashedFromOutput(output) or replayNamedTargetFailure(output, target)
+    ):
         return "reproduced"
     return "infrastructure"
 
@@ -406,6 +497,18 @@ _REPRODUCING_REPLAY_SAMPLE = (
     f"error: 'fuzz: {_REPLAY_TARGET}' failed:\n"
     "failed with error.TestUnexpectedResult\n"
 )
+# A test that fails by RETURNING AN ERROR prints only the `failed:` line and a
+# stack trace - no `failed with error.` line at all. The sample above happens
+# to carry one, which is why this shape went unrecognised until a real
+# promotion reached the replay step: every candidate had failed earlier, so the
+# classifier was never exercised against real replay output. Captured verbatim
+# from `zig build test` replaying a planted returned error.
+_RETURNED_ERROR_REPLAY_SAMPLE = (
+    f"error: 'fuzz_targets.test.fuzz: {_REPLAY_TARGET}' failed:\n"
+    "       /Users/x/tests/fuzz_targets.zig:227:64: 0x104db90c3 in target (fuzz-targets-test)\n"
+    "           if (cond) return error.Planted;\n"
+    "                     ^\n"
+)
 
 
 def self_test():
@@ -428,10 +531,51 @@ def self_test():
         problems.append("an exit-0 command with no fuzz report was reported as clean")
     if classifyReplayRun(1, _REPRODUCING_REPLAY_SAMPLE, _REPLAY_TARGET) != "reproduced":
         problems.append("the selected target's ordinary-test failure did not reproduce")
+    if classifyReplayRun(1, _RETURNED_ERROR_REPLAY_SAMPLE, _REPLAY_TARGET) != "reproduced":
+        problems.append(
+            "a returned-error replay, which prints no `failed with error.` line,"
+            " was not recognised as reproduction (cgz-1js)"
+        )
+    if classifyReplayRun(1, "error: 'fuzz: some other target' failed:\n", _REPLAY_TARGET) != "infrastructure":
+        problems.append("another target's failure was accepted as this target's reproduction")
     if classifyReplayRun(0, "", _REPLAY_TARGET) != "clean":
         problems.append("a passing ordinary replay was not classified as clean")
     if classifyReplayRun(1, "error: unable to build module\n", _REPLAY_TARGET) != "infrastructure":
         problems.append("a replay compilation failure was accepted as reproduction")
+
+    # The mmap extraction is the FIX for cgz-1js, and its whole point is
+    # surviving a payload longer than the toolchain's 512-byte writer buffer.
+    # A fixture that stayed under that boundary would pass against the broken
+    # path too, which is how the original defect hid: `crash` is correct for
+    # short inputs and silently truncated for everything else.
+    with tempfile.TemporaryDirectory(prefix="cgz-selftest-") as tmp:
+        tmp_dir = pathlib.Path(tmp)
+        fuzz_dir = tmp_dir / "f"
+        fuzz_dir.mkdir()
+        out_dir = tmp_dir / "out"
+        out_dir.mkdir()
+        payload = bytes((i * 7 + 3) % 256 for i in range(1000))
+        header = MMAP_INPUT_HEADER.pack(0xABCD1234DEADBEEF, 0, 0, len(payload))
+        # Trailing slack after `len`, as the real mmap files carry.
+        (fuzz_dir / "in0").write_bytes(header + payload + b"\x00" * 512)
+        # len == 0 is the shape that must never be promoted: it is what the
+        # truncated crash file looks like, and a seed of no bytes reproduces
+        # nothing.
+        (fuzz_dir / "in1").write_bytes(MMAP_INPUT_HEADER.pack(1, 0, 0, 0) + b"\x00" * 32)
+        # Header outruns the file: skipped rather than promoted as a partial.
+        (fuzz_dir / "in2").write_bytes(MMAP_INPUT_HEADER.pack(2, 0, 0, 4096) + b"\x01" * 16)
+        extracted = mmapInputSeeds(fuzz_dir, out_dir)
+        if len(extracted) != 1:
+            problems.append(
+                f"mmap extraction returned {len(extracted)} candidates, expected 1"
+                " (len==0 and short-payload inputs must be skipped)"
+            )
+        elif extracted[0].read_bytes() != payload:
+            got = extracted[0].read_bytes()
+            problems.append(
+                f"mmap extraction returned {len(got)} bytes, expected {len(payload)}"
+                " - a payload longer than the 512-byte buffer must survive intact (cgz-1js)"
+            )
 
     # The recipe writer is the containment for cgz-1js, and it writes into a
     # file the build compiles, so a malformed recipe would break the build
@@ -493,11 +637,15 @@ def main(argv):
         fail(f"--target {args.target!r} matched none of: {targets}")
 
     findings = []
+    # Extracted mmap payloads land here rather than in the cache, so nothing
+    # this driver writes can be mistaken for something the toolchain left.
+    extract_ctx = tempfile.TemporaryDirectory(prefix="cgz-fuzz-inputs-")
+    extract_dir = pathlib.Path(extract_ctx.name)
     for target in selected:
         key = next(k for k in budgets if k in target)
         iterations = budgets[key][1 if args.extended else 0]
         print(f"run-fuzz: {target}: {iterations} iterations", file=sys.stderr)
-        crashed, candidates, output = run_target(zig, target, iterations)
+        crashed, candidates, output = run_target(zig, target, iterations, extract_dir)
         if not crashed:
             print(f"run-fuzz: {target}: no failure found", file=sys.stderr)
             continue
@@ -508,14 +656,14 @@ def main(argv):
             findings.append(
                 f"{target}: crashed and the run left no non-empty seed anywhere"
                 " (cgz-1js). Wrote a reproduction recipe to"
-                f" {recorded.relative_to(ROOT)} so the finding is not lost."
+                f" {displayPath(recorded)} so the finding is not lost."
             )
             continue
         promoted = None
         for candidate in candidates:
             data = candidate.read_bytes()
             print(
-                f"run-fuzz: trying {candidate.relative_to(ROOT)} ({len(data)} bytes)",
+                f"run-fuzz: trying {displayPath(candidate)} ({len(data)} bytes)",
                 file=sys.stderr,
             )
             if replay_reproduces(zig, target, data):
@@ -525,15 +673,15 @@ def main(argv):
             candidate, data = promoted
             findings.append(
                 f"{target}: promoted a {len(data)}-byte seed from"
-                f" {candidate.relative_to(ROOT)} to"
-                f" {seed_path(target).relative_to(ROOT)}, proven to reproduce"
+                f" {displayPath(candidate)} to"
+                f" {displayPath(seed_path(target))}, proven to reproduce"
             )
         else:
             recorded = recordRecipe(target, iterations, output)
             findings.append(
                 f"{target}: crashed, but none of the {len(candidates)} candidate"
                 " seeds reproduced, so no seed was committed (cgz-1js). Wrote a"
-                f" reproduction recipe to {recorded.relative_to(ROOT)} so the"
+                f" reproduction recipe to {displayPath(recorded)} so the"
                 " finding is not lost; it is a comment, not a corpus entry."
             )
 
