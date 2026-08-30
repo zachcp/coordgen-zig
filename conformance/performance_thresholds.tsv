@@ -68,20 +68,47 @@
 # and put the gate into permanent failure. That is cgz-7v2.4.9. The rows now
 # carry measurements.
 #
-# The two buckets that already had numbers both IMPROVED. Only one of them is
-# tightened here - no ratio in this file goes up, so no decision Bead is
-# required by the editing rules below:
+# The two buckets that already had numbers both IMPROVED:
 #
 #   tiny p95      20.00 -> 6.00   observed 2.524 - 3.505, was 10.223 - 13.882
 #
-# `tiny` median (1.50), `small` median (3.80) and `small` p95 (4.30) are left
-# alone. `small` median is the one that looks most obviously loose - 3.80
-# guarding a 1.683 - 1.798 median - and it is exactly the row whose tightening
-# was tried and reverted above. Its measured range under load reaches 2.614,
-# and its p95 threshold of 4.30 already sits only ~15% above an observed 3.739,
-# which is tighter than anything else here. Lowering `small` further is free
-# under the editing rules and would still be wrong: there is no evidence it
-# would catch a regression, and clear evidence it would fire on load.
+# `tiny` median (1.50) and `small` median (3.80) are left alone. `small` median
+# is the one that looks most obviously loose - 3.80 guarding a 1.683 - 1.798
+# median - and it is exactly the row whose tightening was tried and reverted
+# above. Its measured range under load reaches 2.614. Lowering it further is
+# free under the editing rules and would still be wrong: there is no evidence
+# it would catch a regression, and clear evidence it would fire on load.
+#
+# ## The one raise in this file, and its decision
+#
+#   small p95      4.30 -> 5.60   decided in cgz-7v2.4.14
+#
+# 4.30 came from the first baseline: four runs, one host, quiet machine,
+# observed 3.457 - 3.483, set ~23% above. More evidence has since contradicted
+# that sample. CI has been running `performance-baseline` on both platforms all
+# along, and those logs were never read. Eight samples across four runs at or
+# after dd4bb2f, every bucket at 20 of 20:
+#
+#   platform       small median    small p95
+#   macos-14       1.817           3.721
+#   macos-14       1.842           3.951
+#   macos-14       1.847           3.831
+#   macos-14       1.881           3.726
+#   ubuntu-24.04   1.444           2.917
+#   ubuntu-24.04   1.497           3.522
+#   ubuntu-24.04   1.697           4.525   <- exceeded the old 4.30
+#   ubuntu-24.04   1.746           3.816
+#
+# The threshold sat INSIDE the range of the thing it measures. One Linux sample
+# violated it outright; the tightest macOS sample cleared it by 8%. 5.60 is
+# ~24% over the highest of the eight, which is the headroom every other row
+# carries.
+#
+# This raise is not admitting a regression, which is what the editing rule below
+# exists to catch. Native did not get slower - the same code measures 2.917 on
+# one runner and 4.525 on another. The number being corrected was derived from a
+# sample now known to be unrepresentative. That distinction is the whole content
+# of the decision, which is why it was taken as one rather than assumed.
 #
 # ## Two findings the numbers carry, which these thresholds do not endorse
 #
@@ -104,6 +131,21 @@
 # 13x - this gate's job is to stop things getting worse, and a threshold set
 # below today's value would be red from the day it landed without making
 # anything faster.
+#
+# ## A caveat on the p95 rows specifically
+#
+# A p95 ratio is native's 95th percentile over the oracle's 95th percentile:
+# a quotient of two independently noisy order statistics, and much less stable
+# than the median ratio taken from the same samples. Under load it swings both
+# ways - one run produced a `huge` p95 of 8.942, about double anything here,
+# while the same run produced a `medium` p95 of 1.723, BELOW that bucket's own
+# median ratio of 4.229. Every median ratio in those runs stayed plausible.
+#
+# The p95 thresholds above are therefore doing less work than their precision
+# suggests, and are set with that in mind. Whether the tail should be compared
+# this way at all is cgz-7v2.4.15. Do not read a p95 row here as a tight
+# statement about the port's tail behaviour; read it as a bound loose enough to
+# survive the statistic's own variance.
 #
 # ## Reproducing these numbers
 #
@@ -138,7 +180,7 @@
 #
 # bucket	max_median_ratio	max_p95_ratio	min_compared_members
 tiny	1.50	6.00	20
-small	3.80	4.30	20
+small	3.80	5.60	20
 medium	7.00	6.20	20
 large	7.40	6.90	20
 huge	8.00	6.90	20
