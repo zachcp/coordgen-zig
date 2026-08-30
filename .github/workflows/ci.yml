@@ -81,15 +81,47 @@ jobs:
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true native-baseline-check
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true template-regeneration-check
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-baseline
-          # performance-baseline MEASURES; performance-check ENFORCES. Running
-          # only the first is how the committed thresholds went stale without
-          # anyone noticing: PRs #27-#30 merged green while the gate was red on
-          # main, because CI printed the ratios and nothing compared them
-          # (cgz-7v2.4.10). Both legs of the matrix run it - the thresholds in
-          # conformance/performance_thresholds.tsv are set from samples taken on
-          # both, not from one host (cgz-7v2.4.14).
-          ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-check
           ${{ steps.zig.outputs.zig }} build sanitizer-check -Denable-oracle=true -Dsanitize-oracle=true -Doptimize=safe
+
+      # performance-baseline above MEASURES; performance-check ENFORCES. Running
+      # only the first is how the committed thresholds went stale without anyone
+      # noticing: PRs #27-#30 merged green while the gate was red on main,
+      # because CI printed the ratios and nothing compared them (cgz-7v2.4.10).
+      #
+      # macOS only, deliberately, and NOT because the thresholds are wrong for
+      # Linux - they were set from samples taken on both platforms, and every
+      # row clears with 24% or more headroom on a healthy ubuntu run. It is
+      # cgz-7v2.4.16: on some fraction of x86_64 hosts native runs 10-40x slower
+      # than normal while the oracle, timed in the same process on the same
+      # members, is unaffected. On such a host every bucket fails by a wide
+      # margin. The first commit to run this gate hit exactly that - one ubuntu
+      # job reported a `large` median of 47.5, a second ubuntu job on the same
+      # commit reported 4.5.
+      #
+      # Turning this on for ubuntu is cgz-7v2.4.17, and it needs repeated green
+      # ubuntu runs rather than one, because the failure is intermittent by host.
+      - name: Enforce native/oracle performance thresholds
+        if: runner.os == 'macOS'
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
+          ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
+        run: ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-check
+
+      # Costs nothing and answers the first question cgz-7v2.4.16 asks: whether
+      # the slow runs correlate with a particular host CPU. Without it, a failed
+      # run cannot be told apart from a healthy one after the fact.
+      - name: Record host CPU
+        run: |
+          if [ -r /proc/cpuinfo ]; then
+            grep -m1 'model name' /proc/cpuinfo || true
+            nproc || true
+          else
+            sysctl -n machdep.cpu.brand_string || true
+            sysctl -n hw.ncpu || true
+          fi
 
       # The architecture axis of the stability classification runs the other
       # CPU architecture's binaries. macOS arm64 runners do that through
