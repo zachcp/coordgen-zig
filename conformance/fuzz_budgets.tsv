@@ -31,11 +31,12 @@
 # Fresh-cache x86_64-linux measurements on the pinned toolchain, 2026-08-30:
 # generation reached 4700 points after its promoted cgz-7v2.34 regression was
 # fixed; the other completed smoke runs reached hostile 1336, native domains
-# 4286, C atom/bond 1804, C extended 2667, and C ownership 1302. Floors retain
-# at least 10% headroom (more on the lower-coverage targets) while still failing
-# if a target collapses to its shallow validator path. Raising a floor follows
-# observed growth; lowering one requires a new fresh-cache measurement and
-# review.
+# 4286, C atom/bond 1804, and C extended 2667. A deterministic valid ownership
+# bootstrap seed stabilizes that target's fresh-cache reach at 2763-2781 points;
+# without it one measured run reached only 340. Floors retain at least 10%
+# headroom (more on the lower-coverage targets) while still failing if a target
+# collapses to its shallow validator path. Raising a floor follows observed
+# growth; lowering one requires a new fresh-cache measurement and review.
 #
 # Raising a budget or coverage floor needs no justification. LOWERING either
 # needs measured evidence and review, which is the point of recording them here

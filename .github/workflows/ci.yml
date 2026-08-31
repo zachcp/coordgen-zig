@@ -66,6 +66,25 @@ jobs:
             sleep 10
           done
 
+      # Both matrix platforms run this deliberately. The built-in fuzzer uses
+      # different object-format paths on Linux (ELF) and macOS (Mach-O), and no
+      # platform-specific exemption has been measured. The six committed smoke
+      # budgets total 7,500 iterations and must remain below the repository's
+      # 10-minute-per-platform ceiling (cgz-7v2.4.18). `time` records the cost
+      # on every run, including a run that exits non-zero after finding a crash.
+      #
+      # Keep the default repo-local Zig cache: tools/run-fuzz reads the fuzzer's
+      # mmap inputs there to prove and promote a discovered regression seed.
+      - name: Run fuzz smoke budgets
+        env:
+          HTTP_PROXY: http://127.0.0.1:9
+          HTTPS_PROXY: http://127.0.0.1:9
+          ALL_PROXY: http://127.0.0.1:9
+          ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
+        run: |
+          ${{ steps.zig.outputs.zig }} build fuzz
+          time tools/run-fuzz --zig '${{ steps.zig.outputs.zig }}'
+
       - name: Build and validate fetched packages offline
         env:
           HTTP_PROXY: http://127.0.0.1:9
