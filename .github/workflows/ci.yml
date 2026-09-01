@@ -136,7 +136,21 @@ jobs:
           ALL_PROXY: http://127.0.0.1:9
           ZIG_GLOBAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-cache
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
-        run: ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-check
+        run: |
+          ${{ steps.zig.outputs.zig }} build -Denable-oracle=true performance-check
+
+          # The original positional stdout writer overwrote offset zero even
+          # when the shell opened this file with O_APPEND (cgz-7v2.4.13). Run
+          # the real cached benchmark twice, not a mock writer, so this fails
+          # if either macOS append semantics or the benchmark regresses.
+          benchmark=$(find "$ZIG_LOCAL_CACHE_DIR/o" -type f -name oracle-performance-baseline -print -quit)
+          test -n "$benchmark"
+          append_log="${{ runner.temp }}/performance-append.log"
+          printf 'SENTINEL\n' > "$append_log"
+          "$benchmark" >> "$append_log"
+          "$benchmark" >> "$append_log"
+          test "$(head -1 "$append_log")" = SENTINEL
+          test "$(grep -c '^# target' "$append_log")" -eq 2
 
       # Costs nothing and answers the first question cgz-7v2.4.16 asks: whether
       # the slow runs correlate with a particular host CPU. The cpu.stat delta
