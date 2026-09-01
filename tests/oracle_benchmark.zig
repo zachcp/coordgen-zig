@@ -216,9 +216,9 @@ pub fn main(init: std.process.Init) !void {
         try member_timings.append(gpa, timing);
     }
 
-    var file = std.Io.File.stdout();
+    const file = std.Io.File.stdout();
     var buffer: [4096]u8 = undefined;
-    var file_writer = file.writer(io, &buffer);
+    var file_writer = benchmarkOutputWriter(file, io, &buffer);
     const out = &file_writer.interface;
     try out.print("# target\t{t}-{t}\n", .{ builtin.target.cpu.arch, builtin.target.os.tag });
     try out.print("# toolchain\t{s}\n", .{builtin.zig_version_string});
@@ -387,6 +387,13 @@ fn oracleRunsFirst(member_ordinal: usize, repetition: usize) bool {
     return (member_ordinal + repetition) % 2 == 0;
 }
 
+fn benchmarkOutputWriter(file: std.Io.File, io: std.Io, buffer: []u8) std.Io.File.Writer {
+    // Shell redirection may open stdout with O_APPEND. A positional writer
+    // ignores that descriptor state and starts every process at offset zero,
+    // silently overwriting earlier benchmark runs on macOS (cgz-7v2.4.13).
+    return file.writerStreaming(io, buffer);
+}
+
 const Threshold = struct { median: f64, p95: f64, min_compared: usize };
 
 /// The committed per-bucket limits. Absent row means absent threshold, which
@@ -548,6 +555,12 @@ test "timing order is balanced and changes within every member" {
         }
     }
     try std.testing.expectEqual(members.len * repetitions / 2, oracle_first);
+}
+
+test "benchmark output honors the descriptor's streaming position" {
+    var buffer: [16]u8 = undefined;
+    const writer = benchmarkOutputWriter(.stdout(), std.testing.io, &buffer);
+    try std.testing.expectEqual(std.Io.File.Writer.Mode.streaming, writer.mode);
 }
 
 test "nearest-rank percentiles do not interpolate timings" {

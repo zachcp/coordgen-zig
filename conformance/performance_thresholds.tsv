@@ -165,11 +165,12 @@
 # directly for repeat runs; it is the same binary the gate runs, without
 # --enforce.
 #
-# The benchmark writes stdout with POSITIONAL writes. Redirected straight to a
-# regular file on macOS it starts at offset 0 every run, so run 2 overwrites
-# run 1 in place and the file ends up holding one run while looking like it
-# holds five. Pipe through `cat` - a pipe is not seekable, so writes append.
-# That is cgz-7v2.4.13.
+# The benchmark uses a streaming stdout writer (cgz-7v2.4.13), so direct
+# executable runs honor `>>` and preserve earlier output. To collect N runs,
+# build once, locate the printed/cached `oracle-performance-baseline` executable,
+# then invoke that executable N times with `>> baseline.log`. Repeating
+# `zig build performance-baseline` itself is not equivalent: inherited stdout
+# is only surfaced once per shell by this pinned build runner.
 #
 # ## Editing rules
 #
