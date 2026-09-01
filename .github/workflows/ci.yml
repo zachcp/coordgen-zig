@@ -94,6 +94,7 @@ jobs:
           ZIG_LOCAL_CACHE_DIR: ${{ runner.temp }}/zig-offline-local-cache
         run: |
           ${{ steps.zig.outputs.zig }} build package-check
+          ${{ steps.zig.outputs.zig }} build package-check -Doptimize=safe
           ${{ steps.zig.outputs.zig }} build abi-check
           ${{ steps.zig.outputs.zig }} build abi-check -Doptimize=safe
           ${{ steps.zig.outputs.zig }} build -Denable-oracle=true upstream-oracle

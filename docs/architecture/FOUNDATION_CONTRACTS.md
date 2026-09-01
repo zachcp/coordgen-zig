@@ -310,7 +310,7 @@ enumerated here with the distinction each one turns on.
 | Gate | Proves |
 |---|---|
 | `tools/verify-upstream` | The pinned archive's SHA-256, byte count, Git tree hash, LICENSE hash, and Zig package hash, all recomputed with the pinned toolchain. The strongest gate in the tree. |
-| `tools/check-install-isolation` | Builds into a scratch prefix created empty and destroyed after, then compiles and runs C and C++17 consumers through the installed `coordgen.pc` (plus a direct-prefix C control). An archive or package descriptor without the ABI fails to link. Wired into `package-check`. |
+| `tools/check-install-isolation` | Builds into a scratch prefix created empty and destroyed after, then compiles and runs native C, C++17, and RDKit-shaped generation/ownership consumers through the installed `coordgen.pc` (plus a direct-prefix C control). The standalone package fixture separately runs the shipped Zig consumer through the exported module. An archive or package descriptor without the ABI fails to link. Wired into `package-check`. |
 | `abi-check` | Freezes every public POD's size, alignment, and field offsets in both C and Zig, then links `tests/abi_layout.c` against the real library so a name or signature drift from `include/coordgen_abi.h` is a link error. |
 | `sanitizer-check` | Rebuilds the native C++ oracle and its stable-ABI adapter in ReleaseSafe with Zig's full C-family UB instrumentation, then runs C, C++, and RDKit-shaped generation/ownership consumers through that instrumented facade. |
 | `assertNoFalseGreenSteps` (build.zig) | Asks the constructed graph whether each public step has dependencies. Runs at configure time on every invocation. |

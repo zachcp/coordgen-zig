@@ -19,6 +19,7 @@ zig_path=${CGZ_ZIG:-}
 if [ -z "$zig_path" ]; then
     zig_path=$("$repo_root/tools/bootstrap-zig")
 fi
+optimize=${CGZ_OPTIMIZE:-Debug}
 
 scratch_dir=$(mktemp -d "${TMPDIR:-/tmp}/cgz-install-isolation.XXXXXX")
 trap 'rm -rf "$scratch_dir"' EXIT HUP INT TERM
@@ -45,6 +46,7 @@ if [ -z "$prefix" ]; then
     # the outer build's cache would contend on its lock.
     (
         cd "$repo_root" && "$zig_path" build --summary failures \
+            -Doptimize="$optimize" \
             --prefix "$prefix" --cache-dir "$build_cache"
     ) || fail "install build failed"
 fi
@@ -112,4 +114,17 @@ pc_flags=$(PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" pkg-config --cflags --libs 
 "$work_dir/pkg-config-cpp-consumer" \
     || fail "installed C++ consumer did not observe the documented ABI behavior"
 
-echo "verified installed public ABI and pkg-config metadata, exclusion of the C++ oracle/probe header, and scratch-directory C/C++ consumer builds"
+# Exercise the actual RDKit-shaped flow against the installed native archive,
+# not only against the non-installed oracle used by conformance. It scrambles
+# caller atom order, generates twice, checks public permutation/geometry
+# observables, and frees three results including two owned simultaneously.
+# Intentional splitting: pkg-config returns compiler arguments.
+# shellcheck disable=SC2086
+"$zig_path" c++ -std=c++17 -Wall -Wextra -Werror \
+    "$repo_root/tests/rdkit_consumer.cpp" $pc_flags \
+    -o "$work_dir/rdkit-shaped-consumer" \
+    || fail "installed RDKit-shaped consumer did not compile/link from pkg-config metadata"
+"$work_dir/rdkit-shaped-consumer" \
+    || fail "installed RDKit-shaped consumer did not preserve generation and ownership contracts"
+
+echo "verified installed public ABI and pkg-config metadata, exclusion of the C++ oracle/probe header, and scratch-directory C/C++/RDKit-shaped consumer builds"

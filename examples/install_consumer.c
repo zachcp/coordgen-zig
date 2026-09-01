@@ -10,35 +10,36 @@
 #include <stddef.h>
 
 int main(void) {
-    coordgen_input_t input;
-    coordgen_result_t result;
+    coordgen_atom_input_t atoms[2] = {0};
+    coordgen_bond_input_t bond = {0};
+    coordgen_input_t input = {0};
+    coordgen_result_t result = {0};
+
+    atoms[0].atomic_number = 6;
+    atoms[0].stereo_looking_from = COORDGEN_INVALID_INDEX;
+    atoms[0].stereo_atom_a = COORDGEN_INVALID_INDEX;
+    atoms[0].stereo_atom_b = COORDGEN_INVALID_INDEX;
+    atoms[1] = atoms[0];
+    bond.start = 0;
+    bond.end = 1;
+    bond.order = COORDGEN_BOND_SINGLE;
+    bond.stereo_atom_a = COORDGEN_INVALID_INDEX;
+    bond.stereo_atom_b = COORDGEN_INVALID_INDEX;
 
     input.options = coordgen_default_options();
-    input.atoms.ptr = NULL;
-    input.atoms.len = 0;
-    input.atoms.reserved = 0;
-    input.bonds.ptr = NULL;
-    input.bonds.len = 0;
-    input.bonds.reserved = 0;
-    input.residues.ptr = NULL;
-    input.residues.len = 0;
-    input.residues.reserved = 0;
-    input.residue_interactions.ptr = NULL;
-    input.residue_interactions.len = 0;
-    input.residue_interactions.reserved = 0;
-    input.extra_bonds.ptr = NULL;
-    input.extra_bonds.len = 0;
-    input.extra_bonds.reserved = 0;
+    input.atoms.ptr = atoms;
+    input.atoms.len = 2;
+    input.bonds.ptr = &bond;
+    input.bonds.len = 1;
 
-    if (coordgen_generate(&input, &result) != COORDGEN_ERROR_EMPTY_GRAPH) {
-        return 1;
-    }
-    if (result.owner != NULL) {
-        return 1;
-    }
-    /* Documented safe on a zeroed failure result; also proves
-     * coordgen_result_free itself resolved from the installed archive. */
+    if (coordgen_generate(&input, &result) != COORDGEN_OK) return 1;
+    if (result.owner == NULL || result.coordinates.ptr == NULL ||
+        result.coordinates.len != 2 || result.effective_bond_orders.len != 1) return 2;
+    if (result.effective_bond_orders.ptr[0] != COORDGEN_BOND_SINGLE) return 3;
     coordgen_result_free(&result);
+    if (result.owner != NULL || result.coordinates.ptr != NULL ||
+        result.coordinates.len != 0 || result.effective_bond_orders.ptr != NULL ||
+        result.effective_bond_orders.len != 0) return 4;
 
     return 0;
 }

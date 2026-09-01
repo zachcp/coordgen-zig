@@ -598,8 +598,21 @@ pub fn build(b: *std.Build) !void {
     module_graph_step.dependOn(&reachability_self_test.step);
 
     const policy_command = b.addSystemCommand(&.{ "sh", "tools/check-build-policy" });
+    const optimize_name = switch (optimize) {
+        .Debug => "debug",
+        .ReleaseSafe => "safe",
+        .ReleaseFast => "fast",
+        .ReleaseSmall => "small",
+    };
     const external_consumer = b.addRunFile(std.Build.LazyPath.zig_exe);
-    external_consumer.addArgs(&.{ "build", "test", "--summary", "failures", "--cache-dir" });
+    external_consumer.addArgs(&.{
+        "build",
+        "test",
+        b.fmt("-Doptimize={s}", .{optimize_name}),
+        "--summary",
+        "failures",
+        "--cache-dir",
+    });
     external_consumer.addDirectoryArg(std.Build.LazyPath.cache_root.path(b, "external-consumer"));
     external_consumer.setCwd(b.path("build_support/consumer"));
     // The install gate the cgz-r28 defect walked straight through, now in the
@@ -611,6 +624,7 @@ pub fn build(b: *std.Build) !void {
     // exporting nothing.
     const install_isolation = b.addSystemCommand(&.{ "sh", "tools/check-install-isolation" });
     install_isolation.setEnvironmentVariable("CGZ_ZIG", b.graph.zig_exe);
+    install_isolation.setEnvironmentVariable("CGZ_OPTIMIZE", optimize_name);
     install_isolation.addPrefixedDirectoryArg(
         "--cache-dir=",
         std.Build.LazyPath.cache_root.path(b, "install-isolation"),
