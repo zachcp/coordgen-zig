@@ -36,6 +36,7 @@ const repetitions = 3;
 extern fn coordgen_generate(input: *const c_abi.Input, result: *c_abi.Result) u32;
 extern fn coordgen_result_free(result: *c_abi.Result) void;
 extern fn cgz_benchmark_now_ns() u64;
+extern fn cgz_benchmark_thread_cpu_ns() u64;
 
 const Member = struct {
     partition: corpus.Partition,
@@ -46,7 +47,9 @@ const MemberTiming = struct {
     member: Member,
     bucket: corpus.SizeBucket,
     oracle_ns: [repetitions]u64,
+    oracle_cpu_ns: [repetitions]u64,
     native_ns: [repetitions]u64,
+    native_cpu_ns: [repetitions]u64,
 };
 
 // Twenty members per atom-count bucket. The drug-like population is included
@@ -175,7 +178,9 @@ pub fn main(init: std.process.Init) !void {
             .member = selected,
             .bucket = bucket,
             .oracle_ns = undefined,
+            .oracle_cpu_ns = undefined,
             .native_ns = undefined,
+            .native_cpu_ns = undefined,
         };
         // Alternate which implementation runs first. The previous grouped
         // oracle-then-native order made the oracle an invalid control for a
@@ -184,11 +189,19 @@ pub fn main(init: std.process.Init) !void {
         // and member so neither side systematically consumes a fresh interval.
         for (0..repetitions) |repetition| {
             if (oracleRunsFirst(member_ordinal, repetition)) {
-                timing.oracle_ns[repetition] = try timeOracle(&prepared.input);
-                timing.native_ns[repetition] = try timeNative(gpa, native.input());
+                const oracle_elapsed = try timeOracle(&prepared.input);
+                timing.oracle_ns[repetition] = oracle_elapsed.wall_ns;
+                timing.oracle_cpu_ns[repetition] = oracle_elapsed.cpu_ns;
+                const native_elapsed = try timeNative(gpa, native.input());
+                timing.native_ns[repetition] = native_elapsed.wall_ns;
+                timing.native_cpu_ns[repetition] = native_elapsed.cpu_ns;
             } else {
-                timing.native_ns[repetition] = try timeNative(gpa, native.input());
-                timing.oracle_ns[repetition] = try timeOracle(&prepared.input);
+                const native_elapsed = try timeNative(gpa, native.input());
+                timing.native_ns[repetition] = native_elapsed.wall_ns;
+                timing.native_cpu_ns[repetition] = native_elapsed.cpu_ns;
+                const oracle_elapsed = try timeOracle(&prepared.input);
+                timing.oracle_ns[repetition] = oracle_elapsed.wall_ns;
+                timing.oracle_cpu_ns[repetition] = oracle_elapsed.cpu_ns;
             }
             try samples[@intFromEnum(bucket)].append(gpa, timing.oracle_ns[repetition]);
             try native_samples[@intFromEnum(bucket)].append(gpa, timing.native_ns[repetition]);
@@ -213,7 +226,9 @@ pub fn main(init: std.process.Init) !void {
             "# member\tpartition\tindex\tbucket",
     );
     for (0..repetitions) |repetition| try out.print("\toracle_ns_{d}", .{repetition});
+    for (0..repetitions) |repetition| try out.print("\toracle_cpu_ns_{d}", .{repetition});
     for (0..repetitions) |repetition| try out.print("\tnative_ns_{d}", .{repetition});
+    for (0..repetitions) |repetition| try out.print("\tnative_cpu_ns_{d}", .{repetition});
     try out.writeByte('\n');
     for (member_timings.items) |timing| {
         try out.print("# member\t{t}\t{d}\t{t}", .{
@@ -222,7 +237,9 @@ pub fn main(init: std.process.Init) !void {
             timing.bucket,
         });
         for (timing.oracle_ns) |sample| try out.print("\t{d}", .{sample});
+        for (timing.oracle_cpu_ns) |sample| try out.print("\t{d}", .{sample});
         for (timing.native_ns) |sample| try out.print("\t{d}", .{sample});
+        for (timing.native_cpu_ns) |sample| try out.print("\t{d}", .{sample});
         try out.writeByte('\n');
     }
     try out.writeAll("# implementation\tbucket\tmembers\tsamples\tmedian_ns\tp95_ns\n");
@@ -428,13 +445,17 @@ fn nativeGenerateOnce(gpa: std.mem.Allocator, input: api.Input) !bool {
     return true;
 }
 
-fn timeNative(gpa: std.mem.Allocator, input: api.Input) !u64 {
-    const start = cgz_benchmark_now_ns();
-    if (start == 0) return error.MonotonicClockUnavailable;
+const Elapsed = struct { wall_ns: u64, cpu_ns: u64 };
+
+fn timeNative(gpa: std.mem.Allocator, input: api.Input) !Elapsed {
+    const wall_start = cgz_benchmark_now_ns();
+    const cpu_start = cgz_benchmark_thread_cpu_ns();
+    if (wall_start == 0 or cpu_start == 0) return error.MonotonicClockUnavailable;
     _ = try nativeGenerateOnce(gpa, input);
-    const finish = cgz_benchmark_now_ns();
-    if (finish <= start) return error.MonotonicClockUnavailable;
-    return finish - start;
+    const cpu_finish = cgz_benchmark_thread_cpu_ns();
+    const wall_finish = cgz_benchmark_now_ns();
+    if (wall_finish <= wall_start or cpu_finish <= cpu_start) return error.MonotonicClockUnavailable;
+    return .{ .wall_ns = wall_finish - wall_start, .cpu_ns = cpu_finish - cpu_start };
 }
 
 fn generateOnce(input: *const c_abi.Input) !void {
@@ -444,13 +465,15 @@ fn generateOnce(input: *const c_abi.Input) !void {
     coordgen_result_free(&result);
 }
 
-fn timeOracle(input: *const c_abi.Input) !u64 {
-    const start = cgz_benchmark_now_ns();
-    if (start == 0) return error.MonotonicClockUnavailable;
+fn timeOracle(input: *const c_abi.Input) !Elapsed {
+    const wall_start = cgz_benchmark_now_ns();
+    const cpu_start = cgz_benchmark_thread_cpu_ns();
+    if (wall_start == 0 or cpu_start == 0) return error.MonotonicClockUnavailable;
     try generateOnce(input);
-    const finish = cgz_benchmark_now_ns();
-    if (finish <= start) return error.MonotonicClockUnavailable;
-    return finish - start;
+    const cpu_finish = cgz_benchmark_thread_cpu_ns();
+    const wall_finish = cgz_benchmark_now_ns();
+    if (wall_finish <= wall_start or cpu_finish <= cpu_start) return error.MonotonicClockUnavailable;
+    return .{ .wall_ns = wall_finish - wall_start, .cpu_ns = cpu_finish - cpu_start };
 }
 
 fn percentile(sorted: []const u64, percent: usize) u64 {
