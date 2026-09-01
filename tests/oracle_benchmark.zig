@@ -2,9 +2,10 @@
 //! (cgz-7v2.4.7).
 //!
 //! Both implementations are timed in ONE process, on the same members, in the
-//! same build, target and optimize mode, inside the same member loop - the
-//! identity rule `RunIdentity.requireSameBuild()` already enforces for
-//! coordinates, applied to timings.
+//! same build, target and optimize mode, inside the same member loop. Wall and
+//! thread CPU time are both reported; the gate uses CPU time so host scheduling
+//! cannot masquerade as an implementation regression, while wall time remains
+//! visible as the user-facing latency diagnostic.
 //!
 //! ## One asymmetry, stated rather than hidden
 //!
@@ -18,9 +19,9 @@
 //! generous to native, and a threshold set from them inherits that. Anyone
 //! tightening these numbers should close that gap first.
 //!
-//! With `--enforce`, the same binary compares each bucket's ratio against
-//! conformance/performance_thresholds.tsv and exits non-zero on a regression,
-//! so the gate reads exactly the numbers the baseline printed.
+//! With `--enforce`, the same binary compares each bucket's CPU-time ratio
+//! against conformance/performance_thresholds.tsv and exits non-zero on a
+//! regression, so the gate reads exactly the numbers the baseline printed.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -132,6 +133,10 @@ pub fn main(init: std.process.Init) !void {
     defer for (&samples) |*bucket| bucket.deinit(gpa);
     var native_samples: [5]std.ArrayList(u64) = @splat(.empty);
     defer for (&native_samples) |*bucket| bucket.deinit(gpa);
+    var cpu_samples: [5]std.ArrayList(u64) = @splat(.empty);
+    defer for (&cpu_samples) |*bucket| bucket.deinit(gpa);
+    var native_cpu_samples: [5]std.ArrayList(u64) = @splat(.empty);
+    defer for (&native_cpu_samples) |*bucket| bucket.deinit(gpa);
     var member_timings: std.ArrayList(MemberTiming) = .empty;
     defer member_timings.deinit(gpa);
     // Members native refused, per bucket. Reported, because a bucket where
@@ -205,6 +210,8 @@ pub fn main(init: std.process.Init) !void {
             }
             try samples[@intFromEnum(bucket)].append(gpa, timing.oracle_ns[repetition]);
             try native_samples[@intFromEnum(bucket)].append(gpa, timing.native_ns[repetition]);
+            try cpu_samples[@intFromEnum(bucket)].append(gpa, timing.oracle_cpu_ns[repetition]);
+            try native_cpu_samples[@intFromEnum(bucket)].append(gpa, timing.native_cpu_ns[repetition]);
         }
         try member_timings.append(gpa, timing);
     }
@@ -242,16 +249,20 @@ pub fn main(init: std.process.Init) !void {
         for (timing.native_cpu_ns) |sample| try out.print("\t{d}", .{sample});
         try out.writeByte('\n');
     }
-    try out.writeAll("# implementation\tbucket\tmembers\tsamples\tmedian_ns\tp95_ns\n");
+    try out.writeAll("# implementation_clock\tbucket\tmembers\tsamples\tmedian_ns\tp95_ns\n");
     var violations: usize = 0;
-    for (&samples, &native_samples, 0..) |*bucket_samples, *bucket_native, raw_bucket| {
+    for (&samples, &native_samples, &cpu_samples, &native_cpu_samples, 0..) |*bucket_samples, *bucket_native, *bucket_cpu, *bucket_native_cpu, raw_bucket| {
         const compared = 20 - unsupported[raw_bucket];
-        if (bucket_samples.items.len != compared * repetitions) {
+        if (bucket_samples.items.len != compared * repetitions or
+            bucket_native.items.len != bucket_samples.items.len or
+            bucket_cpu.items.len != bucket_samples.items.len or
+            bucket_native_cpu.items.len != bucket_samples.items.len)
+        {
             return error.InvalidRepresentativePopulation;
         }
         if (bucket_samples.items.len == 0) {
             const empty_bucket: corpus.SizeBucket = @enumFromInt(raw_bucket);
-            try out.print("oracle\t{t}\t0\t0\t-\t-\t(native supports none of 20)\n", .{empty_bucket});
+            try out.print("oracle_wall\t{t}\t0\t0\t-\t-\t(native supports none of 20)\n", .{empty_bucket});
             if (enforce) {
                 // A bucket that used to be comparable and is not any more is a
                 // domain regression, and it would otherwise be invisible: with
@@ -278,7 +289,7 @@ pub fn main(init: std.process.Init) !void {
         const median = percentile(bucket_samples.items, 50);
         const p95 = percentile(bucket_samples.items, 95);
         const bucket: corpus.SizeBucket = @enumFromInt(raw_bucket);
-        try out.print("oracle\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
+        try out.print("oracle_wall\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
             bucket,
             compared,
             bucket_samples.items.len,
@@ -288,7 +299,7 @@ pub fn main(init: std.process.Init) !void {
         std.mem.sort(u64, bucket_native.items, {}, u64LessThan);
         const native_median = percentile(bucket_native.items, 50);
         const native_p95 = percentile(bucket_native.items, 95);
-        try out.print("native\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
+        try out.print("native_wall\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
             bucket,
             bucket_native.items.len / repetitions,
             bucket_native.items.len,
@@ -297,12 +308,42 @@ pub fn main(init: std.process.Init) !void {
         });
         const median_ratio = ratioOf(native_median, median);
         const p95_ratio = ratioOf(native_p95, p95);
-        try out.print("ratio\t{t}\t{d}\t{d}\t{d:.3}\t{d:.3}\n", .{
+        try out.print("ratio_wall\t{t}\t{d}\t{d}\t{d:.3}\t{d:.3}\n", .{
             bucket,
             compared,
             unsupported[raw_bucket],
             median_ratio,
             p95_ratio,
+        });
+
+        std.mem.sort(u64, bucket_cpu.items, {}, u64LessThan);
+        const cpu_median = percentile(bucket_cpu.items, 50);
+        const cpu_p95 = percentile(bucket_cpu.items, 95);
+        try out.print("oracle_cpu\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
+            bucket,
+            compared,
+            bucket_cpu.items.len,
+            cpu_median,
+            cpu_p95,
+        });
+        std.mem.sort(u64, bucket_native_cpu.items, {}, u64LessThan);
+        const native_cpu_median = percentile(bucket_native_cpu.items, 50);
+        const native_cpu_p95 = percentile(bucket_native_cpu.items, 95);
+        try out.print("native_cpu\t{t}\t{d}\t{d}\t{d}\t{d}\n", .{
+            bucket,
+            compared,
+            bucket_native_cpu.items.len,
+            native_cpu_median,
+            native_cpu_p95,
+        });
+        const cpu_median_ratio = ratioOf(native_cpu_median, cpu_median);
+        const cpu_p95_ratio = ratioOf(native_cpu_p95, cpu_p95);
+        try out.print("ratio_cpu\t{t}\t{d}\t{d}\t{d:.3}\t{d:.3}\n", .{
+            bucket,
+            compared,
+            unsupported[raw_bucket],
+            cpu_median_ratio,
+            cpu_p95_ratio,
         });
         if (!enforce) continue;
         const limits = thresholdFor(bucket) orelse {
@@ -320,15 +361,15 @@ pub fn main(init: std.process.Init) !void {
             );
             violations += 1;
         }
-        if (median_ratio > limits.median) {
-            try out.print("FAIL\t{t}\tmedian ratio {d:.3} exceeds {d:.3}\n", .{
-                bucket, median_ratio, limits.median,
+        if (cpu_median_ratio > limits.median) {
+            try out.print("FAIL\t{t}\tCPU median ratio {d:.3} exceeds {d:.3}\n", .{
+                bucket, cpu_median_ratio, limits.median,
             });
             violations += 1;
         }
-        if (p95_ratio > limits.p95) {
-            try out.print("FAIL\t{t}\tp95 ratio {d:.3} exceeds {d:.3}\n", .{
-                bucket, p95_ratio, limits.p95,
+        if (cpu_p95_ratio > limits.p95) {
+            try out.print("FAIL\t{t}\tCPU p95 ratio {d:.3} exceeds {d:.3}\n", .{
+                bucket, cpu_p95_ratio, limits.p95,
             });
             violations += 1;
         }
@@ -513,4 +554,14 @@ test "nearest-rank percentiles do not interpolate timings" {
     const values = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
     try std.testing.expectEqual(@as(u64, 5), percentile(&values, 50));
     try std.testing.expectEqual(@as(u64, 10), percentile(&values, 95));
+}
+
+test "CPU p95 rejects a tiny tail hidden by the median" {
+    const oracle: [60]u64 = @splat(100);
+    var native: [60]u64 = @splat(100);
+    @memset(native[56..], 1000);
+    const limits = thresholdFor(.tiny).?;
+
+    try std.testing.expect(ratioOf(percentile(&native, 50), percentile(&oracle, 50)) <= limits.median);
+    try std.testing.expect(ratioOf(percentile(&native, 95), percentile(&oracle, 95)) > limits.p95);
 }

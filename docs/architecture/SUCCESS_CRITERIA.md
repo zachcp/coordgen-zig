@@ -208,10 +208,13 @@ cannot be extrapolated from it and must be measured when the harness exists.
 
 `zig build performance-baseline -Denable-oracle=true` times **native and
 oracle in one process**, on the same members, in the same build, target and
-optimize mode. `zig build performance-check -Denable-oracle=true` runs the same
-binary with `--enforce`, so the gate reads exactly the numbers the baseline
-printed. The 100-member population is in `tests/oracle_benchmark.zig`; changing
-it requires a decision Bead.
+optimize mode. It reports both wall and thread CPU time.
+`zig build performance-check -Denable-oracle=true` runs the same binary with
+`--enforce` and gates the CPU-time median and p95 ratios, so host scheduling
+cannot masquerade as an implementation regression. Wall rows and every raw
+per-member wall/CPU sample remain visible as latency diagnostics. The
+100-member population is in `tests/oracle_benchmark.zig`; changing it requires
+a decision Bead.
 
 The trigger named here — set the threshold when the first representative
 native-vs-oracle baseline exists — has been met, and the thresholds are in
@@ -232,9 +235,9 @@ oracle's would flatter native by exactly the amount that matters. Coverage is
 gated separately, by `min_compared_members`, so losing domain is a failure even
 though it leaves no ratio to exceed.
 
-**What the first baseline showed**, aarch64-macos, ReleaseFast. Native could
-lay out nothing above thirty atoms, so the gate covered 36 of the benchmark's
-100 members and three buckets had no ratio to measure:
+**What the first wall-clock baseline showed**, aarch64-macos, ReleaseFast.
+Native could lay out nothing above thirty atoms, so the gate covered 36 of the
+benchmark's 100 members and three buckets had no ratio to measure:
 
 | bucket | median ratio | p95 ratio | members compared |
 |---|---|---|---|
@@ -244,8 +247,9 @@ lay out nothing above thirty atoms, so the gate covered 36 of the benchmark's
 | large | — | — | **0 of 20** |
 | huge | — | — | **0 of 20** |
 
-**What it shows now**, same host and build, at `dd4bb2f`, over twelve runs
-(`cgz-7v2.4.9`). Every bucket is measurable and the gate covers 100 of 100:
+**What the later wall-clock baseline showed**, same host and build, at
+`dd4bb2f`, over twelve runs (`cgz-7v2.4.9`). Every bucket is measurable and the
+gate covers 100 of 100:
 
 | bucket | median ratio | p95 ratio | members compared |
 |---|---|---|---|
@@ -271,6 +275,14 @@ Three facts in the second table matter more than the thresholds:
   constant overhead would hold the ratio steady; one that grows with input
   size while the tail does not points at a term that scales worse in native
   than in the oracle. That is `cgz-7v2.4.12`.
+
+`cgz-7v2.4.15` replaced wall time as the gate's decision clock after a
+controlled contention experiment. Three quiet and three loaded x86_64 runs
+showed stable thread-CPU p95 ratios under load where paired wall ratios reached
+51–120. Fresh macOS aarch64 and Linux x86_64 CI then showed wall and CPU ratios
+agreeing on healthy hosts. No threshold was raised; only scheduling time was
+removed from the regression decision. Wall time remains reported, and
+`cgz-7v2.4.16` owns any abnormal wall/CPU divergence.
 
 ## OOM and leak gates
 

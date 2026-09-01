@@ -2,14 +2,17 @@
 # re-measured across all five buckets in cgz-7v2.4.9).
 #
 # Columns are tab separated:
-#   bucket  max_median_ratio  max_p95_ratio  min_compared_members
+#   bucket  max_cpu_median_ratio  max_cpu_p95_ratio  min_compared_members
 #
-# A ratio is native time divided by oracle time on the same member, in the same
-# process and build. Above 1.0 means native is slower. `min_compared_members`
-# is how many of the bucket's 20 members native could lay out when this row was
-# written; a member native refuses is skipped on BOTH sides, so the ratio stays
-# like-for-like and coverage is tracked separately rather than silently folded
-# into the timing.
+# A ratio is a native thread-CPU-time percentile divided by the corresponding
+# oracle thread-CPU-time percentile over the same member population, in the
+# same process and build. Above 1.0 means native consumes more CPU. Wall-clock
+# percentiles and every per-member wall/CPU sample remain in benchmark output
+# as latency and scheduling diagnostics, but do not decide the regression gate.
+# `min_compared_members` is how many of the bucket's 20 members native could lay
+# out when this row was written; a member native refuses is skipped on BOTH
+# sides, so the populations stay like-for-like and coverage is tracked
+# separately rather than silently folded into the timing.
 #
 # ## Why per bucket
 #
@@ -20,11 +23,11 @@
 #
 # ## Where these numbers came from
 #
-# Measured on aarch64-macos, pinned toolchain 0.17.0-dev.1516+8a4b5424d,
-# ReleaseFast, at dd4bb2f. Sixteen runs: five consecutive uncontended ones, and
-# eleven taken while other work shared the machine. Ranges below span ALL
-# SIXTEEN, because CI runners are shared machines and a threshold set from
-# quiet-machine numbers alone is one that fires on the first busy runner:
+# Originally measured as wall time on aarch64-macos, pinned toolchain
+# 0.17.0-dev.1516+8a4b5424d, ReleaseFast, at dd4bb2f. Sixteen runs: five
+# consecutive uncontended ones, and eleven taken while other work shared the
+# machine. Ranges below span ALL SIXTEEN. The later CPU-clock validation is
+# recorded below; it required no threshold increase.
 #
 #   bucket   median ratio     p95 ratio        compared
 #   tiny     0.783 - 1.034    2.524 - 3.505    20 of 20
@@ -132,20 +135,25 @@
 # below today's value would be red from the day it landed without making
 # anything faster.
 #
-# ## A caveat on the p95 rows specifically
+# ## Why the gate uses thread CPU time (cgz-7v2.4.15)
 #
-# A p95 ratio is native's 95th percentile over the oracle's 95th percentile:
-# a quotient of two independently noisy order statistics, and much less stable
-# than the median ratio taken from the same samples. Under load it swings both
-# ways - one run produced a `huge` p95 of 8.942, about double anything here,
-# while the same run produced a `medium` p95 of 1.723, BELOW that bucket's own
-# median ratio of 4.229. Every median ratio in those runs stayed plausible.
+# The original p95 ratio divided two wall-clock tails. One loaded run produced
+# a `huge` p95 of 8.942 while `medium` fell to 1.723, below its own median ratio
+# of 4.229. Pairing adjacent wall samples is worse: in a controlled experiment
+# with the benchmark pinned beside three competitors, paired p95 ratios reached
+# 75-120 on small and 88-106 on huge because adjacent calls received different
+# scheduler slices. Per-member wall medians still reached 39-102.
 #
-# The p95 thresholds above are therefore doing less work than their precision
-# suggests, and are set with that in mind. Whether the tail should be compared
-# this way at all is cgz-7v2.4.15. Do not read a p95 row here as a tight
-# statement about the port's tail behaviour; read it as a bound loose enough to
-# survive the statistic's own variance.
+# Thread CPU time removes that scheduler term without hiding implementation
+# work. Across three quiet and three identically loaded x86_64 runs, CPU p95
+# ranges were stable: tiny 3.141-3.748 vs 3.213-3.739, small 4.351-4.601 vs
+# 4.327-4.620, medium 4.181-4.326 vs 4.291-4.466, large 4.530-4.952 vs
+# 4.566-4.863, and huge 3.837-4.826 vs 4.628-4.951. Fresh hosted run
+# 33504213332 then showed wall and CPU ratios agreeing within measurement noise
+# on macOS aarch64 and Linux x86_64. Thus the existing limits remain valid and
+# the p95 still catches CPU work confined to a bucket tail, including the shape
+# that opened cgz-twy, without validation-audit's own host load deciding the
+# result. Wall rows remain visible and cgz-7v2.4.16 owns abnormal wall/CPU gaps.
 #
 # ## Reproducing these numbers
 #
@@ -178,7 +186,7 @@
 # permission either, and this file has learned that the hard way: zeroes read
 # as a threshold of zero the moment the bucket becomes measurable.
 #
-# bucket	max_median_ratio	max_p95_ratio	min_compared_members
+# bucket	max_cpu_median_ratio	max_cpu_p95_ratio	min_compared_members
 tiny	1.50	6.00	20
 small	3.80	5.60	20
 medium	7.00	6.20	20
