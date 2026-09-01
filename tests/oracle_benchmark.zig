@@ -42,6 +42,13 @@ const Member = struct {
     index: u32,
 };
 
+const MemberTiming = struct {
+    member: Member,
+    bucket: corpus.SizeBucket,
+    oracle_ns: [repetitions]u64,
+    native_ns: [repetitions]u64,
+};
+
 // Twenty members per atom-count bucket. The drug-like population is included
 // in full; remaining slots are the lowest-index adversarial members in that
 // bucket. Changing this reviewed population changes the benchmark and requires
@@ -122,12 +129,14 @@ pub fn main(init: std.process.Init) !void {
     defer for (&samples) |*bucket| bucket.deinit(gpa);
     var native_samples: [5]std.ArrayList(u64) = @splat(.empty);
     defer for (&native_samples) |*bucket| bucket.deinit(gpa);
+    var member_timings: std.ArrayList(MemberTiming) = .empty;
+    defer member_timings.deinit(gpa);
     // Members native refused, per bucket. Reported, because a bucket where
     // native handles three of twenty members has a ratio that says very
     // little, and the reader has to be able to see that.
     var unsupported: [5]usize = @splat(0);
 
-    for (members) |selected| {
+    for (members, 0..) |selected, member_ordinal| {
         const molecule = try corpus.generate(gpa, selected.partition, selected.index);
         defer molecule.deinit(gpa);
         const bucket = corpus.SizeBucket.of(molecule.atoms.len);
@@ -162,21 +171,29 @@ pub fn main(init: std.process.Init) !void {
         }
         // One untimed generation of each initializes process-local cold state.
         try generateOnce(&prepared.input);
-        for (0..repetitions) |_| {
-            const start = cgz_benchmark_now_ns();
-            if (start == 0) return error.MonotonicClockUnavailable;
-            try generateOnce(&prepared.input);
-            const finish = cgz_benchmark_now_ns();
-            if (finish <= start) return error.MonotonicClockUnavailable;
-            try samples[@intFromEnum(bucket)].append(gpa, finish - start);
+        var timing: MemberTiming = .{
+            .member = selected,
+            .bucket = bucket,
+            .oracle_ns = undefined,
+            .native_ns = undefined,
+        };
+        // Alternate which implementation runs first. The previous grouped
+        // oracle-then-native order made the oracle an invalid control for a
+        // quota, scheduling, or thermal effect that began during the native
+        // half of a member. Vary the first implementation by both repetition
+        // and member so neither side systematically consumes a fresh interval.
+        for (0..repetitions) |repetition| {
+            if (oracleRunsFirst(member_ordinal, repetition)) {
+                timing.oracle_ns[repetition] = try timeOracle(&prepared.input);
+                timing.native_ns[repetition] = try timeNative(gpa, native.input());
+            } else {
+                timing.native_ns[repetition] = try timeNative(gpa, native.input());
+                timing.oracle_ns[repetition] = try timeOracle(&prepared.input);
+            }
+            try samples[@intFromEnum(bucket)].append(gpa, timing.oracle_ns[repetition]);
+            try native_samples[@intFromEnum(bucket)].append(gpa, timing.native_ns[repetition]);
         }
-        for (0..repetitions) |_| {
-            const start = cgz_benchmark_now_ns();
-            _ = try nativeGenerateOnce(gpa, native.input());
-            const finish = cgz_benchmark_now_ns();
-            if (finish <= start) return error.MonotonicClockUnavailable;
-            try native_samples[@intFromEnum(bucket)].append(gpa, finish - start);
-        }
+        try member_timings.append(gpa, timing);
     }
 
     var file = std.Io.File.stdout();
@@ -191,6 +208,23 @@ pub fn main(init: std.process.Init) !void {
             " a member native cannot lay out is skipped on BOTH sides so the" ++
             " ratio stays like-for-like\n",
     );
+    try out.writeAll(
+        "# member timings are emitted after measurement so diagnostics do not perturb later samples\n" ++
+            "# member\tpartition\tindex\tbucket",
+    );
+    for (0..repetitions) |repetition| try out.print("\toracle_ns_{d}", .{repetition});
+    for (0..repetitions) |repetition| try out.print("\tnative_ns_{d}", .{repetition});
+    try out.writeByte('\n');
+    for (member_timings.items) |timing| {
+        try out.print("# member\t{t}\t{d}\t{t}", .{
+            timing.member.partition,
+            timing.member.index,
+            timing.bucket,
+        });
+        for (timing.oracle_ns) |sample| try out.print("\t{d}", .{sample});
+        for (timing.native_ns) |sample| try out.print("\t{d}", .{sample});
+        try out.writeByte('\n');
+    }
     try out.writeAll("# implementation\tbucket\tmembers\tsamples\tmedian_ns\tp95_ns\n");
     var violations: usize = 0;
     for (&samples, &native_samples, 0..) |*bucket_samples, *bucket_native, raw_bucket| {
@@ -289,6 +323,10 @@ pub fn main(init: std.process.Init) !void {
 fn ratioOf(native: u64, oracle: u64) f64 {
     if (oracle == 0) return std.math.inf(f64);
     return @as(f64, @floatFromInt(native)) / @as(f64, @floatFromInt(oracle));
+}
+
+fn oracleRunsFirst(member_ordinal: usize, repetition: usize) bool {
+    return (member_ordinal + repetition) % 2 == 0;
 }
 
 const Threshold = struct { median: f64, p95: f64, min_compared: usize };
@@ -390,11 +428,29 @@ fn nativeGenerateOnce(gpa: std.mem.Allocator, input: api.Input) !bool {
     return true;
 }
 
+fn timeNative(gpa: std.mem.Allocator, input: api.Input) !u64 {
+    const start = cgz_benchmark_now_ns();
+    if (start == 0) return error.MonotonicClockUnavailable;
+    _ = try nativeGenerateOnce(gpa, input);
+    const finish = cgz_benchmark_now_ns();
+    if (finish <= start) return error.MonotonicClockUnavailable;
+    return finish - start;
+}
+
 fn generateOnce(input: *const c_abi.Input) !void {
     var result: c_abi.Result = .{};
     const status = coordgen_generate(input, &result);
     if (status != 0) return error.OracleGenerationFailed;
     coordgen_result_free(&result);
+}
+
+fn timeOracle(input: *const c_abi.Input) !u64 {
+    const start = cgz_benchmark_now_ns();
+    if (start == 0) return error.MonotonicClockUnavailable;
+    try generateOnce(input);
+    const finish = cgz_benchmark_now_ns();
+    if (finish <= start) return error.MonotonicClockUnavailable;
+    return finish - start;
 }
 
 fn percentile(sorted: []const u64, percent: usize) u64 {
@@ -414,6 +470,20 @@ test "representative benchmark has twenty members in every size bucket" {
         counts[@intFromEnum(corpus.SizeBucket.of(molecule.atoms.len))] += 1;
     }
     try std.testing.expectEqual([_]usize{ 20, 20, 20, 20, 20 }, counts);
+}
+
+test "timing order is balanced and changes within every member" {
+    var oracle_first: usize = 0;
+    for (members, 0..) |_, member_ordinal| {
+        for (0..repetitions) |repetition| {
+            if (oracleRunsFirst(member_ordinal, repetition)) oracle_first += 1;
+            if (repetition != 0) {
+                try std.testing.expect(oracleRunsFirst(member_ordinal, repetition) !=
+                    oracleRunsFirst(member_ordinal, repetition - 1));
+            }
+        }
+    }
+    try std.testing.expectEqual(members.len * repetitions / 2, oracle_first);
 }
 
 test "nearest-rank percentiles do not interpolate timings" {
