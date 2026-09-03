@@ -1,5 +1,6 @@
 const std = @import("std");
 const api = @import("api");
+const conformance = @import("conformance");
 const core = @import("core");
 const minimal = @import("generator");
 
@@ -401,6 +402,37 @@ test "minimal native generation reaches macrocycle lattice and forced-open fallb
         .bonds = &bonds,
         .options = .{ .force_open_macrocycles = true },
     });
+}
+
+test "skip_minimization changes coordinates on a minimizing fixture" {
+    const molecule = try conformance.corpus.generate(std.testing.allocator, .drug_like, 2);
+    defer molecule.deinit(std.testing.allocator);
+    const atoms = try std.testing.allocator.alloc(api.AtomInput, molecule.atoms.len);
+    defer std.testing.allocator.free(atoms);
+    for (atoms, molecule.atoms) |*atom, source| atom.* = .{
+        .atomic_number = api.AtomicNumber.fromPublic(source.atomic_number) orelse return error.InvalidAtomicNumber,
+        .formal_charge = source.formal_charge,
+    };
+    const bonds = try std.testing.allocator.alloc(api.BondInput, molecule.bonds.len);
+    defer std.testing.allocator.free(bonds);
+    for (bonds, molecule.bonds) |*bond, source| bond.* = .{
+        .start = source.start,
+        .end = source.end,
+        .order = api.BondOrder.fromInt(source.order) orelse return error.InvalidBondOrder,
+    };
+    var minimized = try generate(std.testing.allocator, .{ .atoms = atoms, .bonds = bonds });
+    defer minimized.deinit();
+    var skipped = try generate(std.testing.allocator, .{
+        .atoms = atoms,
+        .bonds = bonds,
+        .options = .{ .skip_minimization = true },
+    });
+    defer skipped.deinit();
+    var changed = false;
+    for (minimized.coordinates, skipped.coordinates) |before, after| {
+        changed = changed or !std.meta.eql(before, after);
+    }
+    try std.testing.expect(changed);
 }
 
 test "minimal native generation runs discrete search for macrocycle substituents" {

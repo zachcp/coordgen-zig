@@ -1,0 +1,13 @@
+# schema_version	1
+# Every safe Zig option must have one executable flip/reject proof or a reviewed exemption.
+option	kind	observable	evidence	decision
+precision	flip	scored-solution budget	src/optimize/discrete.zig::precision changes the scored-solution budget	-
+score_residue_interactions	flip	crossing score	src/optimize/discrete.zig::discrete clash crossing and atoms-in-rings scores preserve pinned penalties	-
+treat_nonterminal_bonds_to_metal_as_zero_order	flip	effective_bond_orders	src/api.zig::public generation surfaces the metal zero-order rewrite instead of mutating the caller	-
+even_angles	reject	error.Unsupported	tests/native_minimal.zig::minimal native generation explicitly rejects domains owned by later phases	-
+skip_minimization	flip	coordinates	tests/native_minimal.zig::skip_minimization changes coordinates on a minimizing fixture	-
+force_open_macrocycles	flip	coordinates	tests/native_minimal.zig::minimal native generation reaches macrocycle lattice and forced-open fallback	-
+constrain_all_atoms	reject	error.Unsupported	tests/native_minimal.zig::minimal native generation explicitly rejects domains owned by later phases	-
+debug_coordinates	reject	error.Unsupported	tests/native_minimal.zig::minimal native generation explicitly rejects domains owned by later phases	-
+load_templates	flip	template match	src/layout/templates.zig::native fused ring set selects and applies embedded template 80	-
+template_directory	reject	error.Unsupported	src/layout/templates.zig::native fused ring set selects and applies embedded template 80	-

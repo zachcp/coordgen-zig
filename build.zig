@@ -444,6 +444,7 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "api", .module = api },
+            .{ .name = "conformance", .module = conformance },
             .{ .name = "core", .module = core },
             .{ .name = "generator", .module = generator },
         },
@@ -596,6 +597,20 @@ pub fn build(b: *std.Build) !void {
     // The self-test runs with the default checks even while the scan is red, so
     // the checker itself cannot rot unnoticed behind its own known failure.
     module_graph_step.dependOn(&reachability_self_test.step);
+
+    // Independent named gate because an option coverage gap is an actionable
+    // capability defect, not a reason to suppress unrelated tests. Keep its
+    // planted negative fixture under the default checks so the checker cannot
+    // rot behind a future real option gap.
+    const option_evidence_step = b.step(
+        "option-evidence-check",
+        "Require every declared option to change a named observable or be rejected",
+    );
+    const option_evidence_check = b.addSystemCommand(&.{ "python3", "tools/check-option-evidence.py" });
+    const option_evidence_self_test = b.addSystemCommand(&.{ "python3", "tools/check-option-evidence.py", "--self-test" });
+    option_evidence_step.dependOn(&option_evidence_check.step);
+    option_evidence_step.dependOn(&option_evidence_self_test.step);
+    module_graph_step.dependOn(&option_evidence_self_test.step);
 
     const policy_command = b.addSystemCommand(&.{ "sh", "tools/check-build-policy" });
     const optimize_name = switch (optimize) {
@@ -1572,6 +1587,7 @@ pub fn build(b: *std.Build) !void {
         performance_step,
         sanitizer_step,
         fuzz_step,
+        option_evidence_step,
     });
 }
 

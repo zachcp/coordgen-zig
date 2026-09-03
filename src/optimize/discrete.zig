@@ -555,6 +555,12 @@ pub const BondScoreView = struct {
     residue_interaction: bool = false,
 };
 
+pub const ResidueInteractionScoreView = struct {
+    residue: core.ids.AtomId,
+    end: core.ids.AtomId,
+    addition_vector: core.math.Vec2 = .{},
+};
+
 pub const RingScoreView = struct {
     atoms: []const core.ids.AtomId,
     fragment: core.ids.FragmentId,
@@ -588,23 +594,77 @@ pub fn scoreClashInteractions(
     return energy;
 }
 
-pub fn scoreCrossBonds(bonds: []const BondScoreView, coordinates: []const core.math.Vec2) core.errors.Error!f32 {
-    if (bonds.len <= 2) return 0;
+pub fn scoreCrossBonds(
+    bonds: []const BondScoreView,
+    residue_bonds: []const BondScoreView,
+    residue_interactions: []const ResidueInteractionScoreView,
+    score_residue_interactions: bool,
+    coordinates: []const core.math.Vec2,
+) core.errors.Error!f32 {
     var energy: f32 = 0;
-    for (bonds, 0..) |first, first_index| {
-        if (first.residue_interaction) continue;
-        try validateScoreBond(first, coordinates.len);
-        for (bonds[first_index + 1 ..]) |second| {
-            if (second.residue_interaction) continue;
-            try validateScoreBond(second, coordinates.len);
-            if (first.component.isValid() and second.component.isValid() and first.component != second.component) continue;
-            if (!bondsClash(first, second, coordinates)) continue;
-            var penalty_value = standard_crossing_bond_penalty * first.crossing_penalty_multiplier * second.crossing_penalty_multiplier;
-            if (first.terminal or second.terminal) penalty_value *= terminal_bond_crossing_multiplier;
-            if (first.macrocycle or second.macrocycle) penalty_value *= macrocycle_bond_crossing_multiplier;
-            if (first.small_ring or second.small_ring) penalty_value *= ring_bond_crossing_multiplier;
-            energy += penalty_value;
+    if (bonds.len > 2) {
+        for (bonds, 0..) |first, first_index| {
+            if (first.residue_interaction) continue;
+            try validateScoreBond(first, coordinates.len);
+            for (bonds[first_index + 1 ..]) |second| {
+                if (second.residue_interaction) continue;
+                try validateScoreBond(second, coordinates.len);
+                if (first.component.isValid() and second.component.isValid() and first.component != second.component) continue;
+                if (!bondsClash(first, second, coordinates)) continue;
+                var penalty_value = standard_crossing_bond_penalty * first.crossing_penalty_multiplier * second.crossing_penalty_multiplier;
+                if (first.terminal or second.terminal) penalty_value *= terminal_bond_crossing_multiplier;
+                if (first.macrocycle or second.macrocycle) penalty_value *= macrocycle_bond_crossing_multiplier;
+                if (first.small_ring or second.small_ring) penalty_value *= ring_bond_crossing_multiplier;
+                energy += penalty_value;
+            }
         }
+    }
+    if (score_residue_interactions) {
+        energy += try scoreResidueInteractionCrossings(residue_bonds, residue_interactions, coordinates);
+    }
+    return energy;
+}
+
+fn scoreResidueInteractionCrossings(
+    bonds: []const BondScoreView,
+    interactions: []const ResidueInteractionScoreView,
+    coordinates: []const core.math.Vec2,
+) core.errors.Error!f32 {
+    var energy: f32 = 0;
+    var group_start: usize = 0;
+    while (group_start < interactions.len) {
+        var group_end = group_start + 1;
+        while (group_end < interactions.len and interactions[group_end].residue == interactions[group_start].residue) : (group_end += 1) {}
+        const group = interactions[group_start..group_end];
+        for (group) |interaction| {
+            if (!interaction.residue.isValid() or !interaction.end.isValid() or interaction.residue.index() >= coordinates.len or
+                interaction.end.index() >= coordinates.len or !interaction.addition_vector.isFinite()) return error.InvalidMapping;
+        }
+        // Preserve upstream's asymmetric indices exactly: ri1 starts at zero
+        // and stops before the last item, while ri2 starts at one for every
+        // ri1 rather than at ri1 + 1 (CoordgenMinimizer.cpp:871-875).
+        if (group.len > 1) for (group[0 .. group.len - 1]) |first| for (group[1..]) |second| {
+            const first_end = coordinates[first.end.index()];
+            const second_end = coordinates[second.end.index()];
+            if (geometry.segmentIntersection(
+                geometry.add(first_end, geometry.scale(first.addition_vector, 0.2)),
+                geometry.add(second_end, geometry.scale(second.addition_vector, 0.2)),
+                first_end,
+                second_end,
+            ) != null) energy += 15;
+            for (bonds) |bond| {
+                if (!bond.start.isValid() or !bond.end.isValid() or bond.start.index() >= coordinates.len or
+                    bond.end.index() >= coordinates.len) return error.InvalidMapping;
+                if (bond.start == first.end or bond.end == first.end or bond.start == second.end or bond.end == second.end) continue;
+                if (geometry.segmentIntersection(
+                    first_end,
+                    second_end,
+                    coordinates[bond.start.index()],
+                    coordinates[bond.end.index()],
+                ) != null) energy += 10;
+            }
+        };
+        group_start = group_end;
     }
     return energy;
 }
@@ -1081,7 +1141,14 @@ test "discrete clash crossing and atoms-in-rings scores preserve pinned penaltie
         .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(3), .macrocycle = true, .small_ring = true, .crossing_penalty_multiplier = 3 },
         .{ .start = core.ids.AtomId.fromIndex(4), .end = core.ids.AtomId.fromIndex(5) },
     };
-    try std.testing.expectEqual(@as(f32, 120_000), try scoreCrossBonds(&bonds, &coordinates));
+    try std.testing.expectEqual(@as(f32, 120_000), try scoreCrossBonds(&bonds, &bonds, &.{}, false, &coordinates));
+
+    const residue_interactions = [_]ResidueInteractionScoreView{
+        .{ .residue = core.ids.AtomId.fromIndex(5), .end = core.ids.AtomId.fromIndex(0) },
+        .{ .residue = core.ids.AtomId.fromIndex(5), .end = core.ids.AtomId.fromIndex(1) },
+    };
+    try std.testing.expectEqual(@as(f32, 0), try scoreCrossBonds(&bonds, &bonds, &residue_interactions, false, &coordinates));
+    try std.testing.expectEqual(@as(f32, 10), try scoreCrossBonds(&bonds, &bonds, &residue_interactions, true, &coordinates));
 
     var terminal_coordinates = coordinates;
     const degrees = [_]u32{ 2, 1, 1, 1, 1, 1 };
@@ -1198,6 +1265,15 @@ test "solution cache is deterministic, bounded, and chooses lexicographic ties" 
     _ = try bounded.score(&.{0});
     try std.testing.expectEqual(rejected_solution_score, try bounded.score(&.{1}));
     try std.testing.expectEqual(@as(usize, 1), bounded_context.calls);
+}
+
+test "precision changes the scored-solution budget" {
+    var context = ScoreContext{};
+    var quick = try SolutionCache.init(std.testing.allocator, 1, 0.2, .{ .context = &context, .scoreFn = targetScore });
+    defer quick.deinit();
+    var best = try SolutionCache.init(std.testing.allocator, 1, 3, .{ .context = &context, .scoreFn = targetScore });
+    defer best.deinit();
+    try std.testing.expect(quick.max_solutions < best.max_solutions);
 }
 
 test "exhaustive search stores the first clean solution as optimal" {
