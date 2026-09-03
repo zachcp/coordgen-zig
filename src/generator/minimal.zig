@@ -344,9 +344,22 @@ fn minimizeGenerated(
     defer allocator.free(atom_fragments);
     for (fragmentation.atom_fragment, atom_fragments) |fragment, *output| output.* = fragment.index();
 
+    const bond_in_non_macrocycle_ring = allocator.alloc(bool, bonds.len) catch return error.OutOfMemory;
+    defer allocator.free(bond_in_non_macrocycle_ring);
+    for (bonds, bond_in_non_macrocycle_ring) |bond, *in_ring| {
+        in_ring.* = false;
+        for (rings.bondRings(bond.id)) |ring| {
+            if (rings.atoms(ring).len < topology.rings.macrocycle_size) {
+                in_ring.* = true;
+                break;
+            }
+        }
+    }
+
     var base = try optimize.buildBaseInteractions(allocator, atoms, bonds, .{
         .intrafragment_clashes = true,
         .atom_fragments = atom_fragments,
+        .bond_in_non_macrocycle_ring = bond_in_non_macrocycle_ring,
     });
     defer base.deinit();
 
