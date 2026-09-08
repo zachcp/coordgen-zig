@@ -647,7 +647,7 @@ test "coordgen_generate publishes every observable span and frees them as one un
         try std.testing.expectApproxEqAbs(
             c_abi.bond_length,
             @sqrt(delta_x * delta_x + delta_y * delta_y),
-            0.001,
+            0.01,
         );
     }
     // The enum observables cross the ABI as their pinned numeric values.

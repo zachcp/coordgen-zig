@@ -110,11 +110,13 @@ pub const FramePose = struct {
             const cosine = @cos(angle);
             for (self.fragment_atoms[frame.atoms.start..][0..frame.atoms.len], self.atom_coordinates[frame.atoms.start..][0..frame.atoms.len]) |atom, local| {
                 if (!atom.isValid() or atom.index() >= self.global_coordinates.len) return error.InvalidAtomIndex;
-                self.global_coordinates[atom.index()] = add(geometry.rotate(local, sine, cosine), position);
+                // Fragment::setCoordinates reaches Atom::setCoordinates for
+                // every rebuilt atom, which rounds each component here.
+                self.global_coordinates[atom.index()] = roundCoordinate(add(geometry.rotate(local, sine, cosine), position));
             }
             for (self.child_attachments[frame.attachments.start..][0..frame.attachments.len], self.attachment_coordinates[frame.attachments.start..][0..frame.attachments.len]) |attachment, local| {
                 if (!attachment.atom.isValid() or attachment.atom.index() >= self.global_coordinates.len) return error.InvalidAtomIndex;
-                self.global_coordinates[attachment.atom.index()] = add(geometry.rotate(local, sine, cosine), position);
+                self.global_coordinates[attachment.atom.index()] = roundCoordinate(add(geometry.rotate(local, sine, cosine), position));
             }
         }
     }
@@ -131,6 +133,20 @@ pub const FramePose = struct {
         return error.InvalidMapping;
     }
 };
+
+fn roundCoordinate(value: core.math.Vec2) core.math.Vec2 {
+    return .{
+        .x = @floor(value.x * 100 + 0.5) * 0.01,
+        .y = @floor(value.y * 100 + 0.5) * 0.01,
+    };
+}
+
+test "frame coordinate writes use upstream hundredth rounding" {
+    try std.testing.expectEqual(
+        core.math.Vec2{ .x = 12.35, .y = -12.34 },
+        roundCoordinate(.{ .x = 12.3451, .y = -12.3451 }),
+    );
+}
 
 fn rangeEnd(range: core.dof.AtomRange) usize {
     return @as(usize, range.start) + @as(usize, range.len);

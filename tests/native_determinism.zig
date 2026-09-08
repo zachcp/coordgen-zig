@@ -218,10 +218,10 @@ const residue_interactions = [_]api.ResidueInteractionInput{.{ .start = 3, .end 
 ///   ring              0.000015  congruent
 ///   fused rings       0.000008  congruent
 ///   macrocycle       84.492200  divergent
-///   components        0.071243  congruent
+///   components        0.000000  identical
 ///   proximity        83.474560  divergent
 ///   counterion        0.000000  identical
-///   metal zero-order  0.208847  congruent
+///   metal zero-order  0.000000  identical
 ///   heteroatoms       0.000000  identical
 ///
 /// Recorded so a reclassification can be compared against a number rather than
@@ -231,10 +231,10 @@ const families = [_]Family{
     .{ .name = "ring", .atoms = &ring_atoms, .bonds = &ring_bonds, .order = .congruent },
     .{ .name = "fused rings", .atoms = &fused_atoms, .bonds = &fused_bonds, .order = .congruent },
     .{ .name = "macrocycle", .atoms = &macrocycle_atoms, .bonds = &macrocycle_bonds, .order = .divergent },
-    .{ .name = "components", .atoms = &component_atoms, .bonds = &component_bonds, .order = .congruent },
+    .{ .name = "components", .atoms = &component_atoms, .bonds = &component_bonds, .order = .identical },
     .{ .name = "proximity", .atoms = &proximity_atoms, .bonds = &proximity_bonds, .order = .divergent },
     .{ .name = "counterion", .atoms = &counterion_atoms, .bonds = &counterion_bonds, .order = .identical },
-    .{ .name = "metal zero-order", .atoms = &metal_atoms, .bonds = &metal_bonds, .order = .congruent },
+    .{ .name = "metal zero-order", .atoms = &metal_atoms, .bonds = &metal_bonds, .order = .identical },
     .{ .name = "heteroatoms", .atoms = &hetero_atoms, .bonds = &hetero_bonds, .order = .identical },
     .{
         .name = "residue",

@@ -105,6 +105,7 @@ pub fn buildBaseInteractions(
         for (atoms, 0..) |point, point_index| {
             for (bonds) |bond| {
                 try validateBond(bond, atoms.len);
+                if (bond.effective_order == .zero) continue;
                 if (point.id == bond.start or point.id == bond.end) continue;
                 if (point.fixed and atoms[bond.start.index()].fixed and atoms[bond.end.index()].fixed) continue;
                 if (isRigid(options, point_index) and isRigid(options, bond.start.index()) and isRigid(options, bond.end.index())) continue;
@@ -133,6 +134,7 @@ pub fn buildBaseInteractions(
 
     for (bonds, 0..) |bond, bond_index| {
         try validateBond(bond, atoms.len);
+        if (bond.effective_order == .zero) continue;
         var force_constant: f32 = 0.1;
         var rest_length = core.math.bond_length;
         if (isRigid(options, bond.start.index()) and isRigid(options, bond.end.index())) {
@@ -363,6 +365,7 @@ fn isRigidBend(options: BendConstructionOptions, index: usize) bool {
 
 fn areNeighbors(first: core.ids.AtomId, second: core.ids.AtomId, bonds: []const model.Bond) bool {
     for (bonds) |bond| {
+        if (bond.effective_order == .zero) continue;
         if ((bond.start == first and bond.end == second) or (bond.start == second and bond.end == first)) return true;
     }
     return false;
@@ -482,6 +485,10 @@ fn scoreBend(value: core.interaction.Bend, state: State) core.errors.Error!f32 {
     const angle = geometry.unsignedAngle(first, center, last);
     const energy_delta = angle - value.rest_degrees;
     const energy = 5 * value.force_constant * value.secondary_force_constant * energy_delta * energy_delta;
+    // A perfectly straight bend has no defined perpendicular direction.
+    // Pinned upstream leaves that singular configuration stationary; choosing
+    // either normal here makes an otherwise ideal lattice diverge immediately.
+    if (angle == 180) return energy;
     const target = if (value.rest_degrees > 180) 360 - value.rest_degrees else value.rest_degrees;
     const force_delta = target - @abs(angle);
     const arm_a = geometry.subtract(first, center);
@@ -611,6 +618,11 @@ test "bend clash and E/Z values and forces match pinned formulas" {
     try expectForceSumZero(&forces);
 
     @memset(&forces, .{});
+    coordinates[2] = .{ .x = -1 };
+    try std.testing.expectEqual(@as(f32, 900), try score(bend, state));
+    for (forces) |force| try std.testing.expectEqual(core.math.Vec2{}, force);
+
+    coordinates[2] = .{ .y = 1 };
     const clash = core.interaction.Interaction{ .id = core.ids.InteractionId.fromIndex(1), .payload = .{ .clash = .{
         .segment_start = core.ids.AtomId.fromIndex(3),
         .point = core.ids.AtomId.fromIndex(2),
@@ -670,6 +682,38 @@ fn baseInteractionsAndDiscard(allocator: std.mem.Allocator) !void {
 
 test "base interaction construction preserves clash-stretch order and cleans allocation failures" {
     try core.oom.checkAllocationFailures(std.testing.allocator, baseInteractionsAndDiscard, .{});
+}
+
+test "zero-order proximity bonds neither interact nor suppress real-bond clashes" {
+    const atoms = [_]model.Atom{
+        .{ .id = core.ids.AtomId.fromIndex(0), .input_index = 0, .atomic_number = .iron },
+        .{ .id = core.ids.AtomId.fromIndex(1), .input_index = 1, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(2), .input_index = 2, .atomic_number = .oxygen },
+    };
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = atoms[0].id,
+            .end = atoms[1].id,
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = atoms[1].id,
+            .end = atoms[2].id,
+            .input_order = .single,
+            .effective_order = .zero,
+        },
+    };
+    var interactions = try buildBaseInteractions(std.testing.allocator, &atoms, &bonds, .{});
+    defer interactions.deinit();
+    try std.testing.expectEqual(@as(usize, 2), interactions.items.len);
+    try std.testing.expectEqual(atoms[2].id, interactions.items[0].payload.clash.point);
+    try std.testing.expectEqual(atoms[0].id, interactions.items[1].payload.stretch.atom_a);
+    try std.testing.expectEqual(atoms[1].id, interactions.items[1].payload.stretch.atom_b);
 }
 
 fn bendInteractionsAndDiscard(allocator: std.mem.Allocator) !void {

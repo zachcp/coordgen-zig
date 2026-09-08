@@ -166,6 +166,8 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
             .template_observer = if (outputs.probe_sink) |sink| sink.template_observer else null,
         },
     );
+    const component_clean = allocator.alloc(bool, prepared.graph.component_count) catch return error.OutOfMemory;
+    defer allocator.free(component_clean);
     const clean_pose = try optimizeDiscrete(
         allocator,
         prepared.working.atoms,
@@ -180,6 +182,7 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
         prepared.working.residues,
         prepared.working.residue_interactions,
         input.options.score_residue_interactions,
+        component_clean,
     );
     // Upstream requires minimization when the discrete search could not reach
     // a clean pose, and separately when maybeMinimizeRings fired during ring
@@ -197,6 +200,8 @@ pub fn generateInto(allocator: std.mem.Allocator, input: anytype, outputs: Outpu
             prepared.rings,
             fragmentation,
             input.options.even_angles,
+            component_clean,
+            layout_outcome.minimization_required,
         );
     }
     if (outputs.pre_orientation) |slice| {
@@ -339,7 +344,10 @@ fn minimizeGenerated(
     rings: topology.RingMembership,
     fragmentation: layout.Fragmentation,
     even_angles: bool,
+    component_clean: []const bool,
+    layout_minimization_required: bool,
 ) core.errors.Error!void {
+    if (component_clean.len != graph.component_count) return error.InvalidMapping;
     const atom_fragments = allocator.alloc(u32, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_fragments);
     for (fragmentation.atom_fragment, atom_fragments) |fragment, *output| output.* = fragment.index();
@@ -393,7 +401,19 @@ fn minimizeGenerated(
     });
     defer combined.deinit();
 
-    _ = try optimize.minimizeMolecule(allocator, atoms, combined.items, .{}, null);
+    var component_interactions: std.ArrayList(core.interaction.Interaction) = .empty;
+    defer component_interactions.deinit(allocator);
+    for (0..graph.component_count) |raw_component| {
+        if (component_clean[raw_component] and !layout_minimization_required) continue;
+        const component = core.ids.MoleculeId.fromIndex(@intCast(raw_component));
+        component_interactions.clearRetainingCapacity();
+        for (combined.items) |interaction| {
+            if (try interactionCrossesComponents(interaction, graph)) continue;
+            if (try interactionComponent(interaction, graph) != component) continue;
+            component_interactions.append(allocator, interaction) catch return error.OutOfMemory;
+        }
+        _ = try optimize.minimizeMolecule(allocator, atoms, component_interactions.items, .{}, null);
+    }
 }
 
 const DiscreteScoreContext = struct {
@@ -514,8 +534,10 @@ fn optimizeDiscrete(
     residue_records: []const model.Residue,
     residue_interactions: []const model.ResidueInteraction,
     score_residue_interactions: bool,
+    component_clean: []bool,
 ) core.errors.Error!bool {
     if (excluded_atoms.len != 0 and excluded_atoms.len != atoms.len) return error.InvalidMapping;
+    if (component_clean.len != graph.component_count) return error.InvalidMapping;
     const atom_has_dofs = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(atom_has_dofs);
     @memset(atom_has_dofs, false);
@@ -648,6 +670,7 @@ fn optimizeDiscrete(
             component,
             precision,
         );
+        component_clean[raw_component] = clean;
         all_clean = all_clean and clean;
     }
     return all_clean;

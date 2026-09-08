@@ -35,7 +35,7 @@ test "minimal native ethane and propane are finite deterministic caller-order la
     for (bonds) |bond| {
         const delta_x = first.coordinates[bond.start].x - first.coordinates[bond.end].x;
         const delta_y = first.coordinates[bond.start].y - first.coordinates[bond.end].y;
-        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.001);
+        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.01);
     }
     // All-zero preparation output (layout omitted) fails this executable fact.
     try std.testing.expect(first.coordinates[0].x != first.coordinates[1].x or first.coordinates[0].y != first.coordinates[1].y);
@@ -74,7 +74,7 @@ test "minimal native result maps canonical coordinates back to caller order with
     for (bonds) |bond| {
         const delta_x = result.coordinates[bond.start].x - result.coordinates[bond.end].x;
         const delta_y = result.coordinates[bond.start].y - result.coordinates[bond.end].y;
-        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.001);
+        try std.testing.expectApproxEqAbs(api.bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.01);
     }
 }
 
@@ -433,6 +433,47 @@ test "skip_minimization changes coordinates on a minimizing fixture" {
         changed = changed or !std.meta.eql(before, after);
     }
     try std.testing.expect(changed);
+}
+
+test "a dirty component does not minimize a clean disconnected component" {
+    const molecule = try conformance.corpus.generate(std.testing.allocator, .adversarial, 19);
+    defer molecule.deinit(std.testing.allocator);
+    const atoms = try std.testing.allocator.alloc(api.AtomInput, molecule.atoms.len);
+    defer std.testing.allocator.free(atoms);
+    for (atoms, molecule.atoms) |*atom, source| atom.* = .{
+        .atomic_number = api.AtomicNumber.fromPublic(source.atomic_number) orelse return error.InvalidAtomicNumber,
+        .formal_charge = source.formal_charge,
+    };
+    const bonds = try std.testing.allocator.alloc(api.BondInput, molecule.bonds.len);
+    defer std.testing.allocator.free(bonds);
+    for (bonds, molecule.bonds) |*bond, source| bond.* = .{
+        .start = source.start,
+        .end = source.end,
+        .order = api.BondOrder.fromInt(source.order) orelse return error.InvalidBondOrder,
+    };
+    var minimized = try generate(std.testing.allocator, .{ .atoms = atoms, .bonds = bonds });
+    defer minimized.deinit();
+    var skipped = try generate(std.testing.allocator, .{
+        .atoms = atoms,
+        .bonds = bonds,
+        .options = .{ .skip_minimization = true },
+    });
+    defer skipped.deinit();
+
+    // Corpus member 19's first generated component owns atoms 0 through 8.
+    // Global orientation and arrangement may move it rigidly, so compare its
+    // internal distances rather than absolute coordinates.
+    for (0..9) |first| for (first + 1..9) |second| {
+        const minimized_dx = minimized.coordinates[first].x - minimized.coordinates[second].x;
+        const minimized_dy = minimized.coordinates[first].y - minimized.coordinates[second].y;
+        const skipped_dx = skipped.coordinates[first].x - skipped.coordinates[second].x;
+        const skipped_dy = skipped.coordinates[first].y - skipped.coordinates[second].y;
+        try std.testing.expectApproxEqAbs(
+            @sqrt(minimized_dx * minimized_dx + minimized_dy * minimized_dy),
+            @sqrt(skipped_dx * skipped_dx + skipped_dy * skipped_dy),
+            0.001,
+        );
+    };
 }
 
 test "minimal native generation runs discrete search for macrocycle substituents" {

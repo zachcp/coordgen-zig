@@ -187,7 +187,7 @@ pub fn orientComponents(
         for (bonds) |bond| {
             if (graph.component(bond.start) != component or bond.effective_order == .zero or bond.skip) continue;
             const direction = geometry.subtract(atoms[bond.end.index()].coordinates, atoms[bond.start.index()].coordinates);
-            var angle = roundToTwo(std.math.atan2(-direction.y, direction.x));
+            var angle = core.math.roundToTwoDecimalDigits(std.math.atan2(-direction.y, direction.x));
             while (angle <= 0) angle += std.math.pi;
             for (0..6) |index| {
                 var weight: f32 = if (index == 1 or index == 5) 5 else if (index == 0 or index == 3) 1.5 else 1;
@@ -218,7 +218,14 @@ pub fn orientComponents(
             const cosine = std.math.cos(angles.items[best].angle);
             for (members) |atom| {
                 const relative = geometry.subtract(atoms[atom.index()].coordinates, center);
-                atoms[atom.index()].coordinates = geometry.add(center, geometry.rotate(relative, sine, cosine));
+                const coordinate = geometry.add(center, geometry.rotate(relative, sine, cosine));
+                // bestRotation writes through Atom::setCoordinates upstream,
+                // which rounds both axes to hundredths before proximity
+                // placement computes free-valence vectors from this pose.
+                atoms[atom.index()].coordinates = .{
+                    .x = core.math.roundToTwoDecimalDigits(coordinate.x),
+                    .y = core.math.roundToTwoDecimalDigits(coordinate.y),
+                };
             }
         }
         try maybeFlipComponent(allocator, atoms, bonds, graph, rings, analysis, fragmentation, component, members);
@@ -449,7 +456,7 @@ const RingFlipContext = struct {
 };
 
 fn addAngle(allocator: std.mem.Allocator, angles: *std.ArrayList(WeightedAngle), weight: f32, raw_angle: f32) core.errors.Error!void {
-    var angle = roundToTwo(raw_angle);
+    var angle = core.math.roundToTwoDecimalDigits(raw_angle);
     while (angle <= 0) angle += std.math.pi;
     for (angles.items, 0..) |*candidate, index| {
         if (candidate.angle < angle - geometry.epsilon) continue;
@@ -595,10 +602,6 @@ fn scoreRingFlipOfFragment(
     }
 }
 
-fn roundToTwo(value: f32) f32 {
-    return @round(value * 100) / 100;
-}
-
 /// Mirror one component across the axis perpendicular to its first crossing
 /// pair of already-placeable proximity relations, matching upstream's
 /// flipIfCrossingInteractions first-hit behavior.
@@ -694,7 +697,7 @@ pub fn placeProximityChild(
     child_position = geometry.scale(child_position, 1 / divisor);
     child_direction = geometry.scale(child_direction, 1 / divisor);
     var starting_position = geometry.add(parent_position, parent_addition);
-    starting_position = findGridPoint(atoms, graph, placed, starting_position, 0, 0, core.math.bond_length * 1.8);
+    starting_position = findGridPoint(atoms, graph, placed, starting_position, 0, 0, core.math.bond_length * 1.8, 15, 10);
     const desired = geometry.subtract(starting_position, parent_position);
     const opposite_child = geometry.scale(child_direction, -1);
     const angle = geometry.signedAngle(desired, .{}, opposite_child) / 180 * std.math.pi;
@@ -982,18 +985,47 @@ fn generateMetaCoordinates(
     }
     if (bond_count != unique_edge_count) return error.InvalidMapping;
 
-    var meta_graph = try topology.Graph.init(allocator, meta_atoms, meta_bonds);
+    const atom_descriptors = allocator.alloc(topology.canonical.Atom, meta_atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(atom_descriptors);
+    for (atom_descriptors) |*atom| atom.* = .{ .atomic_number = .carbon };
+    const bond_descriptors = allocator.alloc(topology.canonical.Bond, meta_bonds.len) catch return error.OutOfMemory;
+    defer allocator.free(bond_descriptors);
+    for (meta_bonds, bond_descriptors) |bond, *descriptor| descriptor.* = .{
+        .start = bond.start.index(),
+        .end = bond.end.index(),
+        .effective_order = .single,
+    };
+    var ordering = try topology.canonical.order(allocator, atom_descriptors, bond_descriptors);
+    defer ordering.deinit();
+    const old_to_new = allocator.alloc(u32, meta_atoms.len) catch return error.OutOfMemory;
+    defer allocator.free(old_to_new);
+    for (ordering.internal_to_input, 0..) |old_index, new_index| {
+        old_to_new[old_index] = @intCast(new_index);
+        meta_atoms[new_index].input_index = old_index;
+    }
+    const canonical_bonds = allocator.alloc(model.Bond, meta_bonds.len) catch return error.OutOfMemory;
+    defer allocator.free(canonical_bonds);
+    for (ordering.structural_bonds, 0..) |old_bond_index, new_bond_index| {
+        const source = meta_bonds[old_bond_index];
+        canonical_bonds[new_bond_index] = source;
+        canonical_bonds[new_bond_index].id = core.ids.BondId.fromIndex(@intCast(new_bond_index));
+        canonical_bonds[new_bond_index].input_index = old_bond_index;
+        canonical_bonds[new_bond_index].start = core.ids.AtomId.fromIndex(old_to_new[source.start.index()]);
+        canonical_bonds[new_bond_index].end = core.ids.AtomId.fromIndex(old_to_new[source.end.index()]);
+    }
+
+    var meta_graph = try topology.Graph.init(allocator, meta_atoms, canonical_bonds);
     defer meta_graph.deinit();
-    var meta_rings = try topology.RingMembership.init(allocator, meta_graph, meta_bonds);
+    var meta_rings = try topology.RingMembership.init(allocator, meta_graph, canonical_bonds);
     defer meta_rings.deinit();
-    var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings);
+    var fragmentation = try layout.Fragmentation.init(allocator, meta_atoms, canonical_bonds, meta_graph, meta_rings);
     defer fragmentation.deinit();
-    try layout.initializeCoordinates(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, fragmentation);
-    _ = try orientComponents(allocator, meta_atoms, meta_bonds, meta_graph, meta_rings, null);
+    try layout.initializeCoordinates(allocator, meta_atoms, canonical_bonds, meta_graph, meta_rings, fragmentation);
+    _ = try orientComponents(allocator, meta_atoms, canonical_bonds, meta_graph, meta_rings, null);
     try arrangeComponents(allocator, meta_atoms, meta_graph);
 
     const coordinates = allocator.alloc(Vec2, meta_atoms.len) catch return error.OutOfMemory;
-    for (meta_atoms, coordinates) |atom, *coordinate| coordinate.* = atom.coordinates;
+    for (meta_atoms) |atom| coordinates[atom.input_index] = atom.coordinates;
     return coordinates;
 }
 
@@ -1368,7 +1400,7 @@ fn arrangeComponentsExcludingWithPlaced(
             .x = (component_bounds.max.x + component_bounds.min.x) * 0.5,
             .y = (component_bounds.max.y + component_bounds.min.y) * 0.5,
         };
-        const target = findGridPoint(atoms, graph, placed, center, half_width, half_height, core.math.bond_length * 1.8);
+        const target = findGridPoint(atoms, graph, placed, center, half_width, half_height, core.math.bond_length * 1.8, 10, core.math.bond_length);
         const translation = Vec2{ .x = target.x - old_center.x, .y = target.y - old_center.y };
         for (members) |atom| {
             atoms[atom.index()].coordinates.x += translation.x;
@@ -1408,7 +1440,7 @@ fn arrangeComponentsExcludingWithPlaced(
             .x = (component_bounds.max.x + component_bounds.min.x) * 0.5,
             .y = (component_bounds.max.y + component_bounds.min.y) * 0.5,
         };
-        const target = findGridPoint(atoms, graph, placed, search_center, half_width, half_height, core.math.bond_length * 0.8);
+        const target = findGridPoint(atoms, graph, placed, search_center, half_width, half_height, core.math.bond_length * 0.8, 10, core.math.bond_length);
         const translation = Vec2{ .x = target.x - old_center.x, .y = target.y - old_center.y };
         for (members) |atom| {
             atoms[atom.index()].coordinates.x += translation.x;
@@ -1426,35 +1458,39 @@ fn findGridPoint(
     half_width: f32,
     half_height: f32,
     clearance: f32,
+    levels: usize,
+    step: f32,
 ) Vec2 {
-    const step = core.math.bond_length;
-    for (0..10) |level| {
+    for (0..levels) |level| {
         const distance = @as(f32, @floatFromInt(level + 1)) * step;
         const right = Vec2{ .x = center.x + distance, .y = center.y };
         const left = Vec2{ .x = center.x - distance, .y = center.y };
         const bottom = Vec2{ .x = center.x, .y = center.y - distance };
         const top = Vec2{ .x = center.x, .y = center.y + distance };
-        const cardinal = [_]Vec2{ center, right, left, bottom, top };
+        // Upstream expresses candidates in the default (0, 1) direction
+        // basis, whose normal is (-1, 0), so its logical +x candidate is the
+        // Cartesian left point. Preserve that transformed enumeration order.
+        const cardinal = [_]Vec2{ center, left, right, bottom, top };
         for (cardinal) |candidate| if (pointIsClear(atoms, graph, placed, candidate, half_width, half_height, clearance)) return candidate;
         for (0..level) |offset_index| {
             const offset = @as(f32, @floatFromInt(offset_index + 1)) * step;
             const edge = [_]Vec2{
-                .{ .x = right.x, .y = right.y + offset },
-                .{ .x = right.x, .y = right.y - offset },
                 .{ .x = left.x, .y = left.y + offset },
                 .{ .x = left.x, .y = left.y - offset },
-                .{ .x = bottom.x + offset, .y = bottom.y },
+                .{ .x = right.x, .y = right.y + offset },
+                .{ .x = right.x, .y = right.y - offset },
                 .{ .x = bottom.x - offset, .y = bottom.y },
-                .{ .x = top.x + offset, .y = top.y },
+                .{ .x = bottom.x + offset, .y = bottom.y },
                 .{ .x = top.x - offset, .y = top.y },
+                .{ .x = top.x + offset, .y = top.y },
             };
             for (edge) |candidate| if (pointIsClear(atoms, graph, placed, candidate, half_width, half_height, clearance)) return candidate;
         }
         const corners = [_]Vec2{
-            .{ .x = center.x + distance, .y = center.y + distance },
-            .{ .x = center.x + distance, .y = center.y - distance },
             .{ .x = center.x - distance, .y = center.y + distance },
             .{ .x = center.x - distance, .y = center.y - distance },
+            .{ .x = center.x + distance, .y = center.y + distance },
+            .{ .x = center.x + distance, .y = center.y - distance },
         };
         for (corners) |candidate| if (pointIsClear(atoms, graph, placed, candidate, half_width, half_height, clearance)) return candidate;
     }
@@ -1516,6 +1552,14 @@ fn testAtom(index: u32, x: f32) model.Atom {
         .atomic_number = .carbon,
         .coordinates = .{ .x = x },
     };
+}
+
+test "grid candidate order includes upstream default-direction reflection" {
+    var atoms = [_]model.Atom{testAtom(0, 0)};
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &.{});
+    defer graph.deinit();
+    const target = findGridPoint(&atoms, graph, &.{true}, .{}, 0, 0, 10, 1, core.math.bond_length);
+    try std.testing.expectEqual(Vec2{ .x = -core.math.bond_length }, target);
 }
 
 test "neutral components use largest-first center and pinned grid order" {
@@ -1726,6 +1770,40 @@ test "isolated acyclic bond rotates to the upstream horizontal preference" {
     try std.testing.expectApproxEqAbs(core.math.bond_length, @abs(atoms[1].coordinates.x - atoms[0].coordinates.x), 0.001);
 }
 
+test "global orientation rounds rotated coordinates to hundredths" {
+    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 17), testAtom(2, 70) };
+    atoms[1].coordinates.y = 41;
+    atoms[2].coordinates.y = -3;
+    const bonds = [_]model.Bond{
+        .{
+            .id = core.ids.BondId.fromIndex(0),
+            .input_index = 0,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(1),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+        .{
+            .id = core.ids.BondId.fromIndex(1),
+            .input_index = 1,
+            .start = core.ids.AtomId.fromIndex(0),
+            .end = core.ids.AtomId.fromIndex(2),
+            .input_order = .single,
+            .effective_order = .single,
+        },
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+
+    _ = try orientComponents(std.testing.allocator, &atoms, &bonds, graph, rings, null);
+    for (atoms) |atom| {
+        try std.testing.expectEqual(core.math.roundToTwoDecimalDigits(atom.coordinates.x), atom.coordinates.x);
+        try std.testing.expectEqual(core.math.roundToTwoDecimalDigits(atom.coordinates.y), atom.coordinates.y);
+    }
+}
+
 test "global orientation reports constrained components instead of silently skipping them" {
     var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 0) };
     atoms[0].constrained = true;
@@ -1779,7 +1857,9 @@ test "first crossing proximity pair mirrors only its local component" {
 }
 
 test "proximity child aligns interaction site with parent free valence" {
-    var atoms = [_]model.Atom{ testAtom(0, 0), testAtom(1, 50), testAtom(2, 0), testAtom(3, 50) };
+    var atoms = [_]model.Atom{
+        testAtom(0, 0), testAtom(1, 50), testAtom(2, 200), testAtom(3, 0), testAtom(4, 50),
+    };
     const bonds = [_]model.Bond{
         .{
             .id = core.ids.BondId.fromIndex(0),
@@ -1792,8 +1872,8 @@ test "proximity child aligns interaction site with parent free valence" {
         .{
             .id = core.ids.BondId.fromIndex(1),
             .input_index = 1,
-            .start = core.ids.AtomId.fromIndex(2),
-            .end = core.ids.AtomId.fromIndex(3),
+            .start = core.ids.AtomId.fromIndex(3),
+            .end = core.ids.AtomId.fromIndex(4),
             .input_order = .single,
             .effective_order = .single,
         },
@@ -1804,21 +1884,56 @@ test "proximity child aligns interaction site with parent free valence" {
     defer rings.deinit();
     const relations = [_]ProximityRelation{.{
         .start = core.ids.AtomId.fromIndex(1),
-        .end = core.ids.AtomId.fromIndex(2),
+        .end = core.ids.AtomId.fromIndex(3),
     }};
-    var placed = [_]bool{ true, false };
+    var placed = [_]bool{ true, true, false };
     try std.testing.expect(try placeProximityChild(
         &atoms,
         graph,
         rings,
         &relations,
-        core.ids.MoleculeId.fromIndex(1),
+        core.ids.MoleculeId.fromIndex(2),
         core.ids.MoleculeId.fromIndex(0),
         &placed,
     ));
-    try std.testing.expectEqual(Vec2{ .x = 200 }, atoms[2].coordinates);
-    try std.testing.expectEqual(Vec2{ .x = 250 }, atoms[3].coordinates);
-    try std.testing.expect(placed[1]);
+    // The ideal interaction point at x=200 is occupied. Upstream's dedicated
+    // 10-unit, 15-level ligand grid accepts the first boundary-clear point at
+    // x=290; using the ordinary 50-unit component grid would place it at 300.
+    try std.testing.expectEqual(Vec2{ .x = 290 }, atoms[3].coordinates);
+    try std.testing.expectEqual(Vec2{ .x = 340 }, atoms[4].coordinates);
+    try std.testing.expect(placed[2]);
+}
+
+test "general proximity meta graph re-enters canonical ordering" {
+    var atoms: [8]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = testAtom(@intCast(index), 0);
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &.{});
+    defer graph.deinit();
+    const relations = [_]ProximityRelation{
+        .{ .start = core.ids.AtomId.fromIndex(6), .end = core.ids.AtomId.fromIndex(2) },
+        .{ .start = core.ids.AtomId.fromIndex(6), .end = core.ids.AtomId.fromIndex(1) },
+        .{ .start = core.ids.AtomId.fromIndex(2), .end = core.ids.AtomId.fromIndex(1) },
+        .{ .start = core.ids.AtomId.fromIndex(6), .end = core.ids.AtomId.fromIndex(3) },
+        .{ .start = core.ids.AtomId.fromIndex(7), .end = core.ids.AtomId.fromIndex(0) },
+        .{ .start = core.ids.AtomId.fromIndex(7), .end = core.ids.AtomId.fromIndex(5) },
+        .{ .start = core.ids.AtomId.fromIndex(7), .end = core.ids.AtomId.fromIndex(4) },
+    };
+    const coordinates = (try generateMetaCoordinates(std.testing.allocator, graph, &relations, relations.len)).?;
+    defer std.testing.allocator.free(coordinates);
+    const expected = [_]Vec2{
+        .{ .x = 142.35, .y = -57.85 },
+        .{ .x = -46.66, .y = -12.47 },
+        .{ .x = -3.38, .y = -37.50 },
+        .{ .x = 21.69, .y = 55.78 },
+        .{ .x = 98.78, .y = -132.69 },
+        .{ .x = 185.38, .y = -133.00 },
+        .{ .x = -3.34, .y = 12.50 },
+        .{ .x = 142.17, .y = -107.85 },
+    };
+    for (coordinates, expected) |actual, want| {
+        try std.testing.expectApproxEqAbs(want.x, actual.x, 0.01);
+        try std.testing.expectApproxEqAbs(want.y, actual.y, 0.01);
+    }
 }
 
 test "proximity arrangement leaves unrelated components for ordinary placement" {

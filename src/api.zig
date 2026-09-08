@@ -331,7 +331,7 @@ test "public generation emits caller-ordered coordinates and every normalization
     for (bonds) |bond| {
         const delta_x = result.coordinates[bond.start].x - result.coordinates[bond.end].x;
         const delta_y = result.coordinates[bond.start].y - result.coordinates[bond.end].y;
-        try std.testing.expectApproxEqAbs(bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.001);
+        try std.testing.expectApproxEqAbs(bond_length, @sqrt(delta_x * delta_x + delta_y * delta_y), 0.01);
     }
     // A successful call that returned zeroed storage would pass every length
     // assertion above; these are the facts that separate the two.

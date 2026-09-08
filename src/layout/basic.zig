@@ -1089,8 +1089,8 @@ fn fallbackOnValid3dCoordinates(atoms: []model.Atom, members: []const core.ids.A
             // rounding keeps the emergency pose on the same two-decimal grid as
             // the rest of the layout.
             atoms[atom.index()].coordinates = .{
-                .x = roundToTwoDecimalDigits(source.x * 35),
-                .y = roundToTwoDecimalDigits(-source.y * 35),
+                .x = core.math.roundToTwoDecimalDigits(source.x * 35),
+                .y = core.math.roundToTwoDecimalDigits(-source.y * 35),
             };
         }
     }
@@ -1177,8 +1177,8 @@ fn avoidInternalClashes(
             if (graph.degree(other) == 1) {
                 const pushed = add(atoms[other_index].coordinates, displacement);
                 atoms[other_index].coordinates = .{
-                    .x = roundToTwoDecimalDigits(pushed.x),
-                    .y = roundToTwoDecimalDigits(pushed.y),
+                    .x = core.math.roundToTwoDecimalDigits(pushed.x),
+                    .y = core.math.roundToTwoDecimalDigits(pushed.y),
                 };
             }
         }
@@ -1188,10 +1188,6 @@ fn avoidInternalClashes(
 fn isBonded(graph: topology.Graph, first: core.ids.AtomId, second: core.ids.AtomId) bool {
     for (graph.neighbors(first)) |neighbor| if (neighbor == second) return true;
     return false;
-}
-
-fn roundToTwoDecimalDigits(value: f32) f32 {
-    return @floor(value * 100 + 0.5) * 0.01;
 }
 
 fn fragmentCenter(atoms: []const model.Atom, members: []const core.ids.AtomId) core.math.Vec2 {
@@ -1419,7 +1415,14 @@ fn placeAcyclicNeighbours(
         // slot in the angle list without advancing the running direction.
         if (placed[neighbor.index()] and fragmentation.atom_fragment[neighbor.index()] == fragment) continue;
         direction = rotateClockwise(direction, angle);
-        atoms[neighbor.index()].coordinates = add(atoms[center.index()].coordinates, direction);
+        const coordinate = add(atoms[center.index()].coordinates, direction);
+        // Every upstream Atom::setCoordinates write rounds to hundredths.
+        // Retaining the raw trig result can put a nominally straight bend on
+        // the opposite side of zero when continuous minimization starts.
+        atoms[neighbor.index()].coordinates = .{
+            .x = core.math.roundToTwoDecimalDigits(coordinate.x),
+            .y = core.math.roundToTwoDecimalDigits(coordinate.y),
+        };
         // A neighbour outside this fragment is written but neither visited nor
         // queued: the write is what tells its own fragment where its attachment
         // atom goes, and `FragmentFrames.store` reads it before the next
@@ -1942,7 +1945,7 @@ test "macrocycles dispatch through native polyomino placement" {
         try std.testing.expectApproxEqAbs(
             bond_length,
             distance(atoms[bond.start.index()].coordinates, atoms[bond.end.index()].coordinates),
-            0.001,
+            0.01,
         );
     }
     try std.testing.expect(@abs(distance(
@@ -2267,7 +2270,7 @@ test "fragment assembly preserves every acyclic parent bond length" {
         try std.testing.expectApproxEqAbs(
             distance(atoms[left].coordinates, atoms[right].coordinates),
             distance(reversed_atoms[left].coordinates, reversed_atoms[right].coordinates),
-            0.001,
+            0.01,
         );
     };
 }
