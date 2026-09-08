@@ -28,7 +28,8 @@ pub fn divide(vector: Vec2, divisor: Scalar) Vec2 {
 }
 
 pub fn dot(a: Vec2, b: Vec2) Scalar {
-    return a.x * b.x + a.y * b.y;
+    // The pinned Clang build contracts upstream's multiply-add expression.
+    return @mulAdd(Scalar, a.x, b.x, a.y * b.y);
 }
 
 pub fn cross(a: Vec2, b: Vec2) Scalar {
@@ -106,7 +107,11 @@ fn radiansToDegrees(radians: Scalar) Scalar {
 pub fn signedAngle(p1: Vec2, p2: Vec2, p3: Vec2) Scalar {
     const first = subtract(p1, p2);
     const second = subtract(p3, p2);
-    return radiansToDegrees(std.math.atan2(cross(first, second), dot(first, second)));
+    // Clang contracts upstream's `x1 * y2 - y1 * x2` expression into an FMA.
+    // Keep that single-rounding residue: even the angle from a vector to
+    // itself can be microscopically negative, which anchors clockwise ties.
+    const cross_product = @mulAdd(Scalar, first.x, second.y, -(first.y * second.x));
+    return radiansToDegrees(std.math.atan2(cross_product, dot(first, second)));
 }
 
 /// Unsigned p1-p2-p3 angle in degrees, including upstream's epsilon floor for
@@ -136,7 +141,10 @@ pub fn projectPointOnLine(point: Vec2, line_start: Vec2, line_end: Vec2) Vec2 {
     var squared_segment_length = squaredLength(direction);
     if (squared_segment_length < epsilon) squared_segment_length = epsilon;
     const parameter = dot(from_start, direction) / squared_segment_length;
-    return add(line_start, scale(direction, parameter));
+    return .{
+        .x = @mulAdd(Scalar, parameter, direction.x, line_start.x),
+        .y = @mulAdd(Scalar, parameter, direction.y, line_start.y),
+    };
 }
 
 pub const PointSegmentDistance = struct {
@@ -166,7 +174,11 @@ pub fn squaredDistancePointSegment(point: Vec2, start: Vec2, end: Vec2) PointSeg
     } else if (raw_parameter > 1) {
         squared_distance = squaredLength(to_end);
     } else {
-        squared_distance = squaredLength(subtract(point, add(start, scale(segment, raw_parameter))));
+        const projection = Vec2{
+            .x = @mulAdd(Scalar, raw_parameter, segment.x, start.x),
+            .y = @mulAdd(Scalar, raw_parameter, segment.y, start.y),
+        };
+        squared_distance = squaredLength(subtract(point, projection));
     }
     if (squared_distance < epsilon) squared_distance = epsilon;
     return .{ .squared_distance = squared_distance, .parameter = parameter };
@@ -243,6 +255,10 @@ test "vector arithmetic preserves upstream degeneracy and rotation semantics" {
     try std.testing.expectEqual(Vec2{ .x = 4, .y = 2 }, add(.{ .x = 1, .y = 4 }, .{ .x = 3, .y = -2 }));
     try std.testing.expectEqual(Vec2{ .x = -2, .y = 6 }, subtract(.{ .x = 1, .y = 4 }, .{ .x = 3, .y = -2 }));
     try std.testing.expectEqual(@as(Scalar, 5), dot(.{ .x = 1, .y = 2 }, .{ .x = 3, .y = 1 }));
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0xc9d1a1e6))),
+        dot(.{ .x = -1757.9722, .y = -700.3646 }, .{ .x = 1009.6434, .y = -82.26597 }),
+    );
     try std.testing.expectEqual(@as(Scalar, -5), cross(.{ .x = 1, .y = 2 }, .{ .x = 3, .y = 1 }));
 
     const degenerate = Vec2{ .x = 0.005, .y = 0 };
@@ -265,6 +281,10 @@ test "angles coincidence and half-plane predicates match upstream boundaries" {
     try std.testing.expectEqual(@as(Scalar, @bitCast(@as(u32, 0x427dbd64))), signedAngle(.{ .x = 1, .y = 2 }, origin, .{ .x = -3, .y = 4 }));
     try std.testing.expectEqual(@as(Scalar, @bitCast(@as(u32, 0x427dbd64))), unsignedAngle(.{ .x = 1, .y = 2 }, origin, .{ .x = -3, .y = 4 }));
     try std.testing.expectEqual(@as(Scalar, @bitCast(@as(u32, 0xc1a84cd3))), signedAngle(.{ .x = -10, .y = -10 }, origin, .{ .x = -9, .y = -4 }));
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0xb4954269))),
+        signedAngle(.{ .x = 64.34, .y = -27.58 }, origin, .{ .x = 64.34, .y = -27.58 }),
+    );
     try std.testing.expectApproxEqAbs(@as(Scalar, @bitCast(@as(u32, 0x428f214f))), unsignedAngle(.{ .x = -10, .y = -10 }, origin, .{ .x = -8, .y = 4 }), 0.00001);
     try std.testing.expectApproxEqAbs(@as(Scalar, 90), unsignedAngle(origin, origin, .{ .x = 1 }), 0.00001);
     try std.testing.expect(std.math.isNan(unsignedAngle(.{ .x = std.math.nan(Scalar) }, origin, .{ .x = 1 })));

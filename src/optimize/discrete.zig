@@ -136,8 +136,8 @@ pub const FramePose = struct {
 
 fn roundCoordinate(value: core.math.Vec2) core.math.Vec2 {
     return .{
-        .x = @floor(value.x * 100 + 0.5) * 0.01,
-        .y = @floor(value.y * 100 + 0.5) * 0.01,
+        .x = core.math.roundToTwoDecimalDigits(value.x),
+        .y = core.math.roundToTwoDecimalDigits(value.y),
     };
 }
 
