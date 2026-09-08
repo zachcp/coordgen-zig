@@ -409,27 +409,40 @@ fn placeFragmentRings(
         }
     }
     var pentagon_minimization = false;
-    var remaining: usize = fragment.ring_count;
-    while (remaining != 0) {
+    const side_rings = try collectSideRings(allocator, membership, analysis, fragmentation, fragment);
+    defer allocator.free(side_rings);
+    var central_remaining: usize = fragment.ring_count - side_rings.len;
+    var side_remaining: usize = side_rings.len;
+    while (central_remaining != 0 or side_remaining != 0) {
         var selected: ?model.Ring = null;
         var selected_shared: usize = 0;
         var selected_score: usize = 0;
-        for (membership.rings) |ring| {
-            const ring_atoms = membership.atoms(ring.id);
-            if (ring_atoms.len < 3 or
-                fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id) continue;
-            var already_complete = true;
-            var shared: usize = 0;
-            for (ring_atoms) |atom| {
-                already_complete = already_complete and placed[atom.index()];
-                shared += @intFromBool(placed[atom.index()]);
+        if (central_remaining != 0) {
+            for (membership.rings) |ring| {
+                const ring_atoms = membership.atoms(ring.id);
+                if (ring_atoms.len < 3 or
+                    fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id or
+                    std.mem.indexOfScalar(core.ids.RingId, side_rings, ring.id) != null) continue;
+                var already_complete = true;
+                var shared: usize = 0;
+                for (ring_atoms) |atom| {
+                    already_complete = already_complete and placed[atom.index()];
+                    shared += @intFromBool(placed[atom.index()]);
+                }
+                if (already_complete) continue;
+                const score = ringPriority(membership, analysis, ring, shared != 0);
+                if (selected == null or score > selected_score) {
+                    selected = ring;
+                    selected_shared = shared;
+                    selected_score = score;
+                }
             }
-            if (already_complete) continue;
-            const score = ringPriority(membership, analysis, ring, shared != 0);
-            if (selected == null or score > selected_score) {
-                selected = ring;
-                selected_shared = shared;
-                selected_score = score;
+        } else {
+            side_remaining -= 1;
+            const ring_id = side_rings[side_remaining];
+            selected = membership.rings[ring_id.index()];
+            for (membership.atoms(ring_id)) |atom| {
+                selected_shared += @intFromBool(placed[atom.index()]);
             }
         }
         const ring = selected orelse break;
@@ -449,11 +462,11 @@ fn placeFragmentRings(
                 // hexagonal lattice, and upstream requires minimization for
                 // exactly that case.
                 if (shape_result == .matched_needs_minimization) pentagon_minimization = true;
-                remaining -= 1;
+                if (central_remaining != 0) central_remaining -= 1;
                 continue;
             }
             if (try openCycleAndGenerateCoordinates(allocator, ring.id, atoms, bonds, graph, membership, placed)) {
-                remaining -= 1;
+                if (central_remaining != 0) central_remaining -= 1;
                 continue;
             }
         }
@@ -469,7 +482,15 @@ fn placeFragmentRings(
             // where the two disagree and where the wrong mirror gets picked.
             const parent = selectParentRing(membership, analysis, ring.id, placed) orelse
                 return error.InvalidMapping;
-            try alignFusedRing(atoms, ordered, local, placed, membership.atoms(parent));
+            try alignFusedRing(
+                atoms,
+                ordered,
+                local,
+                placed,
+                membership.atoms(parent),
+                fragmentation.members(fragment.id),
+                central_remaining == 0,
+            );
         } else if (selected_shared == 1) {
             var pivot: usize = 0;
             for (ordered, 0..) |atom, index| if (placed[atom.index()]) {
@@ -494,7 +515,7 @@ fn placeFragmentRings(
                 placed[atom.index()] = true;
             }
         }
-        remaining -= 1;
+        if (central_remaining != 0) central_remaining -= 1;
     }
     // Upstream reaches maybeMinimizeRings only after the loop above has drained
     // its ring vector — `while (!rings.empty()) { ... rings.erase(...); }` —
@@ -509,6 +530,45 @@ fn placeFragmentRings(
     // call site hands it, which upstream leaves empty.
     const rings_left_after_placement: []const core.ids.RingId = &.{};
     return pentagon_minimization or maybeMinimizeRings(membership, rings_left_after_placement);
+}
+
+fn collectSideRings(
+    allocator: std.mem.Allocator,
+    membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
+    fragmentation: fragments.Fragmentation,
+    fragment: fragments.Fragment,
+) core.errors.Error![]core.ids.RingId {
+    const chosen = allocator.alloc(bool, membership.rings.len) catch return error.OutOfMemory;
+    defer allocator.free(chosen);
+    @memset(chosen, false);
+    var side: std.ArrayList(core.ids.RingId) = .empty;
+    defer side.deinit(allocator);
+    var found = true;
+    while (found) {
+        found = false;
+        for (membership.rings) |ring| {
+            const ring_atoms = membership.atoms(ring.id);
+            if (ring_atoms.len < 3 or
+                fragmentation.atom_fragment[ring_atoms[0].index()] != fragment.id or
+                chosen[ring.id.index()] or
+                ring_atoms.len >= topology.rings.macrocycle_size) continue;
+            var neighbours: usize = 0;
+            for (analysis.fusedWith(ring.id)) |fusion| {
+                if (chosen[fusion.other.index()]) continue;
+                neighbours += 1;
+                const other_size = membership.atoms(fusion.other).len;
+                if (other_size >= topology.rings.macrocycle_size) neighbours += 1;
+                const shared = analysis.fusionAtoms(fusion).len;
+                if (shared > 3 or (shared == 3 and ring_atoms.len == 4 and other_size == 4)) neighbours += 1;
+            }
+            if (neighbours != 1) continue;
+            side.append(allocator, ring.id) catch return error.OutOfMemory;
+            chosen[ring.id.index()] = true;
+            found = true;
+        }
+    }
+    return side.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 /// `findCentralRingOfSystem` for a system where nothing has been placed yet, so
@@ -813,6 +873,8 @@ fn alignFusedRing(
     local: []const core.math.Vec2,
     placed: []bool,
     parent_atoms: []const core.ids.AtomId,
+    fragment_atoms: []const core.ids.AtomId,
+    side_ring: bool,
 ) core.errors.Error!void {
     var first: ?usize = null;
     var last: usize = 0;
@@ -820,10 +882,27 @@ fn alignFusedRing(
     // upstream's `fusionAtoms`, not every atom already placed: a ring fused to
     // two drawn rings shares atoms with both, and only the parent's pair
     // defines the axis the two candidates differ across.
-    for (ordered, 0..) |atom, index| {
-        if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) == null) continue;
-        if (first == null) first = index;
-        last = index;
+    if (side_ring) {
+        // initializeFusedRingInformation appends shared atoms while walking
+        // the fragment's atom vector. Its first and last entries define the
+        // side-ring alignment axis; ring-cycle order is not interchangeable
+        // for three-atom fusions.
+        for (fragment_atoms) |atom| {
+            if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) == null) continue;
+            const index = std.mem.indexOfScalar(core.ids.AtomId, ordered, atom) orelse continue;
+            if (first == null) first = index;
+            last = index;
+        }
+    } else {
+        // Central fused macrocycles still use the established cycle-order
+        // alignment path. Their coordinate generator has a separate residual
+        // parity seam (cgz-l3s), so changing that path here regresses its
+        // frozen drug_like/3 ceiling.
+        for (ordered, 0..) |atom, index| {
+            if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) == null) continue;
+            if (first == null) first = index;
+            last = index;
+        }
     }
     const first_index = first orelse return error.InvalidMapping;
     if (first_index == last) return error.InvalidMapping;
@@ -860,9 +939,17 @@ fn alignFusedRing(
     // centre, and native's spanned 1.140 to 1.171 (cgz-vu0).
     for (ordered, local) |atom, coordinate| {
         const candidate = transformFromPivot(coordinate, source_first, target_first, rotation);
-        atoms[atom.index()].coordinates = if (use_mirror) reflectAcrossLine(candidate, target_first, target_last) else candidate;
+        const result = if (use_mirror) reflectAcrossLine(candidate, target_first, target_last) else candidate;
+        atoms[atom.index()].coordinates = if (side_ring) roundedCoordinate(result) else result;
         placed[atom.index()] = true;
     }
+}
+
+fn roundedCoordinate(coordinate: core.math.Vec2) core.math.Vec2 {
+    return .{
+        .x = core.math.roundToTwoDecimalDigits(coordinate.x),
+        .y = core.math.roundToTwoDecimalDigits(coordinate.y),
+    };
 }
 
 fn transformFromPivot(point: core.math.Vec2, source: core.math.Vec2, target: core.math.Vec2, rotation: f32) core.math.Vec2 {
@@ -2115,6 +2202,46 @@ test "fused rings align on their shared edge and extend outward" {
         layoutAndDiscard,
         .{ &atoms, &bonds, graph, rings, split },
     );
+}
+
+test "leaf fused rings are stripped into upstream LIFO placement order" {
+    // Two five-rings share the three-atom path 0-6-5. Discovery lists the ring
+    // through atom 1 first; simplifyRingSystem strips it, leaving the ring
+    // through atom 4 to seed coordinates before the side ring is popped.
+    var atoms: [8]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    const pairs = [_][2]u32{
+        .{ 0, 1 }, .{ 1, 3 }, .{ 3, 5 }, .{ 5, 6 }, .{ 6, 0 },
+        .{ 0, 4 }, .{ 4, 7 }, .{ 7, 5 },
+    };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    defer analysis.deinit();
+
+    const fragment = split.fragments[split.atom_fragment[0].index()];
+    const side = try collectSideRings(std.testing.allocator, rings, analysis, split, fragment);
+    defer std.testing.allocator.free(side);
+    try std.testing.expectEqual(@as(usize, 1), side.len);
+    try std.testing.expect(std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(side[0]), core.ids.AtomId.fromIndex(1)) != null);
+    try std.testing.expect(std.mem.indexOfScalar(core.ids.AtomId, rings.atoms(side[0]), core.ids.AtomId.fromIndex(4)) == null);
 }
 
 test "the third ring of a linear acene mirrors away from its parent ring, not from everything drawn" {
