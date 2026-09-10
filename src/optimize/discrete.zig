@@ -179,10 +179,15 @@ pub const FramePoseEvaluator = struct {
         }
         @memcpy(self.pose.atom_coordinates, self.base_atom_coordinates);
         @memcpy(self.pose.attachment_coordinates, self.base_attachment_coordinates);
+        // Fragment::setCoordinates first writes the stored frame through each
+        // Atom setter, which rounds the base pose before any DOF is applied.
+        for (self.pose.atom_coordinates) |*coordinate_value| coordinate_value.* = roundCoordinate(coordinate_value.*);
+        for (self.pose.attachment_coordinates) |*coordinate_value| coordinate_value.* = roundCoordinate(coordinate_value.*);
         for (self.dofs, states) |*dof, state| {
             if (state >= dof.state.count) return error.InvalidMapping;
             dof.state.current = state;
-            try applyToFrame(dof.*, try affectedAtoms(self.affected_atoms, dof.*), self.pose);
+            const affected = try affectedAtoms(self.affected_atoms, dof.*);
+            try applyToFrame(dof.*, affected, self.pose);
         }
         try self.pose.rebuild();
         // Fragment construction can propagate a scale-atoms DOF onto the
@@ -204,7 +209,7 @@ pub const FramePoseEvaluator = struct {
                         error.InvalidMapping => {
                             if (!atom.isValid() or atom.index() >= self.pose.global_coordinates.len) return error.InvalidAtomIndex;
                             const coordinate = &self.pose.global_coordinates[atom.index()];
-                            coordinate.* = add(pivot, scale(subtract(coordinate.*, pivot), 0.4));
+                            coordinate.* = roundCoordinate(add(pivot, scale(subtract(coordinate.*, pivot), 0.4)));
                             continue;
                         },
                         else => return err,
@@ -917,7 +922,7 @@ pub fn applyToFrame(dof: core.dof.Dof, affected: []const core.ids.AtomId, pose: 
                     error.InvalidMapping => continue,
                     else => return err,
                 };
-                coordinate_value.* = add(pivot, scale(subtract(coordinate_value.*, pivot), 0.4));
+                coordinate_value.* = roundCoordinate(add(pivot, scale(subtract(coordinate_value.*, pivot), 0.4)));
             }
         },
         .scale_fragment => try transformWholeFrame(pose, dof.fragment, .{ .scale = stateFactor(1.4, dof.state.current) }),
@@ -928,7 +933,7 @@ pub fn applyToFrame(dof: core.dof.Dof, affected: []const core.ids.AtomId, pose: 
             const line_b = subtract(pivot, .{ .x = bond.y, .y = -bond.x });
             for (affected) |atom| {
                 const coordinate_value = try pose.coordinate(dof.fragment, atom);
-                coordinate_value.* = reflect(coordinate_value.*, line_a, line_b);
+                coordinate_value.* = roundCoordinate(reflect(coordinate_value.*, line_a, line_b));
             }
         },
         .flip_ring => |payload| {
@@ -936,7 +941,7 @@ pub fn applyToFrame(dof: core.dof.Dof, affected: []const core.ids.AtomId, pose: 
             const line_b = (try pose.coordinate(dof.fragment, payload.pivot_b)).*;
             for (affected) |atom| {
                 const coordinate_value = try pose.coordinate(dof.fragment, atom);
-                coordinate_value.* = reflect(coordinate_value.*, line_a, line_b);
+                coordinate_value.* = roundCoordinate(reflect(coordinate_value.*, line_a, line_b));
             }
         },
     }
@@ -957,15 +962,17 @@ fn transformWholeFrame(pose: FramePose, fragment: core.ids.FragmentId, transform
 }
 
 fn applyFrameTransform(coordinate_value: *core.math.Vec2, transform: FrameTransform) void {
-    switch (transform) {
-        .flip_y => coordinate_value.y = -coordinate_value.y,
-        .translate_x => |amount| coordinate_value.x += amount,
-        .rotate => |rotation| coordinate_value.* = add(
+    // Every upstream DOF write goes through Atom::setCoordinates, so each
+    // transform is rounded before the next DOF observes it.
+    coordinate_value.* = roundCoordinate(switch (transform) {
+        .flip_y => .{ .x = coordinate_value.x, .y = -coordinate_value.y },
+        .translate_x => |amount| .{ .x = coordinate_value.x + amount, .y = coordinate_value.y },
+        .rotate => |rotation| add(
             geometry.rotate(subtract(coordinate_value.*, rotation.origin), rotation.sine, rotation.cosine),
             rotation.origin,
         ),
-        .scale => |factor| coordinate_value.* = scale(coordinate_value.*, factor),
-    }
+        .scale => |factor| scale(coordinate_value.*, factor),
+    });
 }
 
 pub fn penalty(dof: core.dof.Dof, affected_count: usize, context: PenaltyContext) !f32 {
@@ -1112,6 +1119,44 @@ test "frame rebuild preserves duplicate child anchors and parent DOFs move the c
     try std.testing.expectApproxEqAbs(@as(f32, -20), global[1].y, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 96.423836), global[2].x, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, -38.569534), global[2].y, 0.0001);
+}
+
+fn scoreSecondCoordinateX(_: ?*anyopaque, coordinates: []const core.math.Vec2, _: []const core.dof.Dof) !f32 {
+    return coordinates[1].x;
+}
+
+test "frame evaluation rounds stored coordinates before each DOF write" {
+    const frames = [_]core.dof.FragmentFrame{.{
+        .id = core.ids.FragmentId.fromIndex(0),
+        .atoms = .{ .start = 0, .len = 2 },
+        .attachments = .{ .start = 0, .len = 0 },
+    }};
+    const order = [_]core.ids.FragmentId{core.ids.FragmentId.fromIndex(0)};
+    const fragment_atoms = [_]core.ids.AtomId{ core.ids.AtomId.fromIndex(0), core.ids.AtomId.fromIndex(1) };
+    const base = [_]core.math.Vec2{ .{ .x = -11.12 }, .{ .x = -27.634163 } };
+    var local: [2]core.math.Vec2 = undefined;
+    var global: [2]core.math.Vec2 = undefined;
+    const affected = [_]core.ids.AtomId{core.ids.AtomId.fromIndex(1)};
+    var dofs = [_]core.dof.Dof{testDof(.{ .scale_atoms = .{ .pivot = core.ids.AtomId.fromIndex(0) } }, 1, 2)};
+    dofs[0].affected_atoms = .{ .start = 0, .len = 1 };
+    var evaluator = FramePoseEvaluator{
+        .dofs = &dofs,
+        .affected_atoms = &affected,
+        .pose = .{
+            .frames = &frames,
+            .rebuild_order = &order,
+            .fragment_atoms = &fragment_atoms,
+            .child_attachments = &.{},
+            .atom_coordinates = &local,
+            .attachment_coordinates = &.{},
+            .global_coordinates = &global,
+        },
+        .base_atom_coordinates = &base,
+        .base_attachment_coordinates = &.{},
+        .scorePoseFn = scoreSecondCoordinateX,
+    };
+    try std.testing.expectEqual(@as(f32, -17.72), try evaluator.evaluate(&.{1}));
+    try std.testing.expectEqual(@as(f32, -17.72), local[1].x);
 }
 
 test "DOF penalties preserve state levels and flip context" {

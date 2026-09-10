@@ -145,10 +145,9 @@ pub fn projectPointOnLine(point: Vec2, line_start: Vec2, line_end: Vec2) Vec2 {
     var squared_segment_length = squaredLength(direction);
     if (squared_segment_length < epsilon) squared_segment_length = epsilon;
     const parameter = dot(from_start, direction) / squared_segment_length;
-    return .{
-        .x = @mulAdd(Scalar, parameter, direction.x, line_start.x),
-        .y = @mulAdd(Scalar, parameter, direction.y, line_start.y),
-    };
+    // PointF's scale and add operators materialize the product before the sum;
+    // unlike direct component arithmetic, this expression is not contracted.
+    return add(line_start, scale(direction, parameter));
 }
 
 pub const PointSegmentDistance = struct {
@@ -178,11 +177,10 @@ pub fn squaredDistancePointSegment(point: Vec2, start: Vec2, end: Vec2) PointSeg
     } else if (raw_parameter > 1) {
         squared_distance = squaredLength(to_end);
     } else {
-        const projection = Vec2{
-            .x = @mulAdd(Scalar, raw_parameter, segment.x, start.x),
-            .y = @mulAdd(Scalar, raw_parameter, segment.y, start.y),
-        };
-        squared_distance = squaredLength(subtract(point, projection));
+        // Preserve the same operator boundary as projectPointOnLine above.
+        const projection = add(start, scale(segment, raw_parameter));
+        const from_projection = subtract(point, projection);
+        squared_distance = squaredLength(from_projection);
     }
     if (squared_distance < epsilon) squared_distance = epsilon;
     return .{ .squared_distance = squared_distance, .parameter = parameter };
@@ -339,6 +337,18 @@ test "projection and point segment distance preserve epsilon floors and clamping
     const nan_distance = squaredDistancePointSegment(.{ .x = std.math.nan(Scalar) }, .{}, .{ .x = 1 });
     try std.testing.expect(std.math.isNan(nan_distance.parameter));
     try std.testing.expect(std.math.isNan(nan_distance.squared_distance));
+
+    const point = Vec2{ .x = -18.88, .y = -6.61 };
+    const segment_start = Vec2{ .x = -75.46, .y = -21.17 };
+    const segment_end = Vec2{ .x = -33.55, .y = 34.9 };
+    try std.testing.expectEqual(
+        Vec2{ .x = @bitCast(@as(u32, 0xc240ca3a)), .y = @bitCast(@as(u32, 0x4174db96)) },
+        projectPointOnLine(point, segment_start, segment_end),
+    );
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0x44a77716))),
+        squaredDistancePointSegment(point, segment_start, segment_end).squared_distance,
+    );
 }
 
 test "segment intersection includes endpoints and rejects parallel lines" {
