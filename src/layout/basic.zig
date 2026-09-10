@@ -824,7 +824,9 @@ fn regularRingCoordinates(allocator: std.mem.Allocator, count: usize) core.error
     const result = allocator.alloc(core.math.Vec2, count) catch return error.OutOfMemory;
     errdefer allocator.free(result);
     var coordinate: core.math.Vec2 = .{};
-    const step = 2 * pi / @as(f32, @floatFromInt(count));
+    // Upstream evaluates `2 * M_PI / atoms.size()` in double and only then
+    // casts the ring step to float.
+    const step: f32 = @floatCast(2 * @as(f64, std.math.pi) / @as(f64, @floatFromInt(count)));
     for (result, 0..) |*destination, index| {
         destination.* = coordinate;
         const angle = step * @as(f32, @floatFromInt(index));
@@ -1970,6 +1972,14 @@ fn parentAngle(atoms: []const model.Atom, graph: topology.Graph, fragmentation: 
 }
 
 test "regular ring coordinate walk preserves the upstream bond length" {
+    const nine_ring = try regularRingCoordinates(std.testing.allocator, 9);
+    defer std.testing.allocator.free(nine_ring);
+    const upstream_step: f32 = @floatCast(2 * @as(f64, std.math.pi) / 9);
+    try std.testing.expectEqual(
+        -@sin(upstream_step) * bond_length,
+        nine_ring[2].y,
+    );
+
     var atoms: [6]model.Atom = undefined;
     var bonds: [6]model.Bond = undefined;
     for (&atoms, 0..) |*atom, index| atom.* = .{ .id = core.ids.AtomId.fromIndex(@intCast(index)), .input_index = @intCast(index), .atomic_number = .carbon };
