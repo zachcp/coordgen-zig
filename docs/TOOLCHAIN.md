@@ -4,7 +4,7 @@
 host-readable file rather than ZON because the compiler must be authenticated
 before Zig is allowed to parse `build.zig.zon`. Each supported host records the
 exact distribution archive name, byte length, SHA-256, immutable upstream URL,
-and owner-controlled mirror URL.
+owner-controlled mirror URL, and community-mirror fallback URL.
 
 `tools/bootstrap-zig` detects the host, downloads the selected distribution,
 checks its byte length and SHA-256 before extraction, and then checks the
@@ -18,9 +18,11 @@ exists, using the bump procedure below.
 
 ## Mirror requirement
 
-The mirror column is currently `UNCONFIGURED` because this repository has no
-remote and no owner-controlled artifact endpoint was supplied. The bootstrap
-therefore warns and uses the exact checksummed Zig CDN URL. Set
+The owner-controlled mirror column is currently `UNCONFIGURED` because no
+project artifact endpoint was supplied. The pinned development archives have
+since aged out of the Zig CDN, so bootstrap warns and uses the explicitly
+recorded community mirror while retaining the locked byte-length, SHA-256, and
+exact-version checks. Set
 `CGZ_REQUIRE_TOOLCHAIN_MIRROR=1` to make this missing external input fatal.
 Replace each marker with an immutable URL under project control before closing
 the toolchain provenance issue; the existing SHA-256 remains authoritative.

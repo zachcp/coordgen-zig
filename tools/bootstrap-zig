@@ -45,6 +45,7 @@ expected_sha=$(target_value "$host" 4)
 expected_bytes=$(target_value "$host" 5)
 upstream_url=$(target_value "$host" 6)
 mirror_url=$(target_value "$host" 7)
+community_mirror_url=$(target_value "$host" 8)
 
 [ -n "$version" ] || fail "missing version"
 [ -n "$archive" ] || fail "host $host is not pinned"
@@ -54,8 +55,13 @@ if [ "$mirror_url" = UNCONFIGURED ]; then
     if [ "${CGZ_REQUIRE_TOOLCHAIN_MIRROR:-0}" = 1 ]; then
         fail "owner-controlled mirror is not configured for $host"
     fi
-    echo "bootstrap-zig: warning: owner-controlled mirror is not configured; using exact upstream URL" >&2
-    download_url=$upstream_url
+    if [ -n "$community_mirror_url" ]; then
+        echo "bootstrap-zig: warning: owner-controlled mirror is not configured; using checksummed community mirror" >&2
+        download_url=$community_mirror_url
+    else
+        echo "bootstrap-zig: warning: owner-controlled mirror is not configured; using exact upstream URL" >&2
+        download_url=$upstream_url
+    fi
 else
     download_url=$mirror_url
 fi
