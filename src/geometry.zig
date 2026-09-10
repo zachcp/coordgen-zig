@@ -33,11 +33,13 @@ pub fn dot(a: Vec2, b: Vec2) Scalar {
 }
 
 pub fn cross(a: Vec2, b: Vec2) Scalar {
-    return a.x * b.y - a.y * b.x;
+    // Keep parity with Clang's contracted multiply-subtract in PointF.
+    return @mulAdd(Scalar, a.x, b.y, -(a.y * b.x));
 }
 
 pub fn squaredLength(vector: Vec2) Scalar {
-    return vector.x * vector.x + vector.y * vector.y;
+    // Keep parity with Clang's contracted multiply-add in PointF.
+    return @mulAdd(Scalar, vector.x, vector.x, vector.y * vector.y);
 }
 
 /// Matches sketcherMinimizerPointF::length: vectors whose squared length is
@@ -57,9 +59,10 @@ pub fn normalize(vector: Vec2) Vec2 {
 /// Rotate using upstream's screen-coordinate convention. Positive sine turns
 /// (1, 0) toward (0, -1), clockwise in conventional Cartesian coordinates.
 pub fn rotate(vector: Vec2, sine: Scalar, cosine: Scalar) Vec2 {
+    // PointF::rotate contracts each multiply-add in the pinned Clang build.
     return .{
-        .x = vector.x * cosine + vector.y * sine,
-        .y = -vector.x * sine + vector.y * cosine,
+        .x = @mulAdd(Scalar, vector.x, cosine, vector.y * sine),
+        .y = @mulAdd(Scalar, -vector.x, sine, vector.y * cosine),
     };
 }
 
@@ -71,7 +74,8 @@ pub fn parallelComponent(vector: Vec2, axis: Vec2) Vec2 {
 pub fn squaredDistance(a: Vec2, b: Vec2) Scalar {
     const dx = a.x - b.x;
     const dy = a.y - b.y;
-    return dx * dx + dy * dy;
+    // PointF::squaredDistance contracts the sum in the pinned Clang build.
+    return @mulAdd(Scalar, dx, dx, dy * dy);
 }
 
 pub fn pointsCoincide(a: Vec2, b: Vec2) bool {
@@ -260,6 +264,25 @@ test "vector arithmetic preserves upstream degeneracy and rotation semantics" {
         dot(.{ .x = -1757.9722, .y = -700.3646 }, .{ .x = 1009.6434, .y = -82.26597 }),
     );
     try std.testing.expectEqual(@as(Scalar, -5), cross(.{ .x = 1, .y = 2 }, .{ .x = 3, .y = 1 }));
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0x467dcab5))),
+        cross(
+            .{ .x = -154.942642, .y = 181.409866 },
+            .{ .x = -181.409866, .y = 107.567947 },
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0x4671db1b))),
+        squaredLength(.{ .x = -123.949234, .y = -10.7407618 }),
+    );
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0x467dcab5))),
+        rotate(.{ .x = -154.942642, .y = 181.409866 }, 181.409866, 107.567947).x,
+    );
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0x4671db1b))),
+        squaredDistance(.{ .x = -123.949234, .y = -10.7407618 }, .{}),
+    );
 
     const degenerate = Vec2{ .x = 0.005, .y = 0 };
     try std.testing.expectEqual(@as(Scalar, 0), length(degenerate));
