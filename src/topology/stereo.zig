@@ -88,6 +88,7 @@ const Branch = struct {
         std.mem.sort(u32, shell.items, {}, std.sort.desc(u32));
         self.frontier.deinit(self.allocator);
         self.frontier = next;
+        next = .empty;
         return shell.toOwnedSlice(allocator) catch return error.OutOfMemory;
     }
 };

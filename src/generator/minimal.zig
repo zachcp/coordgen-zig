@@ -412,8 +412,80 @@ fn minimizeGenerated(
             if (try interactionComponent(interaction, graph) != component) continue;
             component_interactions.append(allocator, interaction) catch return error.OutOfMemory;
         }
-        _ = try optimize.minimizeMolecule(allocator, atoms, component_interactions.items, .{}, null);
+        const stereo_context = MinimizationStereoContext{
+            .allocator = allocator,
+            .bonds = bonds,
+            .graph = graph,
+            .rings = rings,
+            .component = component,
+        };
+        _ = try optimize.minimizeMolecule(allocator, atoms, component_interactions.items, .{}, .{
+            .context = &stereo_context,
+            .validateFn = validateMinimizedStereo,
+        });
     }
+}
+
+const MinimizationStereoContext = struct {
+    allocator: std.mem.Allocator,
+    bonds: []const model.Bond,
+    graph: topology.Graph,
+    rings: topology.RingMembership,
+    component: core.ids.MoleculeId,
+};
+
+fn validateMinimizedStereo(raw_context: *const anyopaque, atoms: []const model.Atom) core.errors.Error!bool {
+    const context: *const MinimizationStereoContext = @ptrCast(@alignCast(raw_context));
+    for (context.bonds) |bond| {
+        if (context.graph.component(bond.start) != context.component or bond.effective_order != .double) continue;
+        var in_small_ring = false;
+        for (context.rings.bondRings(bond.id)) |ring| {
+            if (context.rings.atoms(ring).len < topology.rings.macrocycle_size) in_small_ring = true;
+        }
+        if (in_small_ring) continue;
+        const start_neighbor = (try topology.stereo.firstNeighbor(context.allocator, atoms, context.bonds, context.graph, bond.start, bond.end)) orelse continue;
+        const end_neighbor = (try topology.stereo.firstNeighbor(context.allocator, atoms, context.bonds, context.graph, bond.end, bond.start)) orelse continue;
+        const absolute = if (bond.stereo == .unspecified)
+            core.chemistry.BondStereo.e
+        else
+            try topology.stereo.absoluteBondStereo(context.allocator, atoms, context.bonds, context.graph, context.rings, bond.id);
+        if (!topology.stereo.geometryMatches(atoms, bond, start_neighbor, end_neighbor, absolute)) return false;
+    }
+    return true;
+}
+
+test "minimization preserves unspecified acyclic double-bond geometry" {
+    var atoms = [_]model.Atom{
+        .{ .id = core.ids.AtomId.fromIndex(0), .input_index = 0, .atomic_number = .carbon, .coordinates = .{ .y = 1 } },
+        .{ .id = core.ids.AtomId.fromIndex(1), .input_index = 1, .atomic_number = .carbon },
+        .{ .id = core.ids.AtomId.fromIndex(2), .input_index = 2, .atomic_number = .carbon, .coordinates = .{ .x = 1 } },
+        .{ .id = core.ids.AtomId.fromIndex(3), .input_index = 3, .atomic_number = .carbon, .coordinates = .{ .x = 1, .y = 1 } },
+    };
+    const pairs = [_][2]u32{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 } };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = if (index == 1) .double else .single,
+        .effective_order = if (index == 1) .double else .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    const context = MinimizationStereoContext{
+        .allocator = std.testing.allocator,
+        .bonds = &bonds,
+        .graph = graph,
+        .rings = rings,
+        .component = graph.component(atoms[0].id).?,
+    };
+
+    try std.testing.expect(!try validateMinimizedStereo(&context, &atoms));
+    atoms[3].coordinates.y = -1;
+    try std.testing.expect(try validateMinimizedStereo(&context, &atoms));
 }
 
 const DiscreteScoreContext = struct {

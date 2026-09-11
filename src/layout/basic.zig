@@ -1417,20 +1417,19 @@ fn placeRingAtomSubstituents(
     // Upstream starts from the chosen gap's own ring neighbour and steps
     // counter-clockwise into the gap, one step per substituent slot. A visited
     // neighbour consumes no step but still counts in the divisor.
-    const step = best_gap / @as(f32, @floatFromInt(substituent_count + 1));
-    const start = std.math.atan2(
-        atoms[ring_neighbours[best].index()].coordinates.y - origin.y,
-        atoms[ring_neighbours[best].index()].coordinates.x - origin.x,
-    );
-    var taken: usize = 0;
+    const step = -best_gap / @as(f32, @floatFromInt(substituent_count + 1));
+    const sine = @sin(step);
+    const cosine = @cos(step);
+    var direction = subtract(atoms[ring_neighbours[best].index()].coordinates, origin);
     for (substituents[0..substituent_count]) |neighbor| {
         if (placed[neighbor.index()] and fragmentation.atom_fragment[neighbor.index()] == fragment) continue;
-        taken += 1;
-        const angle = start + step * @as(f32, @floatFromInt(taken));
-        atoms[neighbor.index()].coordinates = .{
-            .x = origin.x + @cos(angle) * bond_length,
-            .y = origin.y + @sin(angle) * bond_length,
+        const previous = direction;
+        direction = .{
+            .x = @mulAdd(f32, previous.x, cosine, previous.y * sine),
+            .y = @mulAdd(f32, -previous.x, sine, previous.y * cosine),
         };
+        const coordinate = add(origin, direction);
+        atoms[neighbor.index()].coordinates = roundedCoordinate(coordinate);
         // As in the acyclic branch, a substituent belonging to another fragment
         // takes its slot in the gap and is written there - that write is how its
         // fragment learns its attachment direction - but it is not this
@@ -2212,6 +2211,50 @@ test "fused rings align on their shared edge and extend outward" {
         layoutAndDiscard,
         .{ &atoms, &bonds, graph, rings, split },
     );
+}
+
+test "ring substituents preserve cumulative PointF rotation and coordinate writes" {
+    var atoms: [6]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    atoms[0].coordinates = .{ .x = -31.34, .y = 39.09 };
+    atoms[1].coordinates = .{ .x = -20.05, .y = 87.84 };
+    atoms[2].coordinates = .{};
+    const pairs = [_][2]u32{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 0 }, .{ 0, 3 }, .{ 0, 4 }, .{ 0, 5 } };
+    var bonds: [pairs.len]model.Bond = undefined;
+    for (&bonds, pairs, 0..) |*bond, pair, index| bond.* = .{
+        .id = core.ids.BondId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .start = core.ids.AtomId.fromIndex(pair[0]),
+        .end = core.ids.AtomId.fromIndex(pair[1]),
+        .input_order = .single,
+        .effective_order = .single,
+    };
+    var graph = try topology.Graph.init(std.testing.allocator, &atoms, &bonds);
+    defer graph.deinit();
+    var rings = try topology.RingMembership.init(std.testing.allocator, graph, &bonds);
+    defer rings.deinit();
+    var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
+    defer split.deinit();
+    var placed = [_]bool{ true, true, true, false, false, false };
+    var queue: [6]core.ids.AtomId = undefined;
+    var tail: usize = 0;
+
+    try std.testing.expect(try placeRingAtomSubstituents(
+        &atoms,
+        graph,
+        rings,
+        split,
+        split.atom_fragment[0],
+        core.ids.AtomId.fromIndex(0),
+        &placed,
+        &queue,
+        &tail,
+    ));
+    try std.testing.expectEqual(core.math.Vec2{ .x = -80.13, .y = 27.97 }, atoms[4].coordinates);
 }
 
 test "leaf fused rings are stripped into upstream LIFO placement order" {

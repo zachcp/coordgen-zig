@@ -19,9 +19,9 @@ pub const State = struct {
 pub fn score(interaction: core.interaction.Interaction, state: State) core.errors.Error!f32 {
     try state.validate();
     return switch (interaction.payload) {
-        .stretch => |value| scoreStretch(value, state),
-        .bend => |value| scoreBend(value, state),
-        .clash => |value| scoreClash(value, state, false),
+        .stretch => |value| scoreStretch(value, state, null),
+        .bend => |value| scoreBend(value, state, null),
+        .clash => |value| scoreClash(value, state, false, null),
         .constraint => |value| scoreConstraint(value, state),
         .ez_constraint => |value| scoreEz(value, state),
     };
@@ -30,7 +30,14 @@ pub fn score(interaction: core.interaction.Interaction, state: State) core.error
 pub fn scoreAll(interactions: []const core.interaction.Interaction, state: State) core.errors.Error!f32 {
     try state.validate();
     var energy: f32 = 0;
-    for (interactions) |interaction| energy += try score(interaction, state);
+    for (interactions) |interaction| {
+        switch (interaction.payload) {
+            .stretch => |value| _ = try scoreStretch(value, state, &energy),
+            .bend => |value| _ = try scoreBend(value, state, &energy),
+            .clash => |value| _ = try scoreClash(value, state, false, &energy),
+            else => energy += try score(interaction, state),
+        }
+    }
     return energy;
 }
 
@@ -46,7 +53,14 @@ pub const MinimizeResult = struct {
     converged: bool,
 };
 
-pub const StereoValidator = *const fn ([]const model.Atom) bool;
+pub const StereoValidator = struct {
+    context: *const anyopaque,
+    validateFn: *const fn (*const anyopaque, []const model.Atom) core.errors.Error!bool,
+
+    pub fn validate(self: StereoValidator, atoms: []const model.Atom) core.errors.Error!bool {
+        return self.validateFn(self.context, atoms);
+    }
+};
 
 pub const ConstructionOptions = struct {
     intrafragment_clashes: bool = true,
@@ -397,7 +411,8 @@ pub fn minimize(
     for (0..options.max_iterations) |iteration| {
         const energy = try scoreAll(interactions, state);
         energies[iteration] = energy;
-        if (!try applyForces(state, options.max_step)) {
+        const moved = try applyForces(state, options.max_step);
+        if (!moved) {
             return .{ .iterations = iteration + 1, .energy = energy, .converged = true };
         }
         if (iteration >= 200 and energies[iteration - 100] - energy < 20) {
@@ -434,7 +449,6 @@ pub fn minimizeMolecule(
         force.* = .{};
         is_fixed.* = atom.fixed;
     }
-
     const result = try minimize(interactions, .{
         .coordinates = coordinates,
         .forces = forces,
@@ -442,7 +456,7 @@ pub fn minimizeMolecule(
     }, options);
     for (atoms, coordinates) |*atom, position| atom.coordinates = position;
     if (validate_stereo) |validator| {
-        if (!validator(atoms)) {
+        if (!try validator.validate(atoms)) {
             for (atoms, previous_coordinates) |*atom, previous| {
                 atom.coordinates = previous;
             }
@@ -460,11 +474,17 @@ fn addForce(state: State, atom: core.ids.AtomId, force: core.math.Vec2) void {
     state.forces[atom.index()] = geometry.add(state.forces[atom.index()], force);
 }
 
-fn scoreStretch(value: core.interaction.Stretch, state: State) core.errors.Error!f32 {
+fn accumulateEnergy(total: *f32, factor: f32, value: f32) void {
+    total.* = @mulAdd(f32, factor, value, total.*);
+}
+
+fn scoreStretch(value: core.interaction.Stretch, state: State, accumulated: ?*f32) core.errors.Error!f32 {
     const difference = geometry.subtract(try coordinate(state, value.atom_a), try coordinate(state, value.atom_b));
     const magnitude = geometry.length(difference);
     const delta = magnitude - value.rest_length;
-    const energy = 0.5 * value.force_constant * delta * delta;
+    const energy_factor = 0.5 * value.force_constant * delta;
+    const energy = energy_factor * delta;
+    if (accumulated) |total| accumulateEnergy(total, energy_factor, delta);
     const force_delta = if (magnitude < value.rest_length - value.tolerance)
         value.rest_length - value.tolerance - magnitude
     else if (magnitude > value.rest_length + value.tolerance)
@@ -478,13 +498,15 @@ fn scoreStretch(value: core.interaction.Stretch, state: State) core.errors.Error
     return energy;
 }
 
-fn scoreBend(value: core.interaction.Bend, state: State) core.errors.Error!f32 {
+fn scoreBend(value: core.interaction.Bend, state: State, accumulated: ?*f32) core.errors.Error!f32 {
     const first = try coordinate(state, value.atom_a);
     const center = try coordinate(state, value.center);
     const last = try coordinate(state, value.atom_b);
     const angle = geometry.unsignedAngle(first, center, last);
     const energy_delta = angle - value.rest_degrees;
-    const energy = 5 * value.force_constant * value.secondary_force_constant * energy_delta * energy_delta;
+    const energy_factor = 5 * value.force_constant * value.secondary_force_constant * energy_delta;
+    const energy = energy_factor * energy_delta;
+    if (accumulated) |total| accumulateEnergy(total, energy_factor, energy_delta);
     // A perfectly straight bend has no defined perpendicular direction.
     // Pinned upstream leaves that singular configuration stationary; choosing
     // either normal here makes an otherwise ideal lattice diverge immediately.
@@ -510,14 +532,16 @@ fn normalizeWithFloor(value: core.math.Vec2) core.math.Vec2 {
     return geometry.divide(value, @max(geometry.length(value), geometry.epsilon));
 }
 
-fn scoreClash(value: core.interaction.Clash, state: State, skip_force: bool) core.errors.Error!f32 {
+fn scoreClash(value: core.interaction.Clash, state: State, skip_force: bool, accumulated: ?*f32) core.errors.Error!f32 {
     const start = try coordinate(state, value.segment_start);
     const point = try coordinate(state, value.point);
     const end = try coordinate(state, value.segment_end);
     const distance = geometry.squaredDistancePointSegment(point, start, end).squared_distance;
     if (distance > value.rest_squared_distance) return 0;
     const deficit = value.rest_squared_distance - distance;
-    const energy = 0.5 * value.force_constant * value.secondary_force_constant * deficit;
+    const factor = 0.5 * value.force_constant * value.secondary_force_constant;
+    const energy = factor * deficit;
+    if (accumulated) |total| accumulateEnergy(total, factor, deficit);
     if (skip_force) return energy;
     const projection = geometry.projectPointOnLine(point, start, end);
     const force = geometry.scale(geometry.normalize(geometry.subtract(point, projection)), deficit * value.force_constant * value.secondary_force_constant);
@@ -593,6 +617,16 @@ test "all continuous interactions conserve direct energy and force facts" {
     } } };
     try std.testing.expectEqual(@as(f32, 50), try score(constraint, state));
     try std.testing.expectEqual(core.math.Vec2{}, forces[1]);
+}
+
+test "score accumulation preserves upstream contracted final product" {
+    var total: f32 = 0x1.4b6fc6p5;
+    const factor: f32 = 0x1.99999ap-5;
+    const value: f32 = 0x1.475a6p8;
+    const separately_rounded = total + factor * value;
+    accumulateEnergy(&total, factor, value);
+    try std.testing.expectEqual(@as(f32, 0x1.ce60bap5), total);
+    try std.testing.expectEqual(@as(f32, 0x1.ce60b8p5), separately_rounded);
 }
 
 test "bend clash and E/Z values and forces match pinned formulas" {
@@ -832,7 +866,7 @@ test "fixed-center bend minimization agrees with pinned oracle fixture" {
     }
 }
 
-fn rejectStereo(_: []const model.Atom) bool {
+fn rejectStereo(_: *const anyopaque, _: []const model.Atom) core.errors.Error!bool {
     return false;
 }
 
@@ -845,7 +879,9 @@ fn minimizeMoleculeAndDiscard(allocator: std.mem.Allocator) !void {
         .id = core.ids.InteractionId.fromIndex(0),
         .payload = .{ .stretch = .{ .atom_a = atoms[0].id, .atom_b = atoms[1].id } },
     }};
-    _ = try minimizeMolecule(allocator, &atoms, &interactions, .{}, rejectStereo);
+    const context: u8 = 0;
+    const validator = StereoValidator{ .context = &context, .validateFn = rejectStereo };
+    _ = try minimizeMolecule(allocator, &atoms, &interactions, .{}, validator);
     try std.testing.expectEqual(@as(f32, 0), atoms[0].coordinates.x);
     try std.testing.expectEqual(@as(f32, 60), atoms[1].coordinates.x);
 }

@@ -107,6 +107,60 @@ fn radiansToDegrees(radians: Scalar) Scalar {
     return @floatCast(@as(f64, scaled) / @as(f64, std.math.pi));
 }
 
+// Derived from Sun Microsystems' fdlibm e_acosf.c, used by glibc 2.36.
+// Copyright (C) 1993 by Sun Microsystems, Inc. All rights reserved.
+// Developed at SunPro, a Sun Microsystems, Inc. business.
+// Permission to use, copy, modify, and distribute this software is freely
+// granted, provided that this notice is preserved.
+fn upstreamAcos(value: Scalar) Scalar {
+    const one: Scalar = 1;
+    const pi: Scalar = @bitCast(@as(u32, 0x40490fda));
+    const pio2_hi: Scalar = @bitCast(@as(u32, 0x3fc90fda));
+    const pio2_lo: Scalar = @bitCast(@as(u32, 0x33a22168));
+    const p_s0: Scalar = @bitCast(@as(u32, 0x3e2aaaab));
+    const p_s1: Scalar = @bitCast(@as(u32, 0xbea6b090));
+    const p_s2: Scalar = @bitCast(@as(u32, 0x3e4e0aa8));
+    const p_s3: Scalar = @bitCast(@as(u32, 0xbd241146));
+    const p_s4: Scalar = @bitCast(@as(u32, 0x3a4f7f04));
+    const p_s5: Scalar = @bitCast(@as(u32, 0x3811ef08));
+    const q_s1: Scalar = @bitCast(@as(u32, 0xc019d139));
+    const q_s2: Scalar = @bitCast(@as(u32, 0x4001572d));
+    const q_s3: Scalar = @bitCast(@as(u32, 0xbf303361));
+    const q_s4: Scalar = @bitCast(@as(u32, 0x3d9dc62e));
+
+    const bits: u32 = @bitCast(value);
+    const magnitude = bits & 0x7fffffff;
+    if (magnitude == 0x3f800000) {
+        if (bits >> 31 == 0) return 0;
+        return pi + 2 * pio2_lo;
+    }
+    if (magnitude > 0x3f800000) return std.math.nan(Scalar);
+
+    if (magnitude < 0x3f000000) {
+        if (magnitude <= 0x32800000) return pio2_hi + pio2_lo;
+        const z = value * value;
+        const p = z * (p_s0 + z * (p_s1 + z * (p_s2 + z * (p_s3 + z * (p_s4 + z * p_s5)))));
+        const q = one + z * (q_s1 + z * (q_s2 + z * (q_s3 + z * q_s4)));
+        const r = p / q;
+        return pio2_hi - (value - (pio2_lo - value * r));
+    }
+
+    const z = if (bits >> 31 != 0) (one + value) * 0.5 else (one - value) * 0.5;
+    const p = z * (p_s0 + z * (p_s1 + z * (p_s2 + z * (p_s3 + z * (p_s4 + z * p_s5)))));
+    const q = one + z * (q_s1 + z * (q_s2 + z * (q_s3 + z * q_s4)));
+    const s = @sqrt(z);
+    const r = p / q;
+    if (bits >> 31 != 0) {
+        const w = r * s - pio2_lo;
+        return pi - 2 * (s + w);
+    }
+
+    const df: Scalar = @bitCast(@as(u32, @bitCast(s)) & 0xfffff000);
+    const c = (z - df * df) / (s + df);
+    const w = r * s + c;
+    return 2 * (df + w);
+}
+
 /// Signed p1-p2-p3 angle in degrees.
 pub fn signedAngle(p1: Vec2, p2: Vec2, p3: Vec2) Scalar {
     const first = subtract(p1, p2);
@@ -131,10 +185,7 @@ pub fn unsignedAngle(p1: Vec2, p2: Vec2, p3: Vec2) Scalar {
     } else if (cosine > 1) {
         cosine = 1;
     }
-    // Zig's software f32 acos rounds acos(-1) one ULP below the pinned C++
-    // libm result; preserve upstream's exact straight-angle result.
-    if (cosine == -1) return 180;
-    return radiansToDegrees(std.math.acos(cosine));
+    return radiansToDegrees(upstreamAcos(cosine));
 }
 
 /// Projection onto the infinite line through line_start and line_end. The
@@ -306,6 +357,12 @@ test "angles coincidence and half-plane predicates match upstream boundaries" {
         @as(Scalar, @bitCast(@as(u32, 0xb4954269))),
         signedAngle(.{ .x = 64.34, .y = -27.58 }, origin, .{ .x = 64.34, .y = -27.58 }),
     );
+    try std.testing.expectEqual(
+        @as(Scalar, @bitCast(@as(u32, 0x426fff42))),
+        unsignedAngle(.{ .x = 70.05, .y = -87.84 }, .{ .x = 20.05, .y = -87.84 }, .{ .x = 45.05, .y = -131.14 }),
+    );
+    try std.testing.expectEqual(@as(Scalar, 0x1.0c145p0), upstreamAcos(0x1.00017p-1));
+    try std.testing.expectEqual(@as(Scalar, 0x1.02a348p0), upstreamAcos(0x1.102e5p-1));
     try std.testing.expectApproxEqAbs(@as(Scalar, @bitCast(@as(u32, 0x428f214f))), unsignedAngle(.{ .x = -10, .y = -10 }, origin, .{ .x = -8, .y = 4 }), 0.00001);
     try std.testing.expectApproxEqAbs(@as(Scalar, 90), unsignedAngle(origin, origin, .{ .x = 1 }), 0.00001);
     try std.testing.expect(std.math.isNan(unsignedAngle(.{ .x = std.math.nan(Scalar) }, origin, .{ .x = 1 })));
