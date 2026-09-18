@@ -13,6 +13,7 @@ pub fn orderNeighbours(
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
     center: core.ids.AtomId,
     out: []core.ids.AtomId,
 ) core.errors.Error!void {
@@ -23,7 +24,16 @@ pub fn orderNeighbours(
 
     var weights: [4]f32 = undefined;
     for (neighbours, 0..) |neighbor, index| {
-        weights[index] = try neighbourPriorityWeight(allocator, atoms, bonds, graph, membership, center, neighbor);
+        weights[index] = try topology.stereo.atomPriorityWeight(
+            allocator,
+            atoms,
+            bonds,
+            graph,
+            membership,
+            analysis.shared_and_inner,
+            center,
+            neighbor,
+        );
     }
 
     var rest: [4]core.ids.AtomId = undefined;
@@ -65,51 +75,4 @@ fn takeLowestWeight(atoms: []core.ids.AtomId, weights: []f32) core.ids.AtomId {
         weights[index] = weights[index + 1];
     }
     return taken;
-}
-
-/// One upstream term is deliberately absent: -2000 for a neighbour marked
-/// `isSharedAndInner` while the centre is not. This port does not model that
-/// pointer-era fused-ring flag, so assigning it here would invent behavior.
-fn neighbourPriorityWeight(
-    allocator: std.mem.Allocator,
-    atoms: []const model.Atom,
-    bonds: []const model.Bond,
-    graph: topology.Graph,
-    membership: topology.RingMembership,
-    center: core.ids.AtomId,
-    neighbor: core.ids.AtomId,
-) core.errors.Error!f32 {
-    const branch = try graph.reachableExcluding(allocator, neighbor, center);
-    defer allocator.free(branch);
-    var weight: f32 = @floatFromInt(branch.len);
-
-    if (bondBetween(graph, center, neighbor)) |id| {
-        const order = bonds[id.index()].effective_order;
-        if (order == .double) weight -= 0.25;
-        if (atoms[center.index()].atomic_number == .sulfur and order == .double) weight += 2000;
-        if (sharesRing(membership, center, neighbor)) weight += 500;
-    }
-    if (atoms[neighbor.index()].atomic_number == .carbon) weight += 0.5;
-    if (atoms[neighbor.index()].atomic_number == .hydrogen) weight -= 0.5;
-    if (atoms[neighbor.index()].stereo != .unspecified) weight += 10000;
-    if (atoms[center.index()].cross_layout and graph.degree(neighbor) > 1) weight += 200;
-    for (graph.incidentBonds(neighbor)) |incident| if (bonds[incident.index()].effective_order == .double) {
-        weight += 100;
-        break;
-    };
-    return weight;
-}
-
-fn bondBetween(graph: topology.Graph, atom: core.ids.AtomId, other: core.ids.AtomId) ?core.ids.BondId {
-    for (graph.neighbors(atom), graph.incidentBonds(atom)) |neighbor, bond| {
-        if (neighbor == other) return bond;
-    }
-    return null;
-}
-
-fn sharesRing(membership: topology.RingMembership, first: core.ids.AtomId, second: core.ids.AtomId) bool {
-    for (membership.atomRings(first)) |first_ring| {
-        for (membership.atomRings(second)) |second_ring| if (first_ring == second_ring) return true;
-    }
-    return false;
 }

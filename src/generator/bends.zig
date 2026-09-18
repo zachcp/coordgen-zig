@@ -228,7 +228,7 @@ test "a two-neighbour centre emits one candidate, and bond order decides 120 aga
     defer graph.deinit();
     var membership = try topology.RingMembership.init(testing.allocator, graph, &single);
     defer membership.deinit();
-    var analysis = try topology.rings.Analysis.init(testing.allocator, membership, &atoms, &single);
+    var analysis = try topology.rings.Analysis.init(testing.allocator, membership, &atoms, &single, graph);
     defer analysis.deinit();
 
     var groups = try build(testing.allocator, &atoms, &single, graph, membership, analysis);
@@ -250,7 +250,7 @@ test "a two-neighbour centre emits one candidate, and bond order decides 120 aga
     defer graph2.deinit();
     var membership2 = try topology.RingMembership.init(testing.allocator, graph2, &unsaturated);
     defer membership2.deinit();
-    var analysis2 = try topology.rings.Analysis.init(testing.allocator, membership2, &atoms, &unsaturated);
+    var analysis2 = try topology.rings.Analysis.init(testing.allocator, membership2, &atoms, &unsaturated, graph2);
     defer analysis2.deinit();
     var straight = try build(testing.allocator, &atoms, &unsaturated, graph2, membership2, analysis2);
     defer straight.deinit();
@@ -275,7 +275,7 @@ test "a ring centre reports its ring context and an even split for three neighbo
     defer graph.deinit();
     var membership = try topology.RingMembership.init(testing.allocator, graph, &bonds);
     defer membership.deinit();
-    var analysis = try topology.rings.Analysis.init(testing.allocator, membership, &atoms, &bonds);
+    var analysis = try topology.rings.Analysis.init(testing.allocator, membership, &atoms, &bonds, graph);
     defer analysis.deinit();
 
     var groups = try build(testing.allocator, &atoms, &bonds, graph, membership, analysis);

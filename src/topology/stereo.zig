@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core");
 const model = @import("model");
+const rings = @import("rings.zig");
 
 pub const Priority = enum { left, right, tied };
 
@@ -253,6 +254,40 @@ fn containsAtom(haystack: []const core.ids.AtomId, needle: core.ids.AtomId) bool
     return std.mem.indexOfScalar(core.ids.AtomId, haystack, needle) != null;
 }
 
+/// Upstream's `sketcherMinimizerAtom::orderAtomPriorities` weight, shared by
+/// degree-four neighbour ordering and tetrahedral wedge/hash selection.
+pub fn atomPriorityWeight(
+    allocator: std.mem.Allocator,
+    atoms: []const model.Atom,
+    bonds: []const model.Bond,
+    graph: anytype,
+    membership: anytype,
+    shared_and_inner: []const bool,
+    center: core.ids.AtomId,
+    neighbor: core.ids.AtomId,
+) core.errors.Error!f32 {
+    const branch = try graph.reachableExcluding(allocator, neighbor, center);
+    defer allocator.free(branch);
+    var weight: f32 = @floatFromInt(branch.len);
+
+    if (bondBetween(graph, center, neighbor)) |id| {
+        const order = bonds[id.index()].effective_order;
+        if (order == .double) weight -= 0.25;
+        if (atoms[center.index()].atomic_number == .sulfur and order == .double) weight += 2000;
+        if (membership.bondRings(id).len != 0) weight += 500;
+    }
+    if (atoms[neighbor.index()].atomic_number == .carbon) weight += 0.5;
+    if (atoms[neighbor.index()].atomic_number == .hydrogen) weight -= 0.5;
+    if (shared_and_inner[neighbor.index()] and !shared_and_inner[center.index()]) weight -= 2000;
+    if (atoms[neighbor.index()].stereo != .unspecified) weight += 10000;
+    if (atoms[center.index()].cross_layout and graph.degree(neighbor) > 1) weight += 200;
+    for (graph.incidentBonds(neighbor)) |incident| if (bonds[incident.index()].effective_order == .double) {
+        weight += 100;
+        break;
+    };
+    return weight;
+}
+
 /// Assign a deterministic wedge/hash pair which realizes each absolute atom
 /// descriptor in the current 2D geometry. Four-coordinate centers receive a
 /// solid/hash pair; three-coordinate centers receive one display bond and use
@@ -264,6 +299,8 @@ pub fn writeAtomBondDisplays(
     graph: anytype,
     membership: anytype,
 ) core.errors.Error!void {
+    var analysis = try rings.Analysis.init(allocator, membership, atoms, bonds, graph);
+    defer analysis.deinit();
     for (bonds) |*bond| bond.display = .none;
     for (atoms) |*atom| {
         const absolute = try absoluteAtomStereo(allocator, atoms, bonds, graph, atom.id);
@@ -293,23 +330,16 @@ pub fn writeAtomBondDisplays(
 
         for (neighbors, 0..) |neighbor, i| {
             display_order[i] = .{ .atom = neighbor, .priority = 0 };
-            const branch = try graph.reachableExcluding(allocator, neighbor, atom.id);
-            defer allocator.free(branch);
-            const bond_id = bondBetween(graph, atom.id, neighbor) orelse return error.InvalidStereo;
-            const bond = bonds[bond_id.index()];
-            var weight: f32 = @floatFromInt(branch.len);
-            if (bond.effective_order == .double) weight -= 0.25;
-            if (atom.atomic_number == .sulfur and bond.effective_order == .double) weight += 2000;
-            if (membership.bondRings(bond_id).len != 0) weight += 500;
-            if (atoms[neighbor.index()].atomic_number == .carbon) weight += 0.5;
-            if (atoms[neighbor.index()].atomic_number == .hydrogen) weight -= 0.5;
-            if (atoms[neighbor.index()].stereo != .unspecified) weight += 10000;
-            if (atom.cross_layout and graph.degree(neighbor) > 1) weight += 200;
-            for (graph.incidentBonds(neighbor)) |neighbor_bond| if (bonds[neighbor_bond.index()].effective_order == .double) {
-                weight += 100;
-                break;
-            };
-            display_weights[i] = weight;
+            display_weights[i] = try atomPriorityWeight(
+                allocator,
+                atoms,
+                bonds,
+                graph,
+                membership,
+                analysis.shared_and_inner,
+                atom.id,
+                neighbor,
+            );
         }
         sortByDisplayWeight(display_order[0..neighbors.len], display_weights[0..neighbors.len]);
 

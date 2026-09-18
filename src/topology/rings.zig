@@ -24,6 +24,7 @@ pub const Fusion = struct {
 pub const Analysis = struct {
     allocator: std.mem.Allocator,
     flags: []Flags,
+    shared_and_inner: []bool,
     fusion_offsets: []u32,
     fusions: []Fusion,
     fusion_atoms: []core.ids.AtomId,
@@ -33,6 +34,7 @@ pub const Analysis = struct {
         membership: anytype,
         atoms: []const model.Atom,
         bonds: []const model.Bond,
+        graph: anytype,
     ) core.errors.Error!Analysis {
         const ring_count = membership.rings.len;
         const flags = allocator.alloc(Flags, ring_count) catch return error.OutOfMemory;
@@ -45,6 +47,9 @@ pub const Analysis = struct {
                 .macrocycle = membership.atoms(ring_id).len >= macrocycle_size,
             };
         }
+        const shared_and_inner = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
+        errdefer allocator.free(shared_and_inner);
+        @memset(shared_and_inner, false);
 
         var fusion_list: std.ArrayList(Fusion) = .empty;
         defer fusion_list.deinit(allocator);
@@ -70,6 +75,20 @@ pub const Analysis = struct {
                 else
                     core.ids.BondId.invalid;
                 if (shared_count == 0 and fusion_bond == .invalid) continue;
+                if (shared_count > 2) {
+                    for (atom_list.items[atom_start..]) |atom| {
+                        var has_outer_neighbor = false;
+                        for (graph.neighbors(atom)) |neighbor| {
+                            const in_left = std.mem.indexOfScalar(core.ids.AtomId, membership.atoms(left), neighbor) != null;
+                            const in_right = std.mem.indexOfScalar(core.ids.AtomId, membership.atoms(right), neighbor) != null;
+                            if (in_left != in_right) {
+                                has_outer_neighbor = true;
+                                break;
+                            }
+                        }
+                        if (!has_outer_neighbor) shared_and_inner[atom.index()] = true;
+                    }
+                }
                 fusion_list.append(allocator, .{
                     .other = right,
                     .atom_start = @intCast(atom_start),
@@ -85,6 +104,7 @@ pub const Analysis = struct {
         return .{
             .allocator = allocator,
             .flags = flags,
+            .shared_and_inner = shared_and_inner,
             .fusion_offsets = fusion_offsets,
             .fusions = fusions,
             .fusion_atoms = fusion_atoms,
@@ -95,6 +115,7 @@ pub const Analysis = struct {
         self.allocator.free(self.fusion_atoms);
         self.allocator.free(self.fusions);
         self.allocator.free(self.fusion_offsets);
+        self.allocator.free(self.shared_and_inner);
         self.allocator.free(self.flags);
         self.* = undefined;
     }

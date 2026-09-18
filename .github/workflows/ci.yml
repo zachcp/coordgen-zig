@@ -8,6 +8,58 @@ permissions:
   contents: read
 
 jobs:
+  bead-references:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    env:
+      BD_DISABLE_EVENT_FLUSH: "1"
+      BD_DISABLE_METRICS: "1"
+      BD_NON_INTERACTIVE: "1"
+      BD_VERSION: 1.1.2
+    steps:
+      - name: Check out source and PR history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Beads CLI
+        env:
+          BD_LINUX_AMD64_SHA256: a72d71ed374955dc9f83a0f90b54bd7b6a0016709dd1676ae2e368651ed401c2
+        run: |
+          archive="beads_${BD_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL "https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}/${archive}" \
+            -o "${RUNNER_TEMP}/${archive}"
+          printf '%s  %s\n' "$BD_LINUX_AMD64_SHA256" "${RUNNER_TEMP}/${archive}" | sha256sum --check -
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "$RUNNER_TEMP" bd
+          chmod 0755 "${RUNNER_TEMP}/bd"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/bd" version
+
+      - name: Clone the live Beads database
+        run: |
+          bd init \
+            --remote "https://github.com/${GITHUB_REPOSITORY}.git" \
+            --non-interactive \
+            --skip-hooks \
+            --skip-agents \
+            --quiet
+
+      - name: Validate PR and commit Bead references
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_CREATED_AT: ${{ github.event.pull_request.created_at }}
+        run: |
+          jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > "${RUNNER_TEMP}/pr-body"
+          git log --format=%B "$BASE_SHA..$HEAD_SHA" > "${RUNNER_TEMP}/commits"
+          git diff "$BASE_SHA..$HEAD_SHA" -- .beads/interactions.jsonl > "${RUNNER_TEMP}/interactions.diff"
+          python3 tools/check-bead-references --self-test
+          python3 tools/check-bead-references \
+            --pr-body "${RUNNER_TEMP}/pr-body" \
+            --commits "${RUNNER_TEMP}/commits" \
+            --interactions-diff "${RUNNER_TEMP}/interactions.diff" \
+            --pr-created-at "$PR_CREATED_AT"
+
   build:
     strategy:
       fail-fast: false

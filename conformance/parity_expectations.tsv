@@ -40,12 +40,14 @@
 # comparison cannot observe. It exists to prove that cross-build coordinate
 # goldens are forbidden.
 
-# Realistic structures were bit-identical across architectures, optimization
-# levels, and allocator order in the review measurements, and remain so here.
+# Fixed stable structures were bit-identical across architectures,
+# optimization levels, and allocator order in the review measurements, and
+# remain so here. Member 7 is the synthetic zero-order proximity case added by
+# cgz-y3m; the others are realistic structures.
 drug_like	*	0.0	0.0
-# Measured 7/7 arch. The component transform is derived from before/after
-# placement floats, so it differs by one to two units in the last place even
-# where the resulting coordinates are bit-identical. No architecture claim.
+# The component transform is derived from before/after placement floats, so it
+# differs by one to two units in the last place even where the resulting
+# coordinates are bit-identical. No architecture claim.
 drug_like	component_transforms	1.0	0.0
 drug_like	component_transforms_set	1.0	0.0
 

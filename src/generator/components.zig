@@ -144,7 +144,7 @@ pub fn orientComponents(
     var analysis: ?topology.rings.Analysis = null;
     defer if (analysis) |*value| value.deinit();
     if (fragmentation != null and rings.rings.len != 0) {
-        analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds);
+        analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds, graph);
     }
 
     for (0..graph.component_count) |raw_component| {

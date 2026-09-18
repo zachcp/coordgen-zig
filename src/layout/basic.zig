@@ -115,7 +115,7 @@ fn initializeCoordinatesInternal(
     }
     // Ring fusion structure is needed by the central-ring priority, and is
     // derived once for the whole molecule rather than per fragment.
-    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds);
+    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds, graph);
     defer analysis.deinit();
     const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(placed);
@@ -175,7 +175,7 @@ fn initializeCoordinatesInternal(
             // when its own neighbour buffer would overflow.
             if (membership.atomRings(center).len != 0) {
                 if (try placeRingAtomSubstituents(atoms, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail)) continue;
-            } else if (try placeAcyclicNeighbours(allocator, atoms, bonds, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail)) {
+            } else if (try placeAcyclicNeighbours(allocator, atoms, bonds, graph, membership, analysis, fragmentation, fragment.id, center, placed, queue, &tail)) {
                 continue;
             }
             const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
@@ -912,6 +912,11 @@ fn alignFusedRing(
     const target_last = atoms[ordered[last].index()].coordinates;
     const source_first = local[first_index];
     const source_last = local[last];
+    // Upstream aligns the two endpoint midpoints, not either endpoint itself.
+    // Their spans may differ because no scaling is applied; pinning the first
+    // endpoint therefore shifts the entire child ring by half that difference.
+    const target_center = scale(add(target_first, target_last), 0.5);
+    const source_center = scale(add(source_first, source_last), 0.5);
     const target_angle = std.math.atan2(target_last.y - target_first.y, target_last.x - target_first.x);
     const source_angle = std.math.atan2(source_last.y - source_first.y, source_last.x - source_first.x);
     const rotation = target_angle - source_angle;
@@ -920,7 +925,7 @@ fn alignFusedRing(
     const parent_center = ringAtomCenter(atoms, parent_atoms);
     for (ordered, local) |atom, coordinate| {
         if (std.mem.indexOfScalar(core.ids.AtomId, parent_atoms, atom) != null) continue;
-        const candidate = transformFromPivot(coordinate, source_first, target_first, rotation);
+        const candidate = transformFromPivot(coordinate, source_center, target_center, rotation);
         const mirror = reflectAcrossLine(candidate, target_first, target_last);
         first_score += distance(candidate, parent_center);
         mirror_score += distance(mirror, parent_center);
@@ -940,7 +945,7 @@ fn alignFusedRing(
     // upstream's heptagon is regular, every atom 1.150 to 1.154 from the
     // centre, and native's spanned 1.140 to 1.171 (cgz-vu0).
     for (ordered, local) |atom, coordinate| {
-        const candidate = transformFromPivot(coordinate, source_first, target_first, rotation);
+        const candidate = transformFromPivot(coordinate, source_center, target_center, rotation);
         const result = if (use_mirror) reflectAcrossLine(candidate, target_first, target_last) else candidate;
         atoms[atom.index()].coordinates = if (side_ring) roundedCoordinate(result) else result;
         placed[atom.index()] = true;
@@ -1468,6 +1473,7 @@ fn placeAcyclicNeighbours(
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
     fragmentation: fragments.Fragmentation,
     fragment: core.ids.FragmentId,
     center: core.ids.AtomId,
@@ -1479,7 +1485,7 @@ fn placeAcyclicNeighbours(
     if (neighbours.len == 0 or neighbours.len > max_neighbours) return false;
 
     var ordered: [max_neighbours]core.ids.AtomId = undefined;
-    try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, center, ordered[0..neighbours.len]);
+    try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, analysis, center, ordered[0..neighbours.len]);
 
     // Upstream's visited set is fragment-local: it starts as this fragment's
     // ring atoms, or its single start atom, and only ever gains atoms of this
@@ -2213,6 +2219,47 @@ test "fused rings align on their shared edge and extend outward" {
     );
 }
 
+test "fused ring alignment preserves the shared endpoint midpoint without scaling" {
+    var atoms: [5]model.Atom = undefined;
+    for (&atoms, 0..) |*atom, index| atom.* = .{
+        .id = core.ids.AtomId.fromIndex(@intCast(index)),
+        .input_index = @intCast(index),
+        .atomic_number = .carbon,
+    };
+    atoms[0].coordinates = .{ .x = 10 };
+    atoms[2].coordinates = .{ .x = 14 };
+    atoms[4].coordinates = .{ .x = 12, .y = 10 };
+    const ordered = [_]core.ids.AtomId{
+        core.ids.AtomId.fromIndex(0),
+        core.ids.AtomId.fromIndex(1),
+        core.ids.AtomId.fromIndex(2),
+        core.ids.AtomId.fromIndex(3),
+    };
+    const local = [_]core.math.Vec2{
+        .{},
+        .{ .x = 1, .y = -1 },
+        .{ .x = 2 },
+        .{ .x = 1, .y = 1 },
+    };
+    var placed = [_]bool{ true, false, true, false, true };
+    try alignFusedRing(
+        &atoms,
+        &ordered,
+        &local,
+        &placed,
+        &.{ core.ids.AtomId.fromIndex(0), core.ids.AtomId.fromIndex(2), core.ids.AtomId.fromIndex(4) },
+        &.{ core.ids.AtomId.fromIndex(0), core.ids.AtomId.fromIndex(1), core.ids.AtomId.fromIndex(2), core.ids.AtomId.fromIndex(3) },
+        false,
+    );
+
+    // The target span is four units and the source span is two. Upstream does
+    // not scale: it centers the two-unit source span on the target midpoint.
+    // A first-endpoint pivot would incorrectly leave these at x=10 and x=12.
+    try std.testing.expectApproxEqAbs(@as(f32, 11), atoms[0].coordinates.x, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 13), atoms[2].coordinates.x, 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 12), (atoms[0].coordinates.x + atoms[2].coordinates.x) * 0.5, 0.00001);
+}
+
 test "ring substituents preserve cumulative PointF rotation and coordinate writes" {
     var atoms: [6]model.Atom = undefined;
     for (&atoms, 0..) |*atom, index| atom.* = .{
@@ -2286,7 +2333,7 @@ test "leaf fused rings are stripped into upstream LIFO placement order" {
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
-    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds, graph);
     defer analysis.deinit();
 
     const fragment = split.fragments[split.atom_fragment[0].index()];
@@ -2347,7 +2394,7 @@ test "the third ring of a linear acene mirrors away from its parent ring, not fr
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
-    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds, graph);
     defer analysis.deinit();
 
     // And the parent chosen for the outer ring is the ring it shares an edge
@@ -2629,7 +2676,7 @@ fn planarityFixture(atoms: []model.Atom, bonds: []const model.Bond) !f32 {
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, atoms, bonds, graph, rings);
     defer split.deinit();
-    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, atoms, bonds);
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, atoms, bonds, graph);
     defer analysis.deinit();
     var worst: f32 = 0;
     for (split.fragments) |fragment| {

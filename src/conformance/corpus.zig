@@ -21,10 +21,11 @@ pub const Partition = enum {
     /// where upstream's own layout is unstable, so this is the partition that
     /// establishes the parity ceiling.
     adversarial,
-    /// Realistic structures — fused polycyclics, a steroid skeleton, a
-    /// seventeen-membered macrocycle, a bridged bicyclic, a peptide-like
-    /// chain, a four-ring biaryl chain. Recorded as stable across
-    /// architectures and optimization levels, so they carry the exact tier.
+    /// Stable fixed structures — realistic fused polycyclics, a steroid
+    /// skeleton, a seventeen-membered macrocycle, a bridged bicyclic, a
+    /// peptide-like chain, a four-ring biaryl chain, and one explicit
+    /// zero-order proximity case. Recorded as stable across architectures and
+    /// optimization levels, so they carry the exact tier.
     drug_like,
 
     pub fn memberCount(self: Partition, requested: u32) u32 {
@@ -175,7 +176,9 @@ fn hasBond(bonds: []const Bond, start: u32, end: u32) bool {
 }
 
 const DrugLikeMember = struct {
-    smiles: []const u8,
+    /// Null only for the explicit zero-order member, which the deliberately
+    /// small upstream reference parser cannot spell.
+    smiles: ?[]const u8,
     atomic_numbers: []const u32,
     /// `.{ start, end, order }`, in upstream's own construction order.
     bonds: []const [3]u32,
@@ -230,9 +233,9 @@ pub const SizeBucket = enum {
 };
 
 /// The canonical corpus dump. `conformance/smiles_reference.cpp` prints the
-/// drug-like partition in exactly this form from upstream's own parser, and
-/// the build diffs the two, so the committed tables are checked rather than
-/// trusted.
+/// drug-like partition in exactly this form from upstream's own parser (plus
+/// direct construction for the zero-order member), and the build diffs the
+/// two, so the committed tables are checked rather than trusted.
 pub fn writeMolecule(writer: *std.Io.Writer, molecule: Molecule) std.Io.Writer.Error!void {
     try writer.print("molecule {t} {d} atoms={d} bonds={d}\n", .{
         molecule.partition,
@@ -336,6 +339,15 @@ const drug_like_members = [_]DrugLikeMember{
             .{ 22, 21, 1 }, .{ 23, 22, 1 }, .{ 23, 18, 1 },
         },
     },
+    .{
+        // A four-atom chain and a one-atom partner joined only by two
+        // zero-order bonds. The chain endpoints belong to different fragments
+        // and their outward addition vectors face more than 90 degrees apart,
+        // making the proximity-opposite-sides score non-zero (cgz-y3m).
+        .smiles = null,
+        .atomic_numbers = &.{ 6, 6, 6, 6, 6 },
+        .bonds = &.{ .{ 0, 1, 1 }, .{ 1, 2, 1 }, .{ 2, 3, 1 }, .{ 0, 4, 0 }, .{ 3, 4, 0 } },
+    },
 };
 
 const testing = std.testing;
@@ -426,8 +438,8 @@ test "adversarial members carry the properties the corpus exists to exercise" {
 }
 
 test "drug-like members match their committed tables" {
-    try testing.expectEqual(@as(u32, 7), Partition.drug_like.memberCount(2000));
-    try testing.expectError(error.UnknownMember, generate(testing.allocator, .drug_like, 7));
+    try testing.expectEqual(@as(u32, 8), Partition.drug_like.memberCount(2000));
+    try testing.expectError(error.UnknownMember, generate(testing.allocator, .drug_like, 8));
 
     const macrocycle = try generate(testing.allocator, .drug_like, 2);
     defer macrocycle.deinit(testing.allocator);
@@ -443,6 +455,12 @@ test "drug-like members match their committed tables" {
     }
     try testing.expectEqual(@as(usize, 2), double_bonds);
     try testing.expectEqual(@as(u32, 16), peptide.atoms[10].atomic_number);
+
+    const proximity = try generate(testing.allocator, .drug_like, 7);
+    defer proximity.deinit(testing.allocator);
+    try testing.expectEqual(Bond{ .start = 0, .end = 4, .order = 0 }, proximity.bonds[3]);
+    try testing.expectEqual(Bond{ .start = 3, .end = 4, .order = 0 }, proximity.bonds[4]);
+    try testing.expect(drugLikeSmiles(7) == null);
 }
 
 test "size buckets follow the divergence-versus-size boundaries" {

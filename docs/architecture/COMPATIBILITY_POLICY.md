@@ -13,7 +13,7 @@ evidence.
 | Category | Meaning | Obligation |
 |---|---|---|
 | **Emulate** | Upstream's behavior is observable and reproducible; the port reproduces it, defect and all | Oracle regression pinning the behavior |
-| **Correct** | Upstream's behavior is a safety, memory, or concurrency defect with no observable single-threaded difference | Evidence that the observable behavior is unchanged, plus a regression for the corrected property |
+| **Correct** | Upstream's behavior is a safety, memory, or concurrency defect, or accepts public input outside the port's safe domain | Evidence that valid-input behavior is unchanged, plus a regression for the corrected property |
 | **Option** | Consumers plausibly depend on both behaviors | Both paths tested; the upstream-compatible path lives in a named compatibility facade, never in the default |
 | **Parity ceiling** | The oracle is not reproducible against itself, so no exact or tolerant claim can be made against it | Enumerated per (member, observable) in the published manifest with the measurement that placed it there |
 
@@ -150,6 +150,24 @@ match is off by half a bond length, not by a relayout.
 | `cgz-r11` — `initialize()` mutates and takes ownership of caller input | Correct, with the effect surfaced as output | `clear()` at the head of `initialize()` `delete`s the previous call's atoms and bonds |
 | `cgz-r12` — template static-init data race | Correct, do not emulate | Non-atomic guard over a mutable static; `normalizeTemplate` is not idempotent |
 | `cgz-r13` — pointer-order-unstable inputs | Parity ceiling, scoped as above | 4 member × observable pairs out of 2007, max 0.580 bond lengths |
+| `cgz-7v2.26` — upstream accepts non-finite input coordinates | Correct, reject as invalid public input | `Input.validate` returns `InvalidCoordinate`; API tests pin NaN template and infinite 3D coordinates |
+
+### cgz-7v2.26 — reject non-finite input coordinates
+
+The port deliberately rejects NaN and infinite `template_coordinates` and
+`coordinates_3d` with `InvalidCoordinate`. The pinned upstream does not validate
+these inputs. It normally ignores a non-finite 3D value and produces a finite
+layout, but can project it into non-finite 2D output if its fallback path reads
+the value. Accepting input whose observable result depends on whether an
+incidental fallback runs is outside the port's safe public domain.
+
+This is an intentional status divergence, not a parity ceiling: finite inputs
+remain subject to the normal differential comparison, and no coordinate
+comparison is defined after native input validation fails. If the corpus gains
+members with non-finite input coordinates, the differential runner may accept
+`InvalidCoordinate` against upstream success only for those explicitly
+enumerated member identities. It must not add a blanket status exception for
+`InvalidCoordinate` or for the adversarial partition.
 
 ### cgz-r10 — upstream 6212c86 is not a behavioral change
 

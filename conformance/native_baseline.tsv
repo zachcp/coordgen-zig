@@ -1,22 +1,23 @@
 # native-vs-oracle baseline, one line per observable
 # partition	drug_like
-# members	7
+# members	8
 # tolerance_bond_lengths	0.100000
-# max_deviation_bond_lengths	0.092483	drug_like/3
-# pre_orientation_compared	7	1
+# max_deviation_bond_lengths	0.017285	drug_like/5
+# pre_orientation_compared	7	0
 member	coordinate_deviation_bond_lengths
-drug_like/0	0.000170
-drug_like/1	0.000343
-drug_like/2	0.000274
-drug_like/3	0.092483
-drug_like/4	0.000849
-drug_like/5	0.017225
-drug_like/6	0.001558
+drug_like/0	0.000311
+drug_like/1	0.000200
+drug_like/2	0.000200
+drug_like/3	0.005336
+drug_like/4	0.000000
+drug_like/5	0.017285
+drug_like/6	0.001947
+drug_like/7	0.000000
 observable	compared	mismatched	ceiling_applied
-clean_pose	7	0	0
-coordinates	7	0	0
-input_to_internal	7	0	0
-internal_to_input	7	0	0
-effective_bond_orders	7	0	0
-bond_displays	7	0	0
-atom_stereo	7	0	0
+clean_pose	8	0	0
+coordinates	8	0	0
+input_to_internal	8	0	0
+internal_to_input	8	0	0
+effective_bond_orders	8	0	0
+bond_displays	8	0	0
+atom_stereo	8	0	0
