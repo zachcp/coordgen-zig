@@ -35,6 +35,25 @@ def evidence_ids(texts):
     return sorted(found), malformed
 
 
+def branch_closures(diff):
+    closed = set()
+    for line in diff.splitlines():
+        if not line.startswith("+") or line.startswith("+++"):
+            continue
+        try:
+            interaction = json.loads(line[1:])
+        except json.JSONDecodeError:
+            continue
+        extra = interaction.get("extra", {})
+        if (
+            interaction.get("kind") == "field_change"
+            and extra.get("field") == "status"
+            and extra.get("new_value") == "closed"
+        ):
+            closed.add(interaction.get("issue_id"))
+    return closed
+
+
 def query_issue(bead_id):
     result = subprocess.run(
         ["bd", "--readonly", "show", f"--id={bead_id}", "--json"],
@@ -49,7 +68,7 @@ def query_issue(bead_id):
     return rows[0] if len(rows) == 1 and rows[0].get("id") == bead_id else None
 
 
-def validate(texts, pr_created_at, fixture_issues=None):
+def validate(texts, pr_created_at, fixture_issues=None, closed_on_branch=()):
     ids, errors = evidence_ids(texts)
     if not ids and not errors:
         errors.append("no 'Bead: cgz-...' evidence in the PR body or commit messages")
@@ -72,7 +91,7 @@ def validate(texts, pr_created_at, fixture_issues=None):
             continue
         if status == "closed":
             closed_at = parse_time(issue.get("closed_at"))
-            if closed_at is not None and closed_at >= pr_created_at:
+            if bead_id in closed_on_branch or (closed_at is not None and closed_at >= pr_created_at):
                 continue
             errors.append(f"{bead_id}: stale reference to a bead closed before this PR")
             continue
@@ -86,12 +105,14 @@ def self_test():
     issues = [
         {"id": "cgz-live", "status": "in_progress", "closed_at": None},
         {"id": "cgz-done", "status": "closed", "closed_at": "2026-09-18T13:00:00Z"},
+        {"id": "cgz-branch", "status": "closed", "closed_at": "2026-09-17T13:00:00Z"},
         {"id": "cgz-open", "status": "open", "closed_at": None},
         {"id": "cgz-stale", "status": "closed", "closed_at": "2026-09-17T13:00:00Z"},
     ]
     cases = [
         ("claimed", [("body", "Bead: cgz-live")], True, None),
         ("closed during PR", [("commit", "Beads: cgz-done, cgz-live")], True, None),
+        ("closed on branch", [("body", "Bead: cgz-branch")], True, None),
         ("missing", [("body", "No tracker evidence")], False, "no 'Bead:"),
         ("malformed", [("body", "Bead: cgz-replace-me")], False, "has no cgz- ID"),
         ("unknown", [("body", "Bead: cgz-unknown")], False, "unknown bead"),
@@ -99,11 +120,12 @@ def self_test():
         ("stale", [("body", "Bead: cgz-stale")], False, "closed before this PR"),
     ]
     for name, texts, should_pass, expected in cases:
-        _ids, errors = validate(texts, opened, issues)
+        branch = {"cgz-branch"} if name == "closed on branch" else set()
+        _ids, errors = validate(texts, opened, issues, branch)
         if (not errors) != should_pass or (expected and not any(expected in error for error in errors)):
             print(f"check-bead-references: self-test {name!r} failed: {errors}", file=sys.stderr)
             return 1
-    print("check-bead-references: self-test passed 7 positive and negative fixtures")
+    print("check-bead-references: self-test passed 8 positive and negative fixtures")
     return 0
 
 
@@ -111,20 +133,25 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pr-body", type=Path)
     parser.add_argument("--commits", type=Path)
+    parser.add_argument("--interactions-diff", type=Path)
     parser.add_argument("--pr-created-at")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
     if args.self_test:
         return self_test()
-    if args.pr_body is None or args.commits is None or args.pr_created_at is None:
-        parser.error("--pr-body, --commits, and --pr-created-at are required")
+    if args.pr_body is None or args.commits is None or args.interactions_diff is None or args.pr_created_at is None:
+        parser.error("--pr-body, --commits, --interactions-diff, and --pr-created-at are required")
 
     texts = [
         (str(args.pr_body), args.pr_body.read_text(encoding="utf-8")),
         (str(args.commits), args.commits.read_text(encoding="utf-8")),
     ]
-    ids, errors = validate(texts, parse_time(args.pr_created_at))
+    ids, errors = validate(
+        texts,
+        parse_time(args.pr_created_at),
+        closed_on_branch=branch_closures(args.interactions_diff.read_text(encoding="utf-8")),
+    )
     if errors:
         print("check-bead-references: tracker evidence is invalid:", file=sys.stderr)
         for error in errors:

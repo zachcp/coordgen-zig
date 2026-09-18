@@ -52,10 +52,12 @@ jobs:
         run: |
           jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" > "${RUNNER_TEMP}/pr-body"
           git log --format=%B "$BASE_SHA..$HEAD_SHA" > "${RUNNER_TEMP}/commits"
+          git diff "$BASE_SHA..$HEAD_SHA" -- .beads/interactions.jsonl > "${RUNNER_TEMP}/interactions.diff"
           python3 tools/check-bead-references --self-test
           python3 tools/check-bead-references \
             --pr-body "${RUNNER_TEMP}/pr-body" \
             --commits "${RUNNER_TEMP}/commits" \
+            --interactions-diff "${RUNNER_TEMP}/interactions.diff" \
             --pr-created-at "$PR_CREATED_AT"
 
   build:
