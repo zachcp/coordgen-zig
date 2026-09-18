@@ -2,13 +2,13 @@
 # partition	drug_like
 # members	7
 # tolerance_bond_lengths	0.100000
-# max_deviation_bond_lengths	0.063060	drug_like/3
+# max_deviation_bond_lengths	0.017285	drug_like/5
 # pre_orientation_compared	7	0
 member	coordinate_deviation_bond_lengths
-drug_like/0	0.000200
+drug_like/0	0.000311
 drug_like/1	0.000200
 drug_like/2	0.000200
-drug_like/3	0.063060
+drug_like/3	0.005336
 drug_like/4	0.000000
 drug_like/5	0.017285
 drug_like/6	0.001947
