@@ -16,6 +16,7 @@ drug_like/3	small	17	ok	1	component_transforms,component_transforms_set	-	0.000	
 drug_like/4	small	18	ok	0	component_transforms,component_transforms_set	-	0.000	0.000
 drug_like/5	tiny	8	ok	1	component_transforms,component_transforms_set	-	0.000	0.000
 drug_like/6	small	24	ok	1	component_transforms,component_transforms_set	-	0.000	0.000
+drug_like/7	tiny	5	ok	0	-	-	0.000	0.000
 adversarial/0	large	51	ok	0	coordinates,component_transforms,component_transforms_set	-	0.000	0.000
 adversarial/1	tiny	8	ok	1	component_transforms,component_transforms_set	-	0.000	0.000
 adversarial/2	medium	35	ok	0	coordinates,component_transforms,component_transforms_set	-	0.046	0.000
@@ -2018,31 +2019,31 @@ adversarial/1998	small	14	ok	1	component_transforms,component_transforms_set	-	0
 adversarial/1999	medium	43	ok	0	coordinates,component_transforms,component_transforms_set	-	0.000	0.000
 #
 # partition	observable	measured	arch_unstable	order_unstable
-# drug_like	status	7	0	0
-# drug_like	clean_pose	7	0	0
-# drug_like	coordinates	7	0	0
-# drug_like	input_to_internal	7	0	0
-# drug_like	internal_to_input	7	0	0
-# drug_like	effective_bond_orders	7	0	0
-# drug_like	bond_displays	7	0	0
-# drug_like	atom_stereo	7	0	0
-# drug_like	probe_status	7	0	0
-# drug_like	probe_clean_pose	7	0	0
-# drug_like	morgan_ranks	7	0	0
-# drug_like	rings	7	0	0
-# drug_like	rings_set	7	0	0
-# drug_like	fragments	7	0	0
-# drug_like	fragments_set	7	0	0
-# drug_like	dofs	7	0	0
-# drug_like	dofs_set	7	0	0
-# drug_like	dof_penalties	7	0	0
-# drug_like	dof_penalties_set	7	0	0
-# drug_like	template_mappings	7	0	0
-# drug_like	template_mappings_set	7	0	0
-# drug_like	components	7	0	0
-# drug_like	components_set	7	0	0
-# drug_like	component_transforms	7	7	0
-# drug_like	component_transforms_set	7	7	0
+# drug_like	status	8	0	0
+# drug_like	clean_pose	8	0	0
+# drug_like	coordinates	8	0	0
+# drug_like	input_to_internal	8	0	0
+# drug_like	internal_to_input	8	0	0
+# drug_like	effective_bond_orders	8	0	0
+# drug_like	bond_displays	8	0	0
+# drug_like	atom_stereo	8	0	0
+# drug_like	probe_status	8	0	0
+# drug_like	probe_clean_pose	8	0	0
+# drug_like	morgan_ranks	8	0	0
+# drug_like	rings	8	0	0
+# drug_like	rings_set	8	0	0
+# drug_like	fragments	8	0	0
+# drug_like	fragments_set	8	0	0
+# drug_like	dofs	8	0	0
+# drug_like	dofs_set	8	0	0
+# drug_like	dof_penalties	8	0	0
+# drug_like	dof_penalties_set	8	0	0
+# drug_like	template_mappings	8	0	0
+# drug_like	template_mappings_set	8	0	0
+# drug_like	components	8	0	0
+# drug_like	components_set	8	0	0
+# drug_like	component_transforms	8	7	0
+# drug_like	component_transforms_set	8	7	0
 # adversarial	status	2000	0	0
 # adversarial	clean_pose	2000	0	0
 # adversarial	coordinates	2000	1414	1

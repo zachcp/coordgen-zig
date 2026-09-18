@@ -27,7 +27,9 @@ namespace
  * measurements established that realistic structures are bit-identical across
  * architectures and optimization levels: two fused polycyclics, a steroid
  * skeleton, a seventeen-membered macrocycle, a bridged bicyclic pair, a
- * peptide-like chain, and a four-ring biaryl chain. */
+ * peptide-like chain, and a four-ring biaryl chain. The explicit zero-order
+ * member is constructed below because the intentionally tiny reference parser
+ * does not support disconnected components or zero-order bonds. */
 const char* const kSmiles[] = {
     "C1CC2CCC3CCCC4CCC(C1)C2C34",
     "CC12CCC3C(CCC4CC(O)CCC34C)C1CCC2O",
@@ -38,33 +40,55 @@ const char* const kSmiles[] = {
     "C1CCC(CC1)C1CCC(CC1)C1CCC(CC1)C1CCCCC1",
 };
 
+sketcherMinimizerMolecule* makeProximityMember()
+{
+    auto* molecule = new sketcherMinimizerMolecule();
+    for (unsigned atom = 0; atom < 5; ++atom) {
+        molecule->addNewAtom()->setAtomicNumber(6);
+    }
+    const unsigned bonds[][3] = {
+        {0, 1, 1}, {1, 2, 1}, {2, 3, 1}, {0, 4, 0}, {3, 4, 0},
+    };
+    for (const auto& source : bonds) {
+        auto* bond = molecule->addNewBond(molecule->getAtoms().at(source[0]),
+                                          molecule->getAtoms().at(source[1]));
+        bond->setBondOrder(static_cast<int>(source[2]));
+    }
+    return molecule;
+}
+
+void dumpMolecule(unsigned index, sketcherMinimizerMolecule* molecule)
+{
+    const std::vector<sketcherMinimizerAtom*>& atoms = molecule->getAtoms();
+    const std::vector<sketcherMinimizerBond*>& bonds = molecule->getBonds();
+
+    std::printf("molecule drug_like %u atoms=%zu bonds=%zu\n", index,
+                atoms.size(), bonds.size());
+    for (std::size_t atom = 0; atom < atoms.size(); ++atom) {
+        std::printf("atom %zu z=%d q=%d\n", atom,
+                    atoms[atom]->getAtomicNumber(), atoms[atom]->charge);
+    }
+    for (std::size_t bond = 0; bond < bonds.size(); ++bond) {
+        std::size_t start = 0;
+        std::size_t end = 0;
+        for (std::size_t atom = 0; atom < atoms.size(); ++atom) {
+            if (atoms[atom] == bonds[bond]->getStartAtom()) start = atom;
+            if (atoms[atom] == bonds[bond]->getEndAtom()) end = atom;
+        }
+        std::printf("bond %zu %zu %zu order=%d\n", bond, start, end,
+                    bonds[bond]->getBondOrder());
+    }
+    delete molecule;
+}
+
 } // namespace
 
 int main()
 {
     unsigned index = 0;
     for (const char* smiles : kSmiles) {
-        auto* molecule = schrodinger::approxSmilesParse(std::string(smiles));
-        const std::vector<sketcherMinimizerAtom*>& atoms = molecule->getAtoms();
-        const std::vector<sketcherMinimizerBond*>& bonds = molecule->getBonds();
-
-        std::printf("molecule drug_like %u atoms=%zu bonds=%zu\n", index,
-                    atoms.size(), bonds.size());
-        for (std::size_t atom = 0; atom < atoms.size(); ++atom) {
-            std::printf("atom %zu z=%d q=%d\n", atom,
-                        atoms[atom]->getAtomicNumber(), atoms[atom]->charge);
-        }
-        for (std::size_t bond = 0; bond < bonds.size(); ++bond) {
-            std::size_t start = 0;
-            std::size_t end = 0;
-            for (std::size_t atom = 0; atom < atoms.size(); ++atom) {
-                if (atoms[atom] == bonds[bond]->getStartAtom()) start = atom;
-                if (atoms[atom] == bonds[bond]->getEndAtom()) end = atom;
-            }
-            std::printf("bond %zu %zu %zu order=%d\n", bond, start, end,
-                        bonds[bond]->getBondOrder());
-        }
-        ++index;
+        dumpMolecule(index++, schrodinger::approxSmilesParse(std::string(smiles)));
     }
+    dumpMolecule(index, makeProximityMember());
     return 0;
 }

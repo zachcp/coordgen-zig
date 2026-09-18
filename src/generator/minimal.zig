@@ -656,9 +656,16 @@ fn optimizeDiscrete(
         }
         scoring_interactions = filtered_interactions[0..filtered_count];
     }
-    const bond_views = allocator.alloc(optimize.discrete.BondScoreView, bonds.len) catch return error.OutOfMemory;
+    var scored_bond_count: usize = 0;
+    for (bonds) |bond| scored_bond_count += @intFromBool(bond.effective_order != .zero);
+    const bond_views = allocator.alloc(optimize.discrete.BondScoreView, scored_bond_count) catch return error.OutOfMemory;
     defer allocator.free(bond_views);
-    for (bonds, bond_views) |bond, *view| {
+    var scored_bond_index: usize = 0;
+    for (bonds) |bond| {
+        // Upstream removes zero-order bonds from the molecule's bond list
+        // after recording them as proximity relations. They therefore must
+        // not participate in scoreCrossBonds (cgz-y3m).
+        if (bond.effective_order == .zero) continue;
         var macrocycle = false;
         var small_ring = false;
         for (rings.bondRings(bond.id)) |ring_id| {
@@ -666,7 +673,7 @@ fn optimizeDiscrete(
             macrocycle = macrocycle or ring_size >= topology.rings.macrocycle_size;
             small_ring = small_ring or ring_size < topology.rings.macrocycle_size;
         }
-        view.* = .{
+        bond_views[scored_bond_index] = .{
             .start = bond.start,
             .end = bond.end,
             .component = graph.component(bond.start) orelse return error.InvalidMapping,
@@ -675,14 +682,15 @@ fn optimizeDiscrete(
             .macrocycle = macrocycle,
             .small_ring = small_ring,
         };
+        scored_bond_index += 1;
     }
     const residue_bond_views = allocator.alloc(
         optimize.discrete.BondScoreView,
-        bonds.len + residue_interactions.len,
+        bond_views.len + residue_interactions.len,
     ) catch return error.OutOfMemory;
     defer allocator.free(residue_bond_views);
-    @memcpy(residue_bond_views[0..bonds.len], bond_views);
-    for (residue_interactions, residue_bond_views[bonds.len..]) |interaction, *view| view.* = .{
+    @memcpy(residue_bond_views[0..bond_views.len], bond_views);
+    for (residue_interactions, residue_bond_views[bond_views.len..]) |interaction, *view| view.* = .{
         .start = interaction.start,
         .end = interaction.end,
         .residue_interaction = true,
