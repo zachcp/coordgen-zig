@@ -115,7 +115,7 @@ fn initializeCoordinatesInternal(
     }
     // Ring fusion structure is needed by the central-ring priority, and is
     // derived once for the whole molecule rather than per fragment.
-    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds);
+    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds, graph);
     defer analysis.deinit();
     const placed = allocator.alloc(bool, atoms.len) catch return error.OutOfMemory;
     defer allocator.free(placed);
@@ -175,7 +175,7 @@ fn initializeCoordinatesInternal(
             // when its own neighbour buffer would overflow.
             if (membership.atomRings(center).len != 0) {
                 if (try placeRingAtomSubstituents(atoms, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail)) continue;
-            } else if (try placeAcyclicNeighbours(allocator, atoms, bonds, graph, membership, fragmentation, fragment.id, center, placed, queue, &tail)) {
+            } else if (try placeAcyclicNeighbours(allocator, atoms, bonds, graph, membership, analysis, fragmentation, fragment.id, center, placed, queue, &tail)) {
                 continue;
             }
             const base_angle = parentAngle(atoms, graph, fragmentation, fragment.id, center, placed);
@@ -1468,6 +1468,7 @@ fn placeAcyclicNeighbours(
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
     fragmentation: fragments.Fragmentation,
     fragment: core.ids.FragmentId,
     center: core.ids.AtomId,
@@ -1479,7 +1480,7 @@ fn placeAcyclicNeighbours(
     if (neighbours.len == 0 or neighbours.len > max_neighbours) return false;
 
     var ordered: [max_neighbours]core.ids.AtomId = undefined;
-    try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, center, ordered[0..neighbours.len]);
+    try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, analysis, center, ordered[0..neighbours.len]);
 
     // Upstream's visited set is fragment-local: it starts as this fragment's
     // ring atoms, or its single start atom, and only ever gains atoms of this
@@ -2286,7 +2287,7 @@ test "leaf fused rings are stripped into upstream LIFO placement order" {
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
-    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds, graph);
     defer analysis.deinit();
 
     const fragment = split.fragments[split.atom_fragment[0].index()];
@@ -2347,7 +2348,7 @@ test "the third ring of a linear acene mirrors away from its parent ring, not fr
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, &atoms, &bonds, graph, rings);
     defer split.deinit();
-    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds);
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, &atoms, &bonds, graph);
     defer analysis.deinit();
 
     // And the parent chosen for the outer ring is the ring it shares an edge
@@ -2629,7 +2630,7 @@ fn planarityFixture(atoms: []model.Atom, bonds: []const model.Bond) !f32 {
     defer rings.deinit();
     var split = try fragments.Fragmentation.init(std.testing.allocator, atoms, bonds, graph, rings);
     defer split.deinit();
-    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, atoms, bonds);
+    var analysis = try topology.rings.Analysis.init(std.testing.allocator, rings, atoms, bonds, graph);
     defer analysis.deinit();
     var worst: f32 = 0;
     for (split.fragments) |fragment| {

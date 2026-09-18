@@ -891,6 +891,8 @@ pub fn collectAllDofs(
     const maximum_affected = std.math.mul(usize, maximum_specialized, fragmentation.atom_fragment.len) catch return error.TooManyItems;
     items.ensureTotalCapacity(allocator, maximum_items) catch return error.OutOfMemory;
     affected.ensureTotalCapacity(allocator, maximum_affected) catch return error.OutOfMemory;
+    var analysis = try topology.rings.Analysis.init(allocator, membership, atoms, bonds, graph);
+    defer analysis.deinit();
 
     for (fragmentation.fragments) |fragment| {
         const primary = [_]struct { payload: core.dof.Payload, count: u32, tier: u32 }{
@@ -920,7 +922,7 @@ pub fn collectAllDofs(
                 .payload = entry.payload,
             }) catch return error.OutOfMemory;
         }
-        try appendSpecializedDofs(allocator, &items, &affected, fragment, atoms, bonds, graph, membership, fragmentation);
+        try appendSpecializedDofs(allocator, &items, &affected, fragment, atoms, bonds, graph, membership, analysis, fragmentation);
     }
     const owned_items = items.toOwnedSlice(allocator) catch return error.OutOfMemory;
     errdefer allocator.free(owned_items);
@@ -943,6 +945,7 @@ fn appendSpecializedDofs(
     bonds: []const model.Bond,
     graph: topology.Graph,
     membership: topology.RingMembership,
+    analysis: topology.rings.Analysis,
     fragmentation: fragments.Fragmentation,
 ) core.errors.Error!void {
     var pending: std.ArrayList(PendingDof) = .empty;
@@ -991,7 +994,7 @@ fn appendSpecializedDofs(
         const atom = queue[head];
         const neighbors = graph.neighbors(atom);
         if (membership.atomRings(atom).len == 0) {
-            try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, atom, ordered_neighbors[0..neighbors.len]);
+            try neighbour_order.orderNeighbours(allocator, atoms, bonds, graph, membership, analysis, atom, ordered_neighbors[0..neighbors.len]);
             var start: usize = 0;
             for (ordered_neighbors[0..neighbors.len], 0..) |neighbor, index| {
                 if (visited[neighbor.index()]) {

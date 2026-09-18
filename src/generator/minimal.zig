@@ -371,7 +371,7 @@ fn minimizeGenerated(
     });
     defer base.deinit();
 
-    var analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds);
+    var analysis = try topology.rings.Analysis.init(allocator, rings, atoms, bonds, graph);
     defer analysis.deinit();
     var groups = try bends.build(allocator, atoms, bonds, graph, rings, analysis);
     defer groups.deinit();

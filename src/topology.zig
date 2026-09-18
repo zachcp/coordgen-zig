@@ -832,7 +832,7 @@ test "ring perception matches pinned oracle cycle and fused probes" {
     try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(2), AtomId.fromIndex(4) }, fused.rings.atoms(core.ids.RingId.fromIndex(0)));
     try std.testing.expectEqualSlices(AtomId, &.{ AtomId.fromIndex(0), AtomId.fromIndex(1), AtomId.fromIndex(3), AtomId.fromIndex(5) }, fused.rings.atoms(core.ids.RingId.fromIndex(1)));
     try std.testing.expectEqual(@as(usize, 2), fused.rings.atomRings(AtomId.fromIndex(0)).len);
-    var fusion = try rings.Analysis.init(std.testing.allocator, fused.rings, fused.working.atoms, fused.working.bonds);
+    var fusion = try rings.Analysis.init(std.testing.allocator, fused.rings, fused.working.atoms, fused.working.bonds, fused.graph);
     defer fusion.deinit();
     try std.testing.expectEqual(@as(usize, 1), fusion.fusedWith(core.ids.RingId.fromIndex(0)).len);
     try std.testing.expectEqualSlices(
@@ -849,6 +849,77 @@ test "ring perception matches pinned oracle cycle and fused probes" {
     );
 }
 
+test "three-atom fusion marks only its inner atom and forces its priority" {
+    const atoms = [_]prepare.TestAtom{ .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{}, .{} };
+    const bonds = [_]prepare.TestBond{
+        .{ .start = 0, .end = 1 },
+        .{ .start = 1, .end = 2 },
+        .{ .start = 2, .end = 3 },
+        .{ .start = 3, .end = 0 },
+        .{ .start = 2, .end = 4 },
+        .{ .start = 4, .end = 0 },
+        .{ .start = 5, .end = 1 },
+        .{ .start = 5, .end = 6 },
+        .{ .start = 5, .end = 7 },
+        .{ .start = 5, .end = 8 },
+    };
+    var prepared = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &atoms, .bonds = &bonds });
+    defer prepared.deinit();
+    var analysis = try rings.Analysis.init(
+        std.testing.allocator,
+        prepared.rings,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+    );
+    defer analysis.deinit();
+
+    const inner = AtomId.fromIndex(prepared.working.order.input_to_internal[1]);
+    const outer_left = AtomId.fromIndex(prepared.working.order.input_to_internal[0]);
+    const outer_right = AtomId.fromIndex(prepared.working.order.input_to_internal[2]);
+    const center = AtomId.fromIndex(prepared.working.order.input_to_internal[5]);
+    const leaf = AtomId.fromIndex(prepared.working.order.input_to_internal[6]);
+    try std.testing.expect(analysis.shared_and_inner[inner.index()]);
+    try std.testing.expect(!analysis.shared_and_inner[outer_left.index()]);
+    try std.testing.expect(!analysis.shared_and_inner[outer_right.index()]);
+    try std.testing.expect(!analysis.shared_and_inner[center.index()]);
+
+    const forced = try stereo.atomPriorityWeight(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        analysis.shared_and_inner,
+        center,
+        inner,
+    );
+    const ordinary = try stereo.atomPriorityWeight(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        analysis.shared_and_inner,
+        center,
+        leaf,
+    );
+    try std.testing.expect(forced < ordinary - 1000);
+
+    analysis.shared_and_inner[center.index()] = true;
+    const guarded = try stereo.atomPriorityWeight(
+        std.testing.allocator,
+        prepared.working.atoms,
+        prepared.working.bonds,
+        prepared.graph,
+        prepared.rings,
+        analysis.shared_and_inner,
+        center,
+        inner,
+    );
+    try std.testing.expect(guarded > ordinary);
+}
+
 test "benzene ring chemistry matches pinned upstream heuristics" {
     const atoms = [_]prepare.TestAtom{ .{}, .{}, .{}, .{}, .{}, .{} };
     const bonds = [_]prepare.TestBond{
@@ -861,7 +932,7 @@ test "benzene ring chemistry matches pinned upstream heuristics" {
     };
     var prepared = try prepareInput(std.testing.allocator, prepare.TestInput{ .atoms = &atoms, .bonds = &bonds });
     defer prepared.deinit();
-    var analysis = try rings.Analysis.init(std.testing.allocator, prepared.rings, prepared.working.atoms, prepared.working.bonds);
+    var analysis = try rings.Analysis.init(std.testing.allocator, prepared.rings, prepared.working.atoms, prepared.working.bonds, prepared.graph);
     defer analysis.deinit();
     try std.testing.expectEqual(@as(usize, 1), analysis.flags.len);
     try std.testing.expect(analysis.flags[0].benzene);
