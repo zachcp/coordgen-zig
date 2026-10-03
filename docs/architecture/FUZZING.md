@@ -1,8 +1,8 @@
 # Fuzzing platform and mechanism
 
-Status: decided by `cgz-r15` against the pinned toolchain
-`0.17.0-dev.1516+8a4b5424d`. The harness is implemented by `cgz-7v2.4.4`, which
-remains open for the gaps named at the end of this document.
+Status: decided by `cgz-r15` and revalidated against the pinned `0.17.0`
+release. The harness is implemented by `cgz-7v2.4.4`, which remains open for
+the gaps named at the end of this document.
 
 The `fuzz` build step is no longer reserved. `zig build fuzz` runs the targets
 against their committed corpora and asserts the harness's own preconditions;

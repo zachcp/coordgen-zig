@@ -11,18 +11,17 @@ checks its byte length and SHA-256 before extraction, and then checks the
 extracted compiler's exact `zig version`. CI obtains Zig only through this
 script and invokes no preinstalled `zig` first.
 
-The supported build contract intentionally targets
-`0.17.0-dev.1516+8a4b5424d` and its new Maker/package behavior. Whole-project
-0.16 compatibility is not a gate. Prefer the tagged 0.17 release once it
-exists, using the bump procedure below.
+The supported build contract intentionally targets the tagged `0.17.0`
+release and its Maker/package behavior. Whole-project 0.16 compatibility is
+not a gate.
 
 ## Mirror requirement
 
 The owner-controlled mirror column is currently `UNCONFIGURED` because no
-project artifact endpoint was supplied. The pinned development archives have
-since aged out of the Zig CDN, so bootstrap warns and uses the explicitly
-recorded community mirror while retaining the locked byte-length, SHA-256, and
-exact-version checks. Set
+project artifact endpoint was supplied. Bootstrap therefore warns and uses the
+explicitly recorded community mirror while retaining the locked byte-length,
+SHA-256, and exact-version checks. The immutable upstream release URLs remain
+recorded separately. Set
 `CGZ_REQUIRE_TOOLCHAIN_MIRROR=1` to make this missing external input fatal.
 Replace each marker with an immutable URL under project control before closing
 the toolchain provenance issue; the existing SHA-256 remains authoritative.

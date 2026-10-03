@@ -2,7 +2,7 @@
     .name = .coordgen,
     .version = "0.0.0",
     .fingerprint = 0x77542451d402daf8, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0-dev.1516+8a4b5424d",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .coordgenlibs_oracle = .{
             .url = "https://github.com/schrodinger/coordgenlibs/archive/d20e735d96480385b2e257522288004038a08cc9.tar.gz",

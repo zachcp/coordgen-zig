@@ -7,7 +7,7 @@ backend whose `std.testing.fuzz` returns immediately. It does that by mirroring
 lib/compiler/test_runner.zig.
 
 A mirror of a private declaration fails in the dangerous direction. If upstream
-adds a fourth non-fuzzing backend, our list is silently incomplete, the
+adds another non-fuzzing backend, our list is silently incomplete, the
 assertion passes, and the fuzz gate goes back to certifying nothing - which is
 the failure mode the assertion exists to prevent, reintroduced through the
 assertion itself.

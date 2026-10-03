@@ -19,7 +19,7 @@
 //! thing expected to change.
 //!
 //! The list below is a mirror of a private declaration, so it can go stale in
-//! a direction that fails open - upstream adding a fourth non-fuzzing backend
+//! a direction that fails open - upstream adding another non-fuzzing backend
 //! would leave this list silently incomplete. tools/check-fuzz-backend reads
 //! the switch out of the pinned toolchain's own test_runner.zig and fails if
 //! the two disagree. See cgz-r27.
@@ -34,6 +34,7 @@ pub const Backend = @TypeOf(builtin.zig_backend);
 /// compares this set against that switch.
 pub const non_fuzzing_backends = [_]Backend{
     .stage2_aarch64,
+    .stage2_loongarch,
     .stage2_powerpc,
     .stage2_riscv64,
 };

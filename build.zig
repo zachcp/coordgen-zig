@@ -738,11 +738,11 @@ pub fn build(b: *std.Build) !void {
     ) orelse false;
 
     // `-fqemu` and `--libc-runtimes` are consumed by the build runner itself
-    // and are not visible to this script: std.Build.enable_qemu is a vestigial
-    // field that the 0.17-dev Maker never populates, so a build script that
-    // reads it concludes "no executor" even when qemu is in use. The caller
-    // therefore declares the executor separately. A false declaration is not a
-    // way past the gate: the architecture-axis Run step still has to execute.
+    // and are not visible to this script: the 0.17.0 configure API does not
+    // expose the Maker's executor state, so a build script cannot infer that
+    // qemu is in use. Callers therefore declare the executor separately. A
+    // false declaration is not a way past the gate: the architecture-axis Run
+    // step still has to execute.
     const foreign_executor = b.option(
         ForeignExecutor,
         "foreign-executor",
