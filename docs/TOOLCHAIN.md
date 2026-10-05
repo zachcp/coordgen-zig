@@ -11,10 +11,9 @@ checks its byte length and SHA-256 before extraction, and then checks the
 extracted compiler's exact `zig version`. CI obtains Zig only through this
 script and invokes no preinstalled `zig` first.
 
-The supported build contract intentionally targets
-`0.17.0-dev.1516+8a4b5424d` and its new Maker/package behavior. Whole-project
-0.16 compatibility is not a gate. Prefer the tagged 0.17 release once it
-exists, using the bump procedure below.
+The supported build contract targets the released Zig `0.17.0` and its
+Maker/package behavior (repinned from the `0.17.0-dev.1516+8a4b5424d` snapshot
+by `cgz-r24`). Whole-project 0.16 compatibility is not a gate.
 
 ## Mirror requirement
 
