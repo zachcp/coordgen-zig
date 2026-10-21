@@ -34,6 +34,7 @@ pub const Backend = @TypeOf(builtin.zig_backend);
 /// compares this set against that switch.
 pub const non_fuzzing_backends = [_]Backend{
     .stage2_aarch64,
+    .stage2_loongarch,
     .stage2_powerpc,
     .stage2_riscv64,
 };

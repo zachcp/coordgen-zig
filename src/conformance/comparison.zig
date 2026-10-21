@@ -598,7 +598,7 @@ test "coordinate comparisons require an identical run identity" {
     const native = RunIdentity{
         .process_id = "run-4",
         .target = "aarch64-macos",
-        .toolchain = "0.17.0-dev.1516+8a4b5424d",
+        .toolchain = "0.17.0",
         .optimize_mode = "ReleaseFast",
     };
     try RunIdentity.requireSameBuild(native, native);
